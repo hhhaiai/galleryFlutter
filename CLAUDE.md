@@ -24,13 +24,20 @@
 - Windows
 - Linux
 
+应用显示名称：
+
+```text
+galleryFlutter
+```
+
 核心产品能力目标：
 
+- ChatGPT 等主流聊天应用风格布局：顶部模型状态、中间消息气泡、底部 composer
 - 本地对话
-- 图片理解
-- 声音理解
-- Prompt Lab
-- Agent Skills
+- 图片理解入口
+- 语音理解入口
+- Prompt Lab 入口和模板选择
+- Agent Skills 入口
 - 侧边设置 Models 中下载模型
 - 下载完成后使用本地模型文件进行推理
 
@@ -371,11 +378,12 @@ lib/src/features/gemma_home/gemma_home_screen.dart
 
 职责：
 
-- 展示单模型卡片。
-- 展示模型下载状态 Chip。
-- 展示任务入口：对话、Prompt Lab、Skills、图片理解、声音理解。
-- 输入框与发送按钮。
-- 模型未下载时阻止发送并提示。
+- 提供 ChatGPT 等主流聊天应用风格布局。
+- 顶部展示应用名、模型名和模型下载状态 Chip。
+- 中间展示用户/助手消息气泡和流式生成状态。
+- 底部 composer 支持文字输入、图片入口、语音入口、Skills、Prompt Lab。
+- Prompt Lab 开启时展示模板选择。
+- 模型未下载时阻止真实发送并提示。
 - 接入侧边 Models Drawer。
 
 当前逻辑：
@@ -775,6 +783,9 @@ POST_NOTIFICATIONS
 - [x] Android 最小 LiteRT-LM 依赖迁移：`com.google.ai.edge.litertlm:litertlm-android:0.10.0`
 - [x] Android `MainActivity.kt` 增加 MethodChannel/EventChannel 桥接骨架
 - [x] Dart `platform_gemma_runtime.dart` 改为 Android MethodChannel 调用，非 Android 保留占位实现
+- [x] 应用显示名称改为 `galleryFlutter`，已覆盖 Flutter 标题、Android label、iOS/macOS display name、Linux/Windows 窗口/资源名
+- [x] 主界面改为 ChatGPT 类聊天布局：顶部状态、中间消息气泡、底部 composer
+- [x] composer 增加图片、语音、Skills、Prompt Lab 快捷入口
 
 ## 13. 待完成规划
 

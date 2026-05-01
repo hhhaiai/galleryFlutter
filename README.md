@@ -1,4 +1,4 @@
-# Gemma Local App
+# galleryFlutter
 
 从 Google AI Edge Gallery Android 工程中抽取的跨平台本地化 Flutter 工程骨架。
 
@@ -15,7 +15,7 @@
 运行：
 
 ```bash
-cd gemma_local_app
+cd galleryFlutter
 flutter run -d macos
 ```
 

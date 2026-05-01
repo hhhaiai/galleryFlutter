@@ -20,14 +20,22 @@ class GemmaHomeScreen extends StatefulWidget {
 class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _runtime = createLocalGemmaRuntime();
   final _downloadController = ModelDownloadController();
-  final _controller = TextEditingController();
+  final _inputController = TextEditingController();
+  final _scrollController = ScrollController();
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
-  GemmaTaskId _task = GemmaTaskId.chat;
-  PromptTemplate _template = promptLabTemplates.first;
+
   ModelDownloadStatus _downloadStatus = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
   );
-  String _output = '';
+  PromptTemplate _template = promptLabTemplates.first;
+  final List<_ChatMessage> _messages = [
+    const _ChatMessage(
+      role: _ChatRole.assistant,
+      text:
+          '你好，我是 galleryFlutter。本地模型下载完成后，我可以用 Gemma-4-E2B-it 进行对话，并逐步支持图片、语音、Skills 和 Prompt Lab。',
+    ),
+  ];
+  final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
   bool _running = false;
 
   @override
@@ -47,7 +55,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   @override
   void dispose() {
     _downloadSubscription?.cancel();
-    _controller.dispose();
+    _inputController.dispose();
+    _scrollController.dispose();
     _downloadController.dispose();
     _runtime.dispose();
     super.dispose();
@@ -61,46 +70,131 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _send() async {
-    final rawInput = _controller.text.trim();
+    final rawInput = _inputController.text.trim();
     if (rawInput.isEmpty || _running) return;
-    if (!_downloadStatus.isDownloaded) {
-      setState(() {
-        _output = '请先从左侧设置 > Models 下载 ${gemma4E2bIt.name}。';
-      });
-      return;
-    }
-    final prompt = _task == GemmaTaskId.promptLab
+
+    final prompt = _enabledModes.contains(_ComposerMode.promptLab)
         ? _template.buildPrompt(rawInput)
         : rawInput;
+    final userText = _buildUserMessageText(rawInput);
+    _inputController.clear();
+
     setState(() {
+      _messages.add(_ChatMessage(role: _ChatRole.user, text: userText));
+      _messages.add(
+        const _ChatMessage(
+          role: _ChatRole.assistant,
+          text: '',
+          streaming: true,
+        ),
+      );
       _running = true;
-      _output = '';
     });
-    await for (final token in _runtime.generate(
-      GemmaRequest(
-        prompt: prompt,
-        systemPrompt: _task == GemmaTaskId.agentSkills
-            ? agentSkillsSystemPrompt
-            : null,
-        enabledSkillNames: _task == GemmaTaskId.agentSkills
-            ? builtInSkills
-                  .where((skill) => skill.selected)
-                  .map((skill) => skill.name)
-                  .toList()
-            : const [],
-      ),
-    )) {
-      if (!mounted) return;
-      setState(() => _output += token);
+    _scrollToBottom();
+
+    if (!_downloadStatus.isDownloaded) {
+      _appendAssistantText(
+        '请先从左侧菜单进入「Models」下载 ${gemma4E2bIt.name}。下载完成后我会使用本地模型回答。',
+        done: true,
+      );
+      return;
     }
-    if (mounted) setState(() => _running = false);
+
+    try {
+      await for (final token in _runtime.generate(
+        GemmaRequest(
+          prompt: prompt,
+          systemPrompt: _enabledModes.contains(_ComposerMode.skills)
+              ? agentSkillsSystemPrompt
+              : null,
+          imagePaths: _enabledModes.contains(_ComposerMode.image)
+              ? const ['pending-image-picker']
+              : const [],
+          audioPaths: _enabledModes.contains(_ComposerMode.voice)
+              ? const ['pending-audio-recorder']
+              : const [],
+          enabledSkillNames: _enabledModes.contains(_ComposerMode.skills)
+              ? builtInSkills
+                    .where((skill) => skill.selected)
+                    .map((skill) => skill.name)
+                    .toList()
+              : const [],
+        ),
+      )) {
+        _appendAssistantText(token);
+      }
+      _finishAssistantMessage();
+    } catch (error) {
+      _appendAssistantText('\n运行时错误：$error', done: true);
+    }
+  }
+
+  void _appendAssistantText(String token, {bool done = false}) {
+    if (!mounted) return;
+    setState(() {
+      final last = _messages.removeLast();
+      _messages.add(
+        last.copyWith(text: '${last.text}$token', streaming: !done),
+      );
+      if (done) _running = false;
+    });
+    _scrollToBottom();
+  }
+
+  void _finishAssistantMessage() {
+    if (!mounted) return;
+    setState(() {
+      final last = _messages.removeLast();
+      _messages.add(last.copyWith(streaming: false));
+      _running = false;
+    });
+    _scrollToBottom();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  String _buildUserMessageText(String rawInput) {
+    final badges = _enabledModes
+        .where((mode) => mode != _ComposerMode.text)
+        .map((mode) => mode.label)
+        .join(' · ');
+    if (badges.isEmpty) return rawInput;
+    return '$rawInput\n\n[$badges]';
+  }
+
+  void _toggleMode(_ComposerMode mode) {
+    if (mode == _ComposerMode.text) return;
+    setState(() {
+      if (_enabledModes.contains(mode)) {
+        _enabledModes.remove(mode);
+      } else {
+        _enabledModes.add(mode);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(title: const Text('Gemma Local')),
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: const _AppTitle(),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: _ModelStatusChip(status: _downloadStatus),
+          ),
+        ],
+      ),
       drawer: ModelsDrawer(
         status: _downloadStatus,
         onDownload: _downloadModel,
@@ -108,139 +202,103 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         onDelete: () => _downloadController.delete(gemma4E2bIt),
         onRefresh: () => _downloadController.refreshStatus(gemma4E2bIt),
       ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            _ModelCard(config: gemma4E2bIt, status: _downloadStatus),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (final task in gemma4E2bIt.taskIds)
-                  ChoiceChip(
-                    label: Text(task.label),
-                    selected: _task == task,
-                    onSelected: (_) => setState(() => _task = task),
-                  ),
-              ],
+      body: Column(
+        children: [
+          _CapabilityRail(
+            enabledModes: _enabledModes,
+            template: _template,
+            onToggleMode: _toggleMode,
+            onTemplateChanged: (template) =>
+                setState(() => _template = template),
+          ),
+          Expanded(
+            child: _ChatTranscript(
+              controller: _scrollController,
+              messages: _messages,
             ),
-            if (_task == GemmaTaskId.promptLab) ...[
-              const SizedBox(height: 12),
-              DropdownButtonFormField<PromptTemplate>(
-                initialValue: _template,
-                decoration: const InputDecoration(labelText: 'Prompt Lab 模板'),
-                items: [
-                  for (final template in promptLabTemplates)
-                    DropdownMenuItem(
-                      value: template,
-                      child: Text(template.label),
-                    ),
-                ],
-                onChanged: (value) =>
-                    setState(() => _template = value ?? _template),
-              ),
-            ],
-            if (_task == GemmaTaskId.agentSkills) ...[
-              const SizedBox(height: 12),
-              Text('内置 Skills', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: [
-                  for (final skill in builtInSkills)
-                    Chip(label: Text(skill.name)),
-                ],
-              ),
-            ],
-            const SizedBox(height: 16),
-            TextField(
-              controller: _controller,
-              minLines: 4,
-              maxLines: 8,
-              decoration: InputDecoration(
-                border: const OutlineInputBorder(),
-                labelText: _inputLabel,
-                alignLabelWithHint: true,
-              ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _running ? null : _send,
-              icon: _running
-                  ? const SizedBox.square(
-                      dimension: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.send),
-              label: Text(_running ? '运行中' : '发送到本地 Gemma'),
-            ),
-            const SizedBox(height: 16),
-            DecoratedBox(
-              decoration: BoxDecoration(
-                color: colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: SelectableText(_output.isEmpty ? '输出会显示在这里。' : _output),
-              ),
-            ),
-          ],
-        ),
+          ),
+          _Composer(
+            controller: _inputController,
+            enabledModes: _enabledModes,
+            running: _running,
+            onToggleMode: _toggleMode,
+            onSend: _send,
+          ),
+        ],
       ),
     );
   }
-
-  String get _inputLabel => switch (_task) {
-    GemmaTaskId.chat => '输入对话内容',
-    GemmaTaskId.promptLab => '输入 Prompt Lab 内容',
-    GemmaTaskId.agentSkills => '输入需要 Skills 完成的任务',
-    GemmaTaskId.askImage => '输入图片问题（原生接入后附加图片）',
-    GemmaTaskId.askAudio => '输入声音问题（原生接入后附加音频）',
-  };
 }
 
-class _ModelCard extends StatelessWidget {
-  const _ModelCard({required this.config, required this.status});
-  final GemmaModelConfig config;
-  final ModelDownloadStatus status;
+class _AppTitle extends StatelessWidget {
+  const _AppTitle();
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('galleryFlutter', style: Theme.of(context).textTheme.titleMedium),
+        Text(
+          'Gemma-4-E2B-it · Local AI',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
+    );
+  }
+}
+
+class _CapabilityRail extends StatelessWidget {
+  const _CapabilityRail({
+    required this.enabledModes,
+    required this.template,
+    required this.onToggleMode,
+    required this.onTemplateChanged,
+  });
+
+  final Set<_ComposerMode> enabledModes;
+  final PromptTemplate template;
+  final ValueChanged<_ComposerMode> onToggleMode;
+  final ValueChanged<PromptTemplate> onTemplateChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      elevation: 1,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        child: Row(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    config.name,
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
+            for (final mode in _ComposerMode.values)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: FilterChip(
+                  avatar: Icon(mode.icon, size: 18),
+                  label: Text(mode.label),
+                  selected: enabledModes.contains(mode),
+                  onSelected: mode == _ComposerMode.text
+                      ? null
+                      : (_) => onToggleMode(mode),
                 ),
-                _StatusChip(status: status),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(config.description),
-            const SizedBox(height: 8),
-            Text('文件: ${config.modelFile}'),
-            Text(
-              '大小: ${(config.sizeInBytes / 1024 / 1024 / 1024).toStringAsFixed(2)} GB',
-            ),
-            Text('内存要求: ${config.minDeviceMemoryInGb} GB+'),
-            Text(
-              '上下文: ${config.maxContextLength}, 输出: ${config.maxTokens} tokens',
-            ),
-            if (!status.isDownloaded) ...[
-              const SizedBox(height: 8),
-              const Text('请从左侧设置 > Models 下载模型后再使用。'),
-            ],
+              ),
+            if (enabledModes.contains(_ComposerMode.promptLab))
+              Padding(
+                padding: const EdgeInsets.only(left: 4),
+                child: DropdownButton<PromptTemplate>(
+                  value: template,
+                  underline: const SizedBox.shrink(),
+                  items: [
+                    for (final item in promptLabTemplates)
+                      DropdownMenuItem(value: item, child: Text(item.label)),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) onTemplateChanged(value);
+                  },
+                ),
+              ),
           ],
         ),
       ),
@@ -248,8 +306,186 @@ class _ModelCard extends StatelessWidget {
   }
 }
 
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.status});
+class _ChatTranscript extends StatelessWidget {
+  const _ChatTranscript({required this.controller, required this.messages});
+
+  final ScrollController controller;
+  final List<_ChatMessage> messages;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView.builder(
+      controller: controller,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      itemCount: messages.length,
+      itemBuilder: (context, index) => _MessageBubble(message: messages[index]),
+    );
+  }
+}
+
+class _MessageBubble extends StatelessWidget {
+  const _MessageBubble({required this.message});
+
+  final _ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final isUser = message.role == _ChatRole.user;
+    final colorScheme = Theme.of(context).colorScheme;
+    return Align(
+      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.sizeOf(context).width * 0.82,
+        ),
+        child: Card(
+          elevation: 0,
+          color: isUser
+              ? colorScheme.primaryContainer
+              : colorScheme.surfaceContainerHighest,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(
+                  message.text.isEmpty && message.streaming
+                      ? '思考中…'
+                      : message.text,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                if (message.streaming) ...[
+                  const SizedBox(height: 8),
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Composer extends StatelessWidget {
+  const _Composer({
+    required this.controller,
+    required this.enabledModes,
+    required this.running,
+    required this.onToggleMode,
+    required this.onSend,
+  });
+
+  final TextEditingController controller;
+  final Set<_ComposerMode> enabledModes;
+  final bool running;
+  final ValueChanged<_ComposerMode> onToggleMode;
+  final VoidCallback onSend;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: colorScheme.outlineVariant),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: controller,
+                  minLines: 1,
+                  maxLines: 5,
+                  textInputAction: TextInputAction.newline,
+                  decoration: const InputDecoration(
+                    hintText: '发送消息，或添加图片/语音/Skills/Prompt Lab…',
+                    border: InputBorder.none,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12),
+                  ),
+                ),
+                Row(
+                  children: [
+                    _ComposerIcon(
+                      mode: _ComposerMode.image,
+                      selected: enabledModes.contains(_ComposerMode.image),
+                      onTap: () => onToggleMode(_ComposerMode.image),
+                    ),
+                    _ComposerIcon(
+                      mode: _ComposerMode.voice,
+                      selected: enabledModes.contains(_ComposerMode.voice),
+                      onTap: () => onToggleMode(_ComposerMode.voice),
+                    ),
+                    _ComposerIcon(
+                      mode: _ComposerMode.skills,
+                      selected: enabledModes.contains(_ComposerMode.skills),
+                      onTap: () => onToggleMode(_ComposerMode.skills),
+                    ),
+                    _ComposerIcon(
+                      mode: _ComposerMode.promptLab,
+                      selected: enabledModes.contains(_ComposerMode.promptLab),
+                      onTap: () => onToggleMode(_ComposerMode.promptLab),
+                    ),
+                    const Spacer(),
+                    FilledButton.tonalIcon(
+                      onPressed: running ? null : onSend,
+                      icon: running
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.arrow_upward),
+                      label: Text(running ? '生成中' : '发送'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ComposerIcon extends StatelessWidget {
+  const _ComposerIcon({
+    required this.mode,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _ComposerMode mode;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton.filledTonal(
+      isSelected: selected,
+      tooltip: mode.label,
+      onPressed: onTap,
+      icon: Icon(mode.icon),
+    );
+  }
+}
+
+class _ModelStatusChip extends StatelessWidget {
+  const _ModelStatusChip({required this.status});
   final ModelDownloadStatus status;
 
   @override
@@ -268,6 +504,41 @@ class _StatusChip extends StatelessWidget {
       label: Text(label),
       side: BorderSide(color: color),
       labelStyle: TextStyle(color: color),
+      visualDensity: VisualDensity.compact,
+    );
+  }
+}
+
+enum _ComposerMode {
+  text('文字', Icons.chat_bubble_outline),
+  image('图片', Icons.image_outlined),
+  voice('语音', Icons.mic_none),
+  skills('Skills', Icons.extension_outlined),
+  promptLab('Prompt Lab', Icons.science_outlined);
+
+  const _ComposerMode(this.label, this.icon);
+  final String label;
+  final IconData icon;
+}
+
+enum _ChatRole { user, assistant }
+
+class _ChatMessage {
+  const _ChatMessage({
+    required this.role,
+    required this.text,
+    this.streaming = false,
+  });
+
+  final _ChatRole role;
+  final String text;
+  final bool streaming;
+
+  _ChatMessage copyWith({String? text, bool? streaming}) {
+    return _ChatMessage(
+      role: role,
+      text: text ?? this.text,
+      streaming: streaming ?? this.streaming,
     );
   }
 }
