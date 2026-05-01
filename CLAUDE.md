@@ -1,0 +1,1064 @@
+# CLAUDE.md
+
+本文件是 `gemma_local_app` 工程的完整会话记录、项目规划、架构说明、实现方式和后续开发指南。后续任何 AI/Claude/Agent 接手本项目时，优先阅读并维护本文件。
+
+## 1. 项目定位
+
+项目路径：
+
+```text
+/Users/sanbo/Desktop/gallery/gemma_local_app
+```
+
+来源工程路径：
+
+```text
+/Users/sanbo/Desktop/gallery
+```
+
+来源工程是 Google AI Edge Gallery Android 工程。本项目目标是从该 Android 工程中抽取 Gemma 本地能力，新建一个 Flutter 跨平台本地化程序，只使用 `Gemma-4-E2B-it` 模型，并逐步支持：
+
+- iOS
+- Android
+- macOS
+- Windows
+- Linux
+
+核心产品能力目标：
+
+- 本地对话
+- 图片理解
+- 声音理解
+- Prompt Lab
+- Agent Skills
+- 侧边设置 Models 中下载模型
+- 下载完成后使用本地模型文件进行推理
+
+当前阶段性质：
+
+- 架构设计已完成，可以进入工程实现阶段。
+- 已完成 Flutter 跨平台工程骨架。
+- 已完成单模型配置抽取。
+- 已完成侧边 Models 下载模型流程。
+- 已完成 Prompt Lab / Skills / Runtime 抽象骨架。
+- 已开始 Android LiteRT-LM MethodChannel 真推理桥接：已添加 LiteRT-LM Android 依赖、MainActivity MethodChannel/EventChannel 桥接骨架、Dart MethodChannelGemmaRuntime 调用逻辑。
+- Android LiteRT-LM 桥接仍需通过 Gradle 构建和真机模型推理验证。
+
+## 2. 会话背景与用户要求
+
+用户最初要求：
+
+> 这是谷歌的一个 gemma 本地的软件，帮我抽取下，我希望只使用 gemma-4-e2b-it 模型，然后新建一个工程，把这部分抽取并梳理成支持 ios/android/mac/win/linux 的本地化程序，我手机安装了编译后的版本，看上去支持图片/声音/对话/skills/prompt lab
+
+随后用户补充：
+
+> 好，模型也使用和这套工程一样的方式，下载然后使用。现在工程是侧边设置 models 中下载这个模型
+
+最后用户要求：
+
+> 所有的进展项目规划，全部整理到一个文件中 /Users/sanbo/Desktop/gallery/gemma_local_app/CLAUDE.md 中，要求会话，项目架构，实现方式等完整，完善
+
+重要偏好：
+
+- 所有项目进展、架构、逻辑、规划都要同步到文档。
+- 当前汇总文件是本文件：`CLAUDE.md`。
+- 后续若继续开发，必须更新本文件中的进展、决策、待办和验证记录。
+
+## 3. 来源工程关键路径
+
+Google AI Edge Gallery Android 工程中已定位的关键代码：
+
+```text
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/data/Model.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/data/Tasks.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/data/ModelAllowlist.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/ui/llmchat/LlmChatModelHelper.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/runtime/LlmModelHelper.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/ui/llmsingleturn/PromptTemplateConfigs.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/customtasks/agentchat/
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/assets/skills/*/SKILL.md
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/proto/skill.proto
+```
+
+模型下载相关来源路径：
+
+```text
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/ui/modelmanager/ModelManager.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/ui/modelmanager/ModelManagerViewModel.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/data/DownloadRepository.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/worker/DownloadWorker.kt
+/Users/sanbo/Desktop/gallery/Android/src/app/src/main/java/com/google/ai/edge/gallery/data/Consts.kt
+```
+
+模型 allowlist 来源：
+
+```text
+/Users/sanbo/Desktop/gallery/model_allowlists/1_0_12.json
+```
+
+## 4. 单模型策略
+
+本项目只使用一个模型：
+
+```text
+Gemma-4-E2B-it
+```
+
+抽取来源：
+
+```text
+/Users/sanbo/Desktop/gallery/model_allowlists/1_0_12.json
+```
+
+模型配置：
+
+```json
+{
+  "name": "Gemma-4-E2B-it",
+  "modelId": "litert-community/gemma-4-E2B-it-litert-lm",
+  "modelFile": "gemma-4-E2B-it.litertlm",
+  "commitHash": "7fa1d78473894f7e736a21d920c3aa80f950c0db",
+  "sizeInBytes": 2583085056,
+  "minDeviceMemoryInGb": 8,
+  "llmSupportImage": true,
+  "llmSupportAudio": true,
+  "llmSupportThinking": true,
+  "defaultConfig": {
+    "topK": 64,
+    "topP": 0.95,
+    "temperature": 1.0,
+    "maxContextLength": 32000,
+    "maxTokens": 4000,
+    "accelerators": "gpu,cpu",
+    "visionAccelerator": "gpu"
+  },
+  "taskTypes": [
+    "llm_chat",
+    "llm_prompt_lab",
+    "llm_agent_chat",
+    "llm_ask_image",
+    "llm_ask_audio"
+  ],
+  "bestForTaskTypes": [
+    "llm_chat",
+    "llm_prompt_lab",
+    "llm_agent_chat",
+    "llm_ask_image",
+    "llm_ask_audio"
+  ]
+}
+```
+
+下载地址：
+
+```text
+https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm?download=true
+```
+
+Flutter 固化位置：
+
+```text
+lib/src/core/model/gemma_model_config.dart
+```
+
+注意：后续不要重新引入其它模型列表；除非用户明确要求，否则保持单模型。
+
+## 5. 新工程结构
+
+当前主要 Flutter/Dart 文件：
+
+```text
+lib/main.dart
+lib/src/app/gemma_local_app.dart
+lib/src/core/model/gemma_model_config.dart
+lib/src/core/runtime/local_gemma_runtime.dart
+lib/src/core/runtime/platform_gemma_runtime.dart
+lib/src/features/gemma_home/gemma_home_screen.dart
+lib/src/features/models/model_download_service.dart
+lib/src/features/models/models_drawer.dart
+lib/src/features/prompt_lab/prompt_templates.dart
+lib/src/features/skills/skill.dart
+```
+
+测试：
+
+```text
+test/widget_test.dart
+```
+
+已生成平台目录：
+
+```text
+android/
+ios/
+macos/
+windows/
+linux/
+```
+
+文档目录：
+
+```text
+docs/architecture.md
+docs/feature_mapping.md
+docs/model_download_flow.md
+docs/model_gemma_4_e2b_it.md
+docs/progress.md
+CLAUDE.md
+README.md
+```
+
+## 6. 当前依赖
+
+`pubspec.yaml` 当前核心依赖：
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  path_provider: ^2.1.5
+  http: ^1.6.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+```
+
+依赖用途：
+
+- `path_provider`：跨平台获取 Application Support Directory，用作模型下载和存储目录。
+- `http`：Dart 前台下载 HuggingFace 模型，支持 HTTP Range 断点续传。
+
+## 7. 架构设计
+
+整体分层：
+
+```text
+UI 层
+  GemmaHomeScreen
+  ModelsDrawer
+
+Feature 层
+  models/model_download_service.dart
+  prompt_lab/prompt_templates.dart
+  skills/skill.dart
+
+Core 层
+  model/gemma_model_config.dart
+  runtime/local_gemma_runtime.dart
+  runtime/platform_gemma_runtime.dart
+
+Platform 层
+  Android MethodChannel -> LiteRT-LM Engine / Conversation，已建立桥接骨架，待构建/真机验证
+  iOS/macOS/Windows/Linux 本地后端，待实现
+```
+
+### 7.1 App 入口
+
+```text
+lib/main.dart
+```
+
+职责：
+
+- 调用 `runApp(const GemmaLocalApp())`。
+
+### 7.2 App 壳
+
+```text
+lib/src/app/gemma_local_app.dart
+```
+
+职责：
+
+- 配置 `MaterialApp`。
+- 配置 light/dark theme。
+- 入口页面为 `GemmaHomeScreen`。
+
+### 7.3 模型配置
+
+```text
+lib/src/core/model/gemma_model_config.dart
+```
+
+职责：
+
+- 定义 `GemmaModelConfig`。
+- 定义 `GemmaTaskId`。
+- 定义 `GemmaAccelerator`。
+- 固化 `gemma4E2bIt`。
+- 生成 HuggingFace 下载 URL。
+- 生成本地模型路径。
+
+关键路径生成逻辑：
+
+```dart
+String get huggingFaceDownloadUrl =>
+    'https://huggingface.co/$modelId/resolve/$commitHash/$modelFile?download=true';
+
+String get normalizedName => name.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
+
+String localModelPath(String appFilesDir) =>
+    '$appFilesDir/$normalizedName/$commitHash/$modelFile';
+```
+
+注意：这里必须使用真实 Dart 字符串插值，不要写成 `\$modelId` 或 `\${config.name}`。
+
+### 7.4 运行时抽象
+
+```text
+lib/src/core/runtime/local_gemma_runtime.dart
+```
+
+职责：
+
+- 定义 Flutter 侧统一本地模型运行时接口。
+
+接口：
+
+```dart
+abstract interface class LocalGemmaRuntime {
+  Future<void> initialize(GemmaModelConfig config);
+  Stream<String> generate(GemmaRequest request);
+  Future<void> stop();
+  Future<void> dispose();
+}
+```
+
+请求结构：
+
+```dart
+class GemmaRequest {
+  final String prompt;
+  final String? systemPrompt;
+  final List<String> imagePaths;
+  final List<String> audioPaths;
+  final List<String> enabledSkillNames;
+}
+```
+
+### 7.5 当前平台运行时占位
+
+```text
+lib/src/core/runtime/platform_gemma_runtime.dart
+```
+
+职责：
+
+- 当前 `MethodChannelGemmaRuntime` 在 Android 上调用 `com.example.gemma_local_app/runtime` MethodChannel 和 `com.example.gemma_local_app/runtime_events` EventChannel；非 Android 平台使用 `PlaceholderGemmaRuntime` 占位实现。
+- 下载完成后可初始化 Android LiteRT-LM。
+- `generate()` 在 Android 上通过 EventChannel 流式返回 token；非 Android 平台仍输出占位提示。
+
+当前 Android 原生桥接：
+
+- `android/app/src/main/kotlin/com/example/gemma_local_app/MainActivity.kt`
+- MethodChannel：`com.example.gemma_local_app/runtime`
+- EventChannel：`com.example.gemma_local_app/runtime_events`
+- 方法：`initialize` / `generate` / `stop` / `dispose`
+
+后续目标：
+
+- Android：完成 Gradle 构建验证和真机 LiteRT-LM 推理验证。
+- 其它平台：接入对应本地推理后端。
+
+### 7.6 主页面
+
+```text
+lib/src/features/gemma_home/gemma_home_screen.dart
+```
+
+职责：
+
+- 展示单模型卡片。
+- 展示模型下载状态 Chip。
+- 展示任务入口：对话、Prompt Lab、Skills、图片理解、声音理解。
+- 输入框与发送按钮。
+- 模型未下载时阻止发送并提示。
+- 接入侧边 Models Drawer。
+
+当前逻辑：
+
+- `initState()` 中创建并监听 `ModelDownloadController` 状态。
+- `refreshStatus(gemma4E2bIt)` 检查本地模型文件是否存在。
+- 如果模型已下载，则调用 `_runtime.initialize(gemma4E2bIt)`。
+- 点击发送前检查 `_downloadStatus.isDownloaded`。
+
+### 7.7 Models 侧边栏
+
+```text
+lib/src/features/models/models_drawer.dart
+```
+
+职责：
+
+- 提供左侧设置 UI。
+- 显示 `Models` 分组。
+- 只展示 `Gemma-4-E2B-it`。
+- 展示状态、路径、进度、速度、错误。
+- 提供按钮：下载、暂停、刷新、删除。
+
+### 7.8 模型下载服务
+
+```text
+lib/src/features/models/model_download_service.dart
+```
+
+职责：
+
+- 管理模型下载状态。
+- 使用 `path_provider.getApplicationSupportDirectory()` 获取跨平台 app files dir。
+- 使用 Dart `http.Client` 下载。
+- 使用 `.gallerytmp` 临时文件。
+- 支持 HTTP Range 断点续传。
+- 下载完成后 rename 成正式 `.litertlm` 文件。
+- 支持删除模型目录。
+
+状态枚举：
+
+```dart
+enum ModelDownloadStatusType {
+  notDownloaded,
+  partiallyDownloaded,
+  inProgress,
+  succeeded,
+  failed,
+}
+```
+
+临时扩展名：
+
+```dart
+const galleryTmpFileExt = 'gallerytmp';
+```
+
+当前下载策略与原工程保持一致的部分：
+
+- 不把模型打包进 App。
+- 侧边 Models 触发下载。
+- 临时文件：`{modelFile}.gallerytmp`。
+- 存在临时文件时用 HTTP `Range` 继续下载。
+- 下载成功后 rename。
+- 主功能要求模型已下载。
+
+当前与原工程差异：
+
+- 原 Android 工程使用 WorkManager 后台下载和通知。
+- 当前 Flutter 工程使用 Dart 前台下载。
+- 后续 Android 真机可升级为 WorkManager 后台下载，或保留 Dart 方案。
+
+## 8. 模型存储路径
+
+原 Google AI Edge Gallery Android 路径规则：
+
+```text
+{externalFilesDir}/{normalizedName}/{version}/{downloadFileName}
+```
+
+新 Flutter 工程使用：
+
+```text
+{applicationSupportDirectory}/{normalizedName}/{commitHash}/{modelFile}
+```
+
+对于当前模型，最终路径为：
+
+```text
+{applicationSupportDirectory}/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm
+```
+
+临时下载路径为：
+
+```text
+{applicationSupportDirectory}/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm.gallerytmp
+```
+
+## 9. 功能映射
+
+### 9.1 对话
+
+来源：
+
+```text
+LlmChatModelHelper.initialize(...)
+LlmChatModelHelper.runInference(...)
+```
+
+当前 Flutter 抽取：
+
+- 入口：`GemmaTaskId.chat`
+- 请求：`GemmaRequest(prompt: ...)`
+- 运行时：`LocalGemmaRuntime.generate(...)`
+
+待实现：
+
+- Android MethodChannel 真调用 LiteRT-LM `Conversation.generateResponseAsync` 或等效 API。
+
+### 9.2 图片理解
+
+来源：
+
+```text
+Model.llmSupportImage
+EngineConfig.visionBackend
+runInference(images: List<Bitmap>)
+```
+
+当前 Flutter 抽取：
+
+- 入口：`GemmaTaskId.askImage`
+- 请求字段：`GemmaRequest.imagePaths`
+- UI 目前仅保留入口和提示，尚未接图片选择器。
+
+待实现：
+
+- Flutter 侧选择图片。
+- MethodChannel 传图片路径或 bytes。
+- Android 原生转换为 Bitmap / LiteRT-LM 可接受输入。
+
+### 9.3 声音理解
+
+来源：
+
+```text
+Model.llmSupportAudio
+EngineConfig.audioBackend = Backend.CPU()
+runInference(audioClips: List<ByteArray>)
+```
+
+当前 Flutter 抽取：
+
+- 入口：`GemmaTaskId.askAudio`
+- 请求字段：`GemmaRequest.audioPaths`
+- UI 目前仅保留入口和提示，尚未接音频选择/录音。
+
+待实现：
+
+- Flutter 侧音频选择或录音。
+- MethodChannel 传音频路径或 bytes。
+- Android 原生转换为 ByteArray。
+
+### 9.4 Prompt Lab
+
+来源：
+
+```text
+PromptTemplateConfigs.kt
+```
+
+来源模板：
+
+- Free form
+- Rewrite tone
+- Summarize text
+- Code snippet
+
+当前 Flutter 抽取：
+
+```text
+lib/src/features/prompt_lab/prompt_templates.dart
+```
+
+职责：
+
+- 定义 `PromptTemplate`。
+- 提供基础模板和 prompt 拼接。
+
+待增强：
+
+- 复刻原工程更多 editor 配置。
+- 复刻原工程更丰富样例。
+
+### 9.5 Skills / Agent Chat
+
+来源：
+
+```text
+AgentChatTaskModule.kt
+SkillManagerViewModel.kt
+skill.proto
+assets/skills/*/SKILL.md
+```
+
+原工程核心机制：
+
+1. 从 assets 和 DataStore 加载 Skills。
+2. 生成包含 `___SKILLS___` 的系统提示词。
+3. 通过 LiteRT-LM `ToolProvider` 暴露 `load_skill` / `run_intent` 等工具。
+4. 使用 constrained decoding 提高工具调用稳定性。
+
+当前 Flutter 抽取：
+
+```text
+lib/src/features/skills/skill.dart
+```
+
+当前内容：
+
+- `GemmaSkill` 数据结构。
+- `agentSkillsSystemPrompt`。
+- 部分内置 skill 占位：
+  - calculate-hash
+  - query-wikipedia
+  - qr-code
+  - send-email
+
+待实现：
+
+- 读取 assets/skills/SKILL.md。
+- 支持启用/禁用 skills。
+- 支持 secret/API key。
+- Android 原生 ToolProvider 桥接。
+- Dart/平台侧 tool call 分发。
+
+## 10. Android LiteRT-LM 接入规划
+
+当前最重要的下一步：让 Android 真机使用已下载模型跑本地推理。
+
+### 10.1 原工程运行时映射
+
+来源：
+
+```text
+Android/src/app/src/main/java/com/google/ai/edge/gallery/ui/llmchat/LlmChatModelHelper.kt
+```
+
+原工程初始化核心：
+
+```kotlin
+val engineConfig = EngineConfig(
+  modelPath = modelPath,
+  backend = preferredBackend,
+  visionBackend = if (shouldEnableImage) visionBackend else null,
+  audioBackend = if (shouldEnableAudio) Backend.CPU() else null,
+  maxNumTokens = maxTokens,
+  cacheDir = if (modelPath.startsWith("/data/local/tmp"))
+    context.getExternalFilesDir(null)?.absolutePath
+  else null,
+)
+
+val engine = Engine(engineConfig)
+engine.initialize()
+
+val conversation = engine.createConversation(
+  ConversationConfig(
+    samplerConfig = SamplerConfig(
+      topK = topK,
+      topP = topP.toDouble(),
+      temperature = temperature.toDouble(),
+    ),
+    systemInstruction = systemInstruction,
+    tools = tools,
+  )
+)
+```
+
+本项目 Android MethodChannel 应接收 Dart 参数：
+
+```json
+{
+  "modelPath": ".../Gemma_4_E2B_it/.../gemma-4-E2B-it.litertlm",
+  "topK": 64,
+  "topP": 0.95,
+  "temperature": 1.0,
+  "maxTokens": 4000,
+  "supportImage": true,
+  "supportAudio": true,
+  "accelerator": "gpu"
+}
+```
+
+### 10.2 MethodChannel 建议接口
+
+Dart -> Android：
+
+```text
+gemma_local/runtime.initialize
+gemma_local/runtime.generate
+gemma_local/runtime.stop
+gemma_local/runtime.dispose
+```
+
+或者统一 channel：
+
+```text
+com.sanbo.gemma_local/runtime
+```
+
+方法：
+
+```text
+initialize(Map config)
+generate(Map request)
+stop()
+dispose()
+```
+
+返回方式：
+
+- 简单版：`generate` 一次性返回完整字符串。
+- 推荐版：MethodChannel + EventChannel 流式返回 token。
+
+### 10.3 Android Gradle 依赖
+
+需要从原工程确认 LiteRT-LM 依赖：
+
+```text
+Android/src/app/build.gradle.kts
+```
+
+已观察到：
+
+```kotlin
+implementation(libs.litertlm)
+```
+
+接入新 Flutter Android 工程时，需要把对应 Maven repository / version catalog / dependency 迁移到：
+
+```text
+android/app/build.gradle.kts
+android/settings.gradle.kts
+android/build.gradle.kts
+```
+
+注意：不要盲目复制整个 Android 工程，只迁移 LiteRT-LM 运行必要依赖。
+
+### 10.4 Android 权限
+
+下载当前由 Dart 完成，不需要 Android WorkManager 下载权限。但后续如果迁移 WorkManager 后台下载，可能需要通知权限：
+
+```text
+POST_NOTIFICATIONS
+```
+
+当前推理本身主要依赖本地文件访问和 native libs。
+
+## 11. iOS/macOS/Windows/Linux 接入规划
+
+当前只创建了统一 Flutter 壳和运行时接口。桌面与 iOS 本地推理后端尚未选型。
+
+候选方案：
+
+1. 如果 Google LiteRT-LM 有对应平台 SDK：优先使用同模型格式 `.litertlm`。
+2. 如果 `.litertlm` 主要面向 Android：需要确认是否可在 iOS/macOS/Windows/Linux 直接加载。
+3. 若不可用：考虑转换/替代本地后端，例如 MediaPipe、LiteRT、llama.cpp，但这会影响模型格式和下载源。
+
+当前原则：
+
+- Flutter 层保持 `LocalGemmaRuntime` 接口稳定。
+- 每个平台单独实现平台 adapter。
+- 不在业务 UI 里写平台分支，除非是输入选择器差异。
+
+## 12. 已完成进度
+
+已完成：
+
+- [x] 检查来源工程位置：`/Users/sanbo/Desktop/gallery`
+- [x] 确认来源工程是 Google AI Edge Gallery Android 工程
+- [x] 定位 Gemma-4-E2B-it allowlist 配置
+- [x] 确认 Gemma-4-E2B-it 支持图片、声音、对话、Skills、Prompt Lab
+- [x] 新建 Flutter 工程：`/Users/sanbo/Desktop/gallery/gemma_local_app`
+- [x] 创建 iOS / Android / macOS / Windows / Linux 平台目录
+- [x] 抽取单模型配置到 Dart
+- [x] 建立 `LocalGemmaRuntime` 统一接口
+- [x] 建立主界面骨架
+- [x] 建立 Prompt Lab 模板骨架
+- [x] 建立 Skills 数据结构和系统提示词骨架
+- [x] 实现侧边设置 `Models` 中下载 Gemma-4-E2B-it
+- [x] 实现 `.gallerytmp` 临时文件和 HTTP Range 断点续传
+- [x] 模型未下载时阻止发送并提示去 Models 下载
+- [x] 下载完成后调用 `_runtime.initialize(gemma4E2bIt)`
+- [x] 更新 docs 与 README
+- [x] 创建本文件 `CLAUDE.md`
+- [x] 明确：架构设计已完成，可以开始工程编程实现
+- [x] Android 最小 LiteRT-LM 依赖迁移：`com.google.ai.edge.litertlm:litertlm-android:0.10.0`
+- [x] Android `MainActivity.kt` 增加 MethodChannel/EventChannel 桥接骨架
+- [x] Dart `platform_gemma_runtime.dart` 改为 Android MethodChannel 调用，非 Android 保留占位实现
+
+## 13. 待完成规划
+
+优先级 P0：Android 真推理
+
+- [x] 迁移 LiteRT-LM Android 依赖到 Flutter Android 工程。
+- [x] 实现 Android MethodChannel runtime 骨架。
+- [x] 用下载后的本地模型路径初始化 `Engine` 的代码路径。
+- [x] 创建 `Conversation` 的代码路径。
+- [x] 实现文本对话 generate 的 EventChannel 流式返回代码路径。
+- [x] 支持 stop/cancel 的代码路径。
+- [x] 支持 dispose/cleanup 的代码路径。
+- [ ] Android Gradle 编译通过。
+- [ ] Android 真机下载模型后完成真实推理验证。
+- [ ] Android 真机 Profile/Release 验证。
+
+优先级 P1：输入能力
+
+- [ ] 图片选择器。
+- [ ] 图片路径/bytes 传给 Android。
+- [ ] Android Bitmap 转换并传给 LiteRT-LM。
+- [ ] 音频选择或录音。
+- [ ] 音频 bytes 传给 Android。
+- [ ] Android ByteArray 输入接入 LiteRT-LM。
+
+优先级 P1：Skills
+
+- [ ] 把原工程 assets/skills 的 SKILL.md 复制/整理到 Flutter assets。
+- [ ] 在 `pubspec.yaml` 注册 skills assets。
+- [ ] Flutter 侧加载 SKILL.md。
+- [ ] 实现 selected/enabled 状态。
+- [ ] 实现 `___SKILLS___` 注入。
+- [ ] Android ToolProvider 桥接 `load_skill`。
+- [ ] Android ToolProvider 桥接 `run_intent` 或 Dart tool 分发。
+- [ ] 支持 require_secret。
+
+优先级 P2：模型下载增强
+
+- [ ] 下载文件完整性校验。
+- [ ] sha256 或 size 校验。
+- [ ] 下载失败重试策略。
+- [ ] Android 后台下载/通知，可选 WorkManager。
+- [ ] 下载速度、剩余时间展示优化。
+
+优先级 P2：Prompt Lab
+
+- [ ] 复刻更多原工程 PromptTemplateConfigs。
+- [ ] 支持模板参数编辑器。
+- [ ] 增加样例 prompt。
+
+优先级 P3：多平台后端
+
+- [ ] iOS 本地后端调研。
+- [ ] macOS 本地后端调研。
+- [ ] Windows 本地后端调研。
+- [ ] Linux 本地后端调研。
+- [ ] 保持 Flutter `LocalGemmaRuntime` 接口不变。
+
+## 14. 当前验证记录
+
+### 14.1 Android 真机优先验证顺序
+
+用户明确要求严格按平台顺序验证：
+
+1. Android 真机先测试。
+2. Android 可以稳定工作后，再测试 iOS 真机。
+3. iOS 稳定后，再测试 macOS / Windows / Linux。
+
+当前不能跳到 iOS/macOS/Windows/Linux。
+
+### 14.2 Android 真机启动验证
+
+设备：
+
+```text
+Pixel 8 • 37101FDJH0077P • android-arm64 • Android 16 API 36
+```
+
+已执行：
+
+```bash
+cd /Users/sanbo/Desktop/gallery/gemma_local_app
+flutter build apk --debug
+adb -s 37101FDJH0077P install -r build/app/outputs/flutter-apk/app-debug.apk
+adb -s 37101FDJH0077P shell monkey -p com.example.gemma_local_app -c android.intent.category.LAUNCHER 1
+adb -s 37101FDJH0077P shell pidof com.example.gemma_local_app
+adb -s 37101FDJH0077P logcat -d -t 300 | grep -E "GemmaLiteRtRuntime|gemma_local_app|FATAL EXCEPTION|AndroidRuntime" | tail -120
+```
+
+结果：
+
+```text
+Install Success
+Displayed com.example.gemma_local_app/.MainActivity
+Fully drawn com.example.gemma_local_app/.MainActivity
+pid: 31382
+未发现 FATAL EXCEPTION / AndroidRuntime 崩溃日志
+```
+
+结论：Android 真机 Debug APK 已可安装并启动，当前只验证到 App 启动稳定；尚未验证模型下载完成后的真实 LiteRT-LM 推理。下一步仍必须继续 Android 真机：下载 Gemma-4-E2B-it，触发 initialize/generate，检查 GemmaLiteRtRuntime 日志和模型输出。
+
+### 14.3 常规工程验证
+
+最近一次常规验证命令：
+
+```bash
+cd /Users/sanbo/Desktop/gallery/gemma_local_app
+dart format lib test
+flutter analyze
+flutter test
+flutter build apk --debug
+```
+
+结果：
+
+```text
+Formatted lib/src/features/gemma_home/gemma_home_screen.dart
+Formatted lib/src/features/models/model_download_service.dart
+Formatted lib/src/features/models/models_drawer.dart
+Formatted 11 files (3 changed) in 0.03 seconds.
+Analyzing gemma_local_app...
+No issues found! (ran in 2.1s)
+00:00 +0: loading /Users/sanbo/Desktop/gallery/gemma_local_app/test/widget_test.dart
+00:00 +0: Gemma Local smoke test
+00:00 +1: All tests passed!
+```
+
+每次修改后至少运行：
+
+```bash
+dart format lib test
+flutter analyze
+flutter test
+```
+
+## 15. 开发规范和注意事项
+
+### 15.1 Dart import 规则
+
+对于跨 feature 引用，优先使用清晰路径；若路径变深，建议改为 package import：
+
+```dart
+import 'package:gemma_local_app/src/core/model/gemma_model_config.dart';
+```
+
+避免过深相对路径造成 analyzer 解析问题。
+
+### 15.2 不要引入多模型
+
+本项目明确只使用 `Gemma-4-E2B-it`。不要把原工程整个 model allowlist 搬过来作为运行列表。
+
+### 15.3 模型不打包进 App
+
+模型必须通过侧边 `设置 > Models` 下载。
+
+不要把 `.litertlm` 加入 Flutter assets。
+
+### 15.4 下载临时文件规则
+
+保持与原工程一致：
+
+```text
+{modelFile}.gallerytmp
+```
+
+临时文件存在时，使用 HTTP Range 继续下载。
+
+下载完成后 rename 为正式文件。
+
+### 15.5 iOS 真机验证注意
+
+如果后续验证 iOS 真机，不要用 Debug 从手机桌面启动作为是否可独立运行的依据。应使用 Release/Profile 包验证。
+
+推荐模式：
+
+```bash
+flutter build ios --release
+xcrun devicectl device install app --device <UDID> build/ios/iphoneos/Runner.app
+xcrun devicectl device process launch --device <UDID> <bundle_id>
+```
+
+并检查进程是否持续存活和 crash logs。
+
+### 15.6 文档同步要求
+
+后续所有重大变化必须更新本文件：
+
+```text
+/Users/sanbo/Desktop/gallery/gemma_local_app/CLAUDE.md
+```
+
+如保留 docs 目录，也要同步更新相关 docs。
+
+## 16. 推荐下一步执行计划
+
+下一次继续开发时，建议直接从 P0 开始：
+
+1. 阅读原工程 LiteRT-LM Gradle 配置。
+2. 把 LiteRT-LM 依赖最小迁移到 Flutter Android 工程。
+3. 在 Android `MainActivity` 或独立 Kotlin 类中实现 MethodChannel。
+4. Dart `MethodChannelGemmaRuntime.initialize()` 传入模型本地路径和参数。
+5. Android 创建 `Engine` 和 `Conversation`。
+6. 先做最小文本 generate，一次性返回完整文本。
+7. 跑 Android emulator/真机验证。
+8. 再升级 EventChannel 流式 token。
+9. 最后接图片、音频、Skills。
+
+P0 最小验收标准：
+
+- 在侧边 Models 下载 Gemma-4-E2B-it。
+- 下载完成后主页面输入文字。
+- Android 原生 LiteRT-LM 使用本地 `.litertlm` 文件返回真实模型输出。
+- `flutter analyze` 和 `flutter test` 通过。
+- Android Profile/Release 真机可启动。
+
+## 17. 当前 Git/文件状态说明
+
+当前 `gemma_local_app/` 是新建目录，在父仓库中显示为 untracked：
+
+```text
+?? gemma_local_app/
+```
+
+父目录还存在其它未跟踪文件：
+
+```text
+?? ai-edge-gallery.apk
+?? model_download_urls_android_1_0_11.json
+```
+
+不要误删这些用户文件。
+
+## 18. 快速命令
+
+进入工程：
+
+```bash
+cd /Users/sanbo/Desktop/gallery/gemma_local_app
+```
+
+格式化和验证：
+
+```bash
+dart format lib test
+flutter analyze
+flutter test
+```
+
+运行 macOS 版本：
+
+```bash
+flutter run -d macos
+```
+
+运行 Android，需设备/emulator：
+
+```bash
+flutter devices
+flutter run -d <device_id>
+```
+
+构建 Android APK：
+
+```bash
+flutter build apk --release
+```
+
+构建 iOS Release，需签名配置：
+
+```bash
+flutter build ios --release
+```
+
+## 19. 文件维护要求
+
+本文件是项目主上下文。后续 agent 接手时：
+
+1. 先读本文件。
+2. 再读当前相关代码。
+3. 修改代码后更新本文件中的：
+   - 已完成进度
+   - 待完成规划
+   - 验证记录
+   - 架构变更
+   - 重要决策
+4. 运行验证命令。
+5. 最终回复用户时说明改动路径和验证结果。
