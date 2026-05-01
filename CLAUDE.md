@@ -458,11 +458,70 @@ const galleryTmpFileExt = 'gallerytmp';
 
 ## 8. 模型存储路径
 
-原 Google AI Edge Gallery Android 路径规则：
+### 8.1 原 Google AI Edge Gallery Android 模型目录
+
+原始代码依据：
+
+- `Android/src/app/src/main/java/com/google/ai/edge/gallery/data/Model.kt`
+  - `Model.getPath(context, fileName)` 使用 `context.getExternalFilesDir(null)`。
+  - 默认拼接：`{externalFilesDir}/{normalizedName}/{version}/{downloadFileName}`。
+- `Android/src/app/src/main/java/com/google/ai/edge/gallery/worker/DownloadWorker.kt`
+  - 下载目录：`applicationContext.getExternalFilesDir(null) / modelDir / version`。
+  - 临时文件：`{fileName}.gallerytmp`。
+  - 下载完成后 rename 成正式模型文件。
+
+Android 外部应用文件目录实际对应：
 
 ```text
-{externalFilesDir}/{normalizedName}/{version}/{downloadFileName}
+/storage/emulated/0/Android/data/<app_id>/files
 ```
+
+原工程代码注释说明 app id 有两种常见情况：
+
+```text
+com.google.aiedge.gallery     # 从 GitHub source 构建的包名
+com.google.ai.edge.gallery    # Play Store / internal / 其它发布包名
+```
+
+Gemma-4-E2B-it 的原始模型最终路径：
+
+```text
+/storage/emulated/0/Android/data/<app_id>/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm
+```
+
+如果还没下载完成，临时文件路径是：
+
+```text
+/storage/emulated/0/Android/data/<app_id>/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm.gallerytmp
+```
+
+可用以下命令在 Android 真机上确认原 Edge Gallery 包名和文件：
+
+```bash
+adb shell pm list packages | grep -i gallery
+adb shell ls -lh /sdcard/Android/data/com.google.aiedge.gallery/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/
+adb shell ls -lh /sdcard/Android/data/com.google.ai.edge.gallery/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/
+```
+
+导出到 Mac：
+
+```bash
+mkdir -p /Users/sanbo/Desktop/gallery/exported_models/Gemma_4_E2B_it
+adb pull /sdcard/Android/data/com.google.aiedge.gallery/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm /Users/sanbo/Desktop/gallery/exported_models/Gemma_4_E2B_it/
+# 如果上面包名不存在，换用：
+adb pull /sdcard/Android/data/com.google.ai.edge.gallery/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm /Users/sanbo/Desktop/gallery/exported_models/Gemma_4_E2B_it/
+```
+
+导入到当前 galleryFlutter 测试 App，避免重复下载：
+
+```bash
+adb shell mkdir -p /sdcard/Android/data/com.example.gemma_local_app/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/
+adb push /Users/sanbo/Desktop/gallery/exported_models/Gemma_4_E2B_it/gemma-4-E2B-it.litertlm /sdcard/Android/data/com.example.gemma_local_app/files/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm
+```
+
+注意：当前 Flutter 侧使用 `path_provider.getApplicationSupportDirectory()`；在 Android 上通常也是 app 专属 files 目录。若实际路径有差异，可在 Models 页面刷新状态确认，或后续增加“导入本地模型”按钮。
+
+### 8.2 新 Flutter 工程模型目录
 
 新 Flutter 工程使用：
 
@@ -786,6 +845,11 @@ POST_NOTIFICATIONS
 - [x] 应用显示名称改为 `galleryFlutter`，已覆盖 Flutter 标题、Android label、iOS/macOS display name、Linux/Windows 窗口/资源名
 - [x] 主界面改为 ChatGPT 类聊天布局：顶部状态、中间消息气泡、底部 composer
 - [x] composer 增加图片、语音、Skills、Prompt Lab 快捷入口
+- [x] Android 模型下载改为系统后台下载：WorkManager + ForegroundInfo 通知 + `.gallerytmp` + HTTP Range 断点续传
+- [x] Android 下载桥接新增 MethodChannel/EventChannel：`com.example.gemma_local_app/model_download` / `model_download_events`
+- [x] Android 真机已重新编译安装，并授予 POST_NOTIFICATIONS 权限用于前台下载通知
+- [x] 常规验证通过：`dart format lib test`、`flutter analyze`、`flutter test`、`flutter build apk --debug`
+- [x] Android 后台下载点击闪退已定位并修复：Android 16 / targetSdk 36 禁止 foreground service type none，已给 WorkManager SystemForegroundService 合并 `android:foregroundServiceType="dataSync"`，ForegroundInfo 显式传 `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC`；adb 点击下载验证无 FATAL/ANR，WorkManager 持续下载，退后台仍有 progress，回前台 pid 不变
 
 ## 13. 待完成规划
 
@@ -827,7 +891,7 @@ POST_NOTIFICATIONS
 - [ ] 下载文件完整性校验。
 - [ ] sha256 或 size 校验。
 - [ ] 下载失败重试策略。
-- [ ] Android 后台下载/通知，可选 WorkManager。
+- [x] Android 后台下载/通知：WorkManager + ForegroundInfo dataSync + SystemForegroundService dataSync。
 - [ ] 下载速度、剩余时间展示优化。
 
 优先级 P2：Prompt Lab

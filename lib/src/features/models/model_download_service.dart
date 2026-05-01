@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
@@ -58,11 +59,32 @@ class ModelDownloadStatus {
 
 class ModelDownloadController {
   ModelDownloadController({http.Client? client})
-    : _client = client ?? http.Client();
+    : _fallback = _DartForegroundModelDownloader(client: client) {
+    if (Platform.isAndroid) {
+      _androidSubscription = _androidEventChannel
+          .receiveBroadcastStream()
+          .listen(
+            (event) => _emit(_statusFromNativeEvent(event)),
+            onError: (Object error) => _emit(
+              ModelDownloadStatus(
+                type: ModelDownloadStatusType.failed,
+                errorMessage: error.toString(),
+              ),
+            ),
+          );
+    }
+  }
 
-  final http.Client _client;
+  static const _androidMethodChannel = MethodChannel(
+    'com.example.gemma_local_app/model_download',
+  );
+  static const _androidEventChannel = EventChannel(
+    'com.example.gemma_local_app/model_download_events',
+  );
+
+  final _DartForegroundModelDownloader _fallback;
   final _statusController = StreamController<ModelDownloadStatus>.broadcast();
-  bool _cancelRequested = false;
+  StreamSubscription<dynamic>? _androidSubscription;
   ModelDownloadStatus _status = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
   );
@@ -70,6 +92,132 @@ class ModelDownloadController {
   Stream<ModelDownloadStatus> get statusStream => _statusController.stream;
 
   ModelDownloadStatus get status => _status;
+
+  Future<String> get appFilesDir => _fallback.appFilesDir;
+
+  Future<String> modelPath(GemmaModelConfig config) =>
+      _fallback.modelPath(config);
+
+  Future<String> tmpModelPath(GemmaModelConfig config) =>
+      _fallback.tmpModelPath(config);
+
+  Future<ModelDownloadStatus> refreshStatus(GemmaModelConfig config) async {
+    if (Platform.isAndroid) {
+      final result = await _androidMethodChannel
+          .invokeMapMethod<String, Object?>(
+            'refreshStatus',
+            _nativeArgs(config),
+          );
+      final status = _statusFromNativeMap(result ?? const {});
+      _emit(status);
+      return status;
+    }
+    final status = await _fallback.refreshStatus(config);
+    _emit(status);
+    return status;
+  }
+
+  Future<void> download(GemmaModelConfig config) async {
+    if (Platform.isAndroid) {
+      await _androidMethodChannel.invokeMethod<void>(
+        'download',
+        _nativeArgs(config),
+      );
+      return;
+    }
+    await _fallback.download(config, _emit);
+  }
+
+  Future<void> delete(GemmaModelConfig config) async {
+    if (Platform.isAndroid) {
+      final result = await _androidMethodChannel
+          .invokeMapMethod<String, Object?>('delete', _nativeArgs(config));
+      _emit(_statusFromNativeMap(result ?? const {}));
+      return;
+    }
+    await _fallback.delete(config);
+    _emit(_fallback.status);
+  }
+
+  void cancel() {
+    if (Platform.isAndroid) {
+      _androidMethodChannel.invokeMethod<void>(
+        'cancel',
+        _nativeArgs(gemma4E2bIt),
+      );
+      return;
+    }
+    _fallback.cancel();
+  }
+
+  void dispose() {
+    _androidSubscription?.cancel();
+    _fallback.dispose();
+    _statusController.close();
+  }
+
+  Map<String, Object?> _nativeArgs(GemmaModelConfig config) {
+    return {
+      'name': config.name,
+      'url': config.huggingFaceDownloadUrl,
+      'normalizedName': config.normalizedName,
+      'version': config.commitHash,
+      'fileName': config.modelFile,
+      'totalBytes': config.sizeInBytes,
+    };
+  }
+
+  ModelDownloadStatus _statusFromNativeEvent(dynamic event) {
+    if (event is Map) return _statusFromNativeMap(event);
+    return ModelDownloadStatus(
+      type: ModelDownloadStatusType.failed,
+      errorMessage: 'Invalid native download event: $event',
+    );
+  }
+
+  ModelDownloadStatus _statusFromNativeMap(Map<dynamic, dynamic> map) {
+    return ModelDownloadStatus(
+      type: _statusTypeFromString(map['status']?.toString()),
+      receivedBytes: _intFromNative(map['receivedBytes']),
+      totalBytes: _intFromNative(map['totalBytes']),
+      bytesPerSecond: _intFromNative(map['bytesPerSecond']),
+      errorMessage: map['errorMessage']?.toString() ?? '',
+      localPath: map['localPath']?.toString() ?? '',
+    );
+  }
+
+  ModelDownloadStatusType _statusTypeFromString(String? value) =>
+      switch (value) {
+        'partiallyDownloaded' => ModelDownloadStatusType.partiallyDownloaded,
+        'inProgress' => ModelDownloadStatusType.inProgress,
+        'succeeded' => ModelDownloadStatusType.succeeded,
+        'failed' => ModelDownloadStatusType.failed,
+        _ => ModelDownloadStatusType.notDownloaded,
+      };
+
+  int _intFromNative(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  void _emit(ModelDownloadStatus status) {
+    _status = status;
+    if (!_statusController.isClosed) {
+      _statusController.add(status);
+    }
+  }
+}
+
+class _DartForegroundModelDownloader {
+  _DartForegroundModelDownloader({http.Client? client})
+    : _client = client ?? http.Client();
+
+  final http.Client _client;
+  bool _cancelRequested = false;
+  ModelDownloadStatus status = const ModelDownloadStatus(
+    type: ModelDownloadStatusType.notDownloaded,
+  );
 
   Future<String> get appFilesDir async =>
       (await getApplicationSupportDirectory()).path;
@@ -88,37 +236,34 @@ class ModelDownloadController {
 
     if (await file.exists()) {
       final size = await file.length();
-      _emit(
-        ModelDownloadStatus(
-          type: ModelDownloadStatusType.succeeded,
-          receivedBytes: size,
-          totalBytes: config.sizeInBytes,
-          localPath: path,
-        ),
+      status = ModelDownloadStatus(
+        type: ModelDownloadStatusType.succeeded,
+        receivedBytes: size,
+        totalBytes: config.sizeInBytes,
+        localPath: path,
       );
     } else if (await tmpFile.exists()) {
       final size = await tmpFile.length();
-      _emit(
-        ModelDownloadStatus(
-          type: ModelDownloadStatusType.partiallyDownloaded,
-          receivedBytes: size,
-          totalBytes: config.sizeInBytes,
-          localPath: path,
-        ),
+      status = ModelDownloadStatus(
+        type: ModelDownloadStatusType.partiallyDownloaded,
+        receivedBytes: size,
+        totalBytes: config.sizeInBytes,
+        localPath: path,
       );
     } else {
-      _emit(
-        ModelDownloadStatus(
-          type: ModelDownloadStatusType.notDownloaded,
-          totalBytes: config.sizeInBytes,
-          localPath: path,
-        ),
+      status = ModelDownloadStatus(
+        type: ModelDownloadStatusType.notDownloaded,
+        totalBytes: config.sizeInBytes,
+        localPath: path,
       );
     }
-    return _status;
+    return status;
   }
 
-  Future<void> download(GemmaModelConfig config) async {
+  Future<void> download(
+    GemmaModelConfig config,
+    void Function(ModelDownloadStatus status) onStatus,
+  ) async {
     _cancelRequested = false;
     final finalPath = await modelPath(config);
     final tmpPath = await tmpModelPath(config);
@@ -148,7 +293,12 @@ class ModelDownloadController {
     var lastTick = DateTime.now();
     var lastBytes = downloadedBytes;
 
-    _emit(
+    void emit(ModelDownloadStatus next) {
+      status = next;
+      onStatus(next);
+    }
+
+    emit(
       ModelDownloadStatus(
         type: ModelDownloadStatusType.inProgress,
         receivedBytes: downloadedBytes,
@@ -182,7 +332,7 @@ class ModelDownloadController {
                 : (delta * 1000 / elapsedMs).round();
             lastTick = now;
             lastBytes = downloadedBytes;
-            _emit(
+            emit(
               ModelDownloadStatus(
                 type: ModelDownloadStatusType.inProgress,
                 receivedBytes: downloadedBytes,
@@ -202,7 +352,7 @@ class ModelDownloadController {
       }
       await tmpFile.rename(finalPath);
       stopwatch.stop();
-      _emit(
+      emit(
         ModelDownloadStatus(
           type: ModelDownloadStatusType.succeeded,
           receivedBytes: downloadedBytes,
@@ -215,9 +365,9 @@ class ModelDownloadController {
         ),
       );
     } on ModelDownloadCancelledException {
-      await refreshStatus(config);
+      emit(await refreshStatus(config));
     } catch (error) {
-      _emit(
+      emit(
         ModelDownloadStatus(
           type: ModelDownloadStatusType.failed,
           receivedBytes: downloadedBytes,
@@ -235,7 +385,7 @@ class ModelDownloadController {
     if (await dir.exists()) {
       await dir.delete(recursive: true);
     }
-    await refreshStatus(config);
+    status = await refreshStatus(config);
   }
 
   void cancel() {
@@ -244,14 +394,6 @@ class ModelDownloadController {
 
   void dispose() {
     _client.close();
-    _statusController.close();
-  }
-
-  void _emit(ModelDownloadStatus status) {
-    _status = status;
-    if (!_statusController.isClosed) {
-      _statusController.add(status);
-    }
   }
 }
 

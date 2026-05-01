@@ -42,4 +42,5 @@ flutter {
 
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
 }

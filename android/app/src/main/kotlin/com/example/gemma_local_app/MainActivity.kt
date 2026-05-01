@@ -1,6 +1,7 @@
 package com.example.gemma_local_app
 
 import android.util.Log
+import com.example.gemma_local_app.download.ModelDownloadRepository
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -22,6 +23,7 @@ import java.util.concurrent.CancellationException
 
 class MainActivity : FlutterActivity() {
   private val runtime = GemmaLiteRtRuntime()
+  private val downloader by lazy { ModelDownloadRepository(applicationContext) }
 
   override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
     super.configureFlutterEngine(flutterEngine)
@@ -43,6 +45,50 @@ class MainActivity : FlutterActivity() {
       flutterEngine.dartExecutor.binaryMessenger,
       GemmaLiteRtRuntime.EVENT_CHANNEL,
     ).setStreamHandler(runtime)
+
+    MethodChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      DOWNLOAD_METHOD_CHANNEL,
+    ).setMethodCallHandler { call, result ->
+      val args = (call.arguments as? Map<*, *>)?.mapKeys { it.key.toString() } ?: emptyMap()
+      try {
+        when (call.method) {
+          "refreshStatus" -> result.success(downloader.refreshStatus(args))
+          "download" -> {
+            downloader.download(args)
+            result.success(null)
+          }
+          "cancel" -> {
+            downloader.cancel(args)
+            result.success(null)
+          }
+          "delete" -> result.success(downloader.delete(args))
+          else -> result.notImplemented()
+        }
+      } catch (throwable: Throwable) {
+        result.error("DOWNLOAD_ERROR", throwable.message, null)
+      }
+    }
+
+    EventChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      DOWNLOAD_EVENT_CHANNEL,
+    ).setStreamHandler(
+      object : EventChannel.StreamHandler {
+        override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+          downloader.setEventSink(events)
+        }
+
+        override fun onCancel(arguments: Any?) {
+          downloader.setEventSink(null)
+        }
+      }
+    )
+  }
+
+  companion object {
+    private const val DOWNLOAD_METHOD_CHANNEL = "com.example.gemma_local_app/model_download"
+    private const val DOWNLOAD_EVENT_CHANNEL = "com.example.gemma_local_app/model_download_events"
   }
 }
 
