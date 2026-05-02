@@ -1,6 +1,13 @@
 package com.example.gemma_local_app
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.example.gemma_local_app.download.ModelDownloadRepository
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
@@ -20,6 +27,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.CancellationException
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
   private val runtime = GemmaLiteRtRuntime()
@@ -37,6 +45,7 @@ class MainActivity : FlutterActivity() {
         "generate" -> runtime.generate(call, result)
         "stop" -> runtime.stop(result)
         "dispose" -> runtime.dispose(result)
+        "getExternalFilesDir" -> result.success(applicationContext.getExternalFilesDir(null)?.absolutePath)
         else -> result.notImplemented()
       }
     }
@@ -54,7 +63,9 @@ class MainActivity : FlutterActivity() {
       try {
         when (call.method) {
           "refreshStatus" -> result.success(downloader.refreshStatus(args))
+          "requestNotificationPermission" -> result.success(ensureNotificationPermission())
           "download" -> {
+            ensureNotificationPermission()
             downloader.download(args)
             result.success(null)
           }
@@ -86,124 +97,170 @@ class MainActivity : FlutterActivity() {
     )
   }
 
+  private fun ensureNotificationPermission(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+    val granted = ContextCompat.checkSelfPermission(
+      this,
+      Manifest.permission.POST_NOTIFICATIONS,
+    ) == PackageManager.PERMISSION_GRANTED
+    if (!granted) {
+      ActivityCompat.requestPermissions(
+        this,
+        arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+        NOTIFICATION_PERMISSION_REQUEST_CODE,
+      )
+    }
+    return granted
+  }
+
   companion object {
     private const val DOWNLOAD_METHOD_CHANNEL = "com.example.gemma_local_app/model_download"
     private const val DOWNLOAD_EVENT_CHANNEL = "com.example.gemma_local_app/model_download_events"
+    private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 44002
   }
 }
 
+private data class RuntimeInitArgs(
+  val modelPath: String,
+  val accelerator: String,
+  val supportImage: Boolean,
+  val supportAudio: Boolean,
+  val topK: Int,
+  val topP: Double,
+  val temperature: Double,
+  val maxTokens: Int,
+  val systemPrompt: String?,
+)
+
 private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
-  private var engine: Engine? = null
-  private var conversation: Conversation? = null
+  private val executor = Executors.newSingleThreadExecutor()
+  @Volatile private var engine: Engine? = null
+  @Volatile private var conversation: Conversation? = null
   private var eventSink: EventChannel.EventSink? = null
 
-  @OptIn(ExperimentalApi::class)
   fun initialize(call: MethodCall, result: MethodChannel.Result) {
-    try {
-      closeCurrentRuntime()
+    val args = RuntimeInitArgs(
+      modelPath = call.argument<String>("modelPath") ?: run {
+        result.error("INITIALIZE_FAILED", "modelPath is required", null)
+        return
+      },
+      accelerator = call.argument<String>("accelerator") ?: "cpu",
+      supportImage = call.argument<Boolean>("supportImage") ?: false,
+      supportAudio = call.argument<Boolean>("supportAudio") ?: false,
+      topK = call.argument<Int>("topK") ?: 64,
+      topP = call.argument<Double>("topP") ?: 0.95,
+      temperature = call.argument<Double>("temperature") ?: 1.0,
+      maxTokens = call.argument<Int>("maxTokens") ?: 4000,
+      systemPrompt = call.argument<String>("systemPrompt")?.takeIf { it.isNotBlank() },
+    )
 
-      val modelPath = call.argument<String>("modelPath") ?: error("modelPath is required")
-      val accelerator = call.argument<String>("accelerator") ?: "gpu"
-      val supportImage = call.argument<Boolean>("supportImage") ?: false
-      val supportAudio = call.argument<Boolean>("supportAudio") ?: false
-      val topK = call.argument<Int>("topK") ?: 64
-      val topP = call.argument<Double>("topP") ?: 0.95
-      val temperature = call.argument<Double>("temperature") ?: 1.0
-      val maxTokens = call.argument<Int>("maxTokens") ?: 4000
-      val systemPrompt = call.argument<String>("systemPrompt")?.takeIf { it.isNotBlank() }
-
-      val backend = createBackend(accelerator)
-      val engineConfig = EngineConfig(
-        modelPath = modelPath,
-        backend = backend,
-        visionBackend = if (supportImage) Backend.GPU() else null,
-        audioBackend = if (supportAudio) Backend.CPU() else null,
-        maxNumTokens = maxTokens,
-      )
-
-      val newEngine = Engine(engineConfig)
-      newEngine.initialize()
-
-      ExperimentalFlags.enableConversationConstrainedDecoding = false
-      val newConversation = newEngine.createConversation(
-        ConversationConfig(
-          samplerConfig = if (backend is Backend.NPU) {
-            null
-          } else {
-            SamplerConfig(
-              topK = topK,
-              topP = topP,
-              temperature = temperature,
-            )
-          },
-          systemInstruction = systemPrompt?.let {
-            Contents.of(Content.Text(it))
-          },
-          tools = listOf(),
-        )
-      )
-      ExperimentalFlags.enableConversationConstrainedDecoding = false
-
-      engine = newEngine
-      conversation = newConversation
-      result.success(null)
-    } catch (throwable: Throwable) {
-      Log.e(TAG, "initialize failed", throwable)
-      result.error("INITIALIZE_FAILED", throwable.message, null)
+    executor.execute {
+      try {
+        initializeBlocking(args)
+        runOnMainThread { result.success(null) }
+      } catch (throwable: Throwable) {
+        Log.e(TAG, "initialize failed", throwable)
+        runOnMainThread { result.error("INITIALIZE_FAILED", throwable.message, null) }
+      }
     }
   }
 
-  fun generate(call: MethodCall, result: MethodChannel.Result) {
-    val currentConversation = conversation
-    if (currentConversation == null) {
-      result.error("NOT_INITIALIZED", "LiteRT-LM runtime is not initialized.", null)
-      return
-    }
+  @OptIn(ExperimentalApi::class)
+  private fun initializeBlocking(args: RuntimeInitArgs) {
+    closeCurrentRuntime()
+    val backend = createBackend(args.accelerator)
+    val engineConfig = EngineConfig(
+      modelPath = args.modelPath,
+      backend = backend,
+      visionBackend = null,
+      audioBackend = null,
+      maxNumTokens = args.maxTokens,
+    )
 
+    val newEngine = Engine(engineConfig)
+    newEngine.initialize()
+
+    ExperimentalFlags.enableConversationConstrainedDecoding = false
+    val newConversation = newEngine.createConversation(
+      ConversationConfig(
+        samplerConfig = if (backend is Backend.NPU) {
+          null
+        } else {
+          SamplerConfig(
+            topK = args.topK,
+            topP = args.topP,
+            temperature = args.temperature,
+          )
+        },
+        systemInstruction = args.systemPrompt?.let {
+          Contents.of(Content.Text(it))
+        },
+        tools = listOf(),
+      )
+    )
+    ExperimentalFlags.enableConversationConstrainedDecoding = false
+
+    engine = newEngine
+    conversation = newConversation
+  }
+
+  fun generate(call: MethodCall, result: MethodChannel.Result) {
     val prompt = call.argument<String>("prompt") ?: ""
     if (prompt.isBlank()) {
       result.error("EMPTY_PROMPT", "prompt is empty.", null)
       return
     }
 
-    try {
-      currentConversation.sendMessageAsync(
-        Contents.of(Content.Text(prompt)),
-        object : MessageCallback {
-          override fun onMessage(message: Message) {
-            eventSink?.success(
-              mapOf(
-                "type" to "token",
-                "text" to message.toString(),
-                "thought" to message.channels["thought"],
-              )
-            )
-          }
+    executor.execute {
+      val currentConversation = conversation
+      if (currentConversation == null) {
+        runOnMainThread { result.error("NOT_INITIALIZED", "LiteRT-LM runtime is not initialized.", null) }
+        return@execute
+      }
 
-          override fun onDone() {
-            eventSink?.success(mapOf("type" to "done"))
-          }
-
-          override fun onError(throwable: Throwable) {
-            if (throwable is CancellationException) {
-              eventSink?.success(mapOf("type" to "done"))
-            } else {
-              Log.e(TAG, "generate failed", throwable)
-              eventSink?.success(
-                mapOf(
-                  "type" to "error",
-                  "message" to (throwable.message ?: "Unknown inference error"),
+      try {
+        currentConversation.sendMessageAsync(
+          Contents.of(Content.Text(prompt)),
+          object : MessageCallback {
+            override fun onMessage(message: Message) {
+              runOnMainThread {
+                eventSink?.success(
+                  mapOf(
+                    "type" to "token",
+                    "text" to message.toString(),
+                    "thought" to message.channels["thought"],
+                  )
                 )
-              )
+              }
             }
-          }
-        },
-        emptyMap(),
-      )
-      result.success(null)
-    } catch (throwable: Throwable) {
-      Log.e(TAG, "generate start failed", throwable)
-      result.error("GENERATE_FAILED", throwable.message, null)
+
+            override fun onDone() {
+              runOnMainThread { eventSink?.success(mapOf("type" to "done")) }
+            }
+
+            override fun onError(throwable: Throwable) {
+              if (throwable is CancellationException) {
+                runOnMainThread { eventSink?.success(mapOf("type" to "done")) }
+              } else {
+                Log.e(TAG, "generate failed", throwable)
+                runOnMainThread {
+                  eventSink?.success(
+                    mapOf(
+                      "type" to "error",
+                      "message" to (throwable.message ?: "Unknown inference error"),
+                    )
+                  )
+                }
+              }
+            }
+          },
+          emptyMap(),
+        )
+        runOnMainThread { result.success(null) }
+      } catch (throwable: Throwable) {
+        Log.e(TAG, "generate start failed", throwable)
+        runOnMainThread { result.error("GENERATE_FAILED", throwable.message, null) }
+      }
     }
   }
 
@@ -240,6 +297,10 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
       "npu", "tpu" -> Backend.NPU()
       else -> Backend.GPU()
     }
+  }
+
+  private fun runOnMainThread(block: () -> Unit) {
+    Handler(Looper.getMainLooper()).post(block)
   }
 
   private fun closeCurrentRuntime() {

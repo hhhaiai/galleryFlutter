@@ -20,6 +20,7 @@ class ModelDownloadRepository(private val context: Context) {
 
   fun refreshStatus(args: Map<String, Any?>): Map<String, Any?> {
     val paths = paths(args)
+    migrateLegacyModelIfNeeded(paths)
     val finalFile = File(paths.finalPath)
     val tmpFile = File(paths.tmpPath)
     return when {
@@ -29,9 +30,9 @@ class ModelDownloadRepository(private val context: Context) {
         totalBytes = paths.totalBytes,
         localPath = finalFile.absolutePath,
       )
-      tmpFile.exists() -> statusMap(
+      tmpFile.exists() || partialPartBytes(paths) > 0L -> statusMap(
         status = STATUS_PARTIALLY_DOWNLOADED,
-        receivedBytes = tmpFile.length(),
+        receivedBytes = maxOf(tmpFile.length(), partialPartBytes(paths)),
         totalBytes = paths.totalBytes,
         localPath = finalFile.absolutePath,
       )
@@ -76,8 +77,13 @@ class ModelDownloadRepository(private val context: Context) {
   fun delete(args: Map<String, Any?>): Map<String, Any?> {
     cancel(args)
     val paths = paths(args)
-    val dir = File(context.getExternalFilesDir(null), paths.normalizedName)
-    if (dir.exists()) dir.deleteRecursively()
+    val rootDir = context.getExternalFilesDir(null) ?: error("externalFilesDir unavailable")
+    File(paths.finalPath).delete()
+    File(paths.tmpPath).delete()
+    rootDir.listFiles { file -> file.name.startsWith("${paths.fileName}.$TMP_FILE_EXT.part") }
+      ?.forEach { it.delete() }
+    val legacyDir = File(rootDir, paths.normalizedName)
+    if (legacyDir.exists()) legacyDir.deleteRecursively()
     return refreshStatus(args)
   }
 
@@ -120,6 +126,28 @@ class ModelDownloadRepository(private val context: Context) {
     eventSink?.success(map)
   }
 
+  private fun migrateLegacyModelIfNeeded(paths: DownloadPaths) {
+    val finalFile = File(paths.finalPath)
+    if (finalFile.exists() && (paths.totalBytes <= 0L || finalFile.length() >= paths.totalBytes)) return
+    val rootDir = context.getExternalFilesDir(null) ?: return
+    val legacyFile = File(rootDir, listOf(paths.normalizedName, paths.version, paths.originalFileName).joinToString(File.separator))
+    if (!legacyFile.exists()) return
+    if (paths.totalBytes > 0L && legacyFile.length() < paths.totalBytes) return
+    finalFile.parentFile?.mkdirs()
+    try {
+      legacyFile.renameTo(finalFile)
+    } catch (_: Throwable) {
+      legacyFile.copyTo(finalFile, overwrite = true)
+    }
+  }
+
+  private fun partialPartBytes(paths: DownloadPaths): Long {
+    val dir = context.getExternalFilesDir(null) ?: return 0L
+    return dir.listFiles { file -> file.name.startsWith("${paths.fileName}.$TMP_FILE_EXT.part") }
+      ?.sumOf { it.length() }
+      ?: 0L
+  }
+
   private fun paths(args: Map<String, Any?>): DownloadPaths {
     val modelName = args["name"] as? String ?: "Gemma-4-E2B-it"
     val url = args["url"] as? String ?: error("url missing")
@@ -127,17 +155,19 @@ class ModelDownloadRepository(private val context: Context) {
     val version = args["version"] as? String ?: error("version missing")
     val fileName = args["fileName"] as? String ?: error("fileName missing")
     val totalBytes = (args["totalBytes"] as? Number)?.toLong() ?: 0L
-    val dir = File(context.getExternalFilesDir(null), listOf(normalizedName, version).joinToString(File.separator))
+    val dir = context.getExternalFilesDir(null) ?: error("externalFilesDir unavailable")
+    val flatFileName = fileName.lowercase()
     return DownloadPaths(
       args = args,
       modelName = modelName,
       url = url,
       normalizedName = normalizedName,
       version = version,
-      fileName = fileName,
+      fileName = flatFileName,
+      originalFileName = fileName,
       totalBytes = totalBytes,
-      finalPath = File(dir, fileName).absolutePath,
-      tmpPath = File(dir, "$fileName.$TMP_FILE_EXT").absolutePath,
+      finalPath = File(dir, flatFileName).absolutePath,
+      tmpPath = File(dir, "$flatFileName.$TMP_FILE_EXT").absolutePath,
     )
   }
 
@@ -167,6 +197,7 @@ private data class DownloadPaths(
   val normalizedName: String,
   val version: String,
   val fileName: String,
+  val originalFileName: String,
   val totalBytes: Long,
   val finalPath: String,
   val tmpPath: String,

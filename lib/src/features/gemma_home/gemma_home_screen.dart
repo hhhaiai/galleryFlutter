@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../core/model/gemma_model_config.dart';
 import '../../core/runtime/local_gemma_runtime.dart';
@@ -37,6 +38,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   ];
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
   bool _running = false;
+  bool _stopRequested = false;
 
   @override
   void initState() {
@@ -44,11 +46,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _downloadSubscription = _downloadController.statusStream.listen((status) {
       if (mounted) setState(() => _downloadStatus = status);
     });
-    _downloadController.refreshStatus(gemma4E2bIt).then((status) async {
+    _downloadController.refreshStatus(gemma4E2bIt).then((status) {
       if (mounted) setState(() => _downloadStatus = status);
-      if (status.isDownloaded) {
-        await _runtime.initialize(gemma4E2bIt);
-      }
     });
   }
 
@@ -64,14 +63,12 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   Future<void> _downloadModel() async {
     await _downloadController.download(gemma4E2bIt);
-    if (_downloadController.status.isDownloaded) {
-      await _runtime.initialize(gemma4E2bIt);
-    }
   }
 
   Future<void> _send() async {
     final rawInput = _inputController.text.trim();
     if (rawInput.isEmpty || _running) return;
+    _stopRequested = false;
 
     final prompt = _enabledModes.contains(_ComposerMode.promptLab)
         ? _template.buildPrompt(rawInput)
@@ -101,6 +98,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     }
 
     try {
+      await _runtime.initialize(gemma4E2bIt);
       await for (final token in _runtime.generate(
         GemmaRequest(
           prompt: prompt,
@@ -121,11 +119,14 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
               : const [],
         ),
       )) {
+        if (_stopRequested) break;
         _appendAssistantText(token);
       }
-      _finishAssistantMessage();
+      _finishAssistantMessage(stopped: _stopRequested);
+    } on RuntimeUnavailableException catch (error) {
+      _appendAssistantText(error.message, done: true);
     } catch (error) {
-      _appendAssistantText('\n运行时错误：$error', done: true);
+      _appendAssistantText('生成失败：$error', done: true);
     }
   }
 
@@ -141,12 +142,23 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _scrollToBottom();
   }
 
-  void _finishAssistantMessage() {
+  void _stopGeneration() {
+    if (!_running || _stopRequested) return;
+    _stopRequested = true;
+    _runtime.stop();
+    _finishAssistantMessage(stopped: true);
+  }
+
+  void _finishAssistantMessage({bool stopped = false}) {
     if (!mounted) return;
     setState(() {
       final last = _messages.removeLast();
-      _messages.add(last.copyWith(streaming: false));
+      final text = stopped && last.text.trim().isNotEmpty
+          ? '${last.text}\n\n_已停止生成。_'
+          : last.text;
+      _messages.add(last.copyWith(text: text, streaming: false));
       _running = false;
+      _stopRequested = false;
     });
     _scrollToBottom();
   }
@@ -212,9 +224,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
                 setState(() => _template = template),
           ),
           Expanded(
-            child: _ChatTranscript(
-              controller: _scrollController,
-              messages: _messages,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+              child: _ChatTranscript(
+                controller: _scrollController,
+                messages: _messages,
+              ),
             ),
           ),
           _Composer(
@@ -223,6 +239,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             running: _running,
             onToggleMode: _toggleMode,
             onSend: _send,
+            onStop: _stopGeneration,
           ),
         ],
       ),
@@ -351,11 +368,11 @@ class _MessageBubble extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                SelectableText(
-                  message.text.isEmpty && message.streaming
+                _MarkdownMessageText(
+                  text: message.text.isEmpty && message.streaming
                       ? '思考中…'
                       : message.text,
-                  style: Theme.of(context).textTheme.bodyMedium,
+                  isUser: isUser,
                 ),
                 if (message.streaming) ...[
                   const SizedBox(height: 8),
@@ -374,6 +391,58 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
+class _MarkdownMessageText extends StatelessWidget {
+  const _MarkdownMessageText({required this.text, required this.isUser});
+
+  final String text;
+  final bool isUser;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final colorScheme = Theme.of(context).colorScheme;
+    final baseStyle = textTheme.bodyMedium ?? const TextStyle();
+    final textColor = isUser
+        ? colorScheme.onPrimaryContainer
+        : colorScheme.onSurfaceVariant;
+    final codeBackground = isUser
+        ? colorScheme.primary.withValues(alpha: 0.12)
+        : colorScheme.surface;
+
+    return MarkdownBody(
+      data: text,
+      selectable: true,
+      softLineBreak: true,
+      styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+        p: baseStyle.copyWith(color: textColor, height: 1.35),
+        strong: baseStyle.copyWith(
+          color: textColor,
+          fontWeight: FontWeight.w700,
+        ),
+        em: baseStyle.copyWith(color: textColor, fontStyle: FontStyle.italic),
+        h1: textTheme.titleLarge?.copyWith(color: textColor),
+        h2: textTheme.titleMedium?.copyWith(color: textColor),
+        h3: textTheme.titleSmall?.copyWith(color: textColor),
+        listBullet: baseStyle.copyWith(color: textColor, height: 1.35),
+        blockquote: baseStyle.copyWith(
+          color: textColor.withValues(alpha: 0.82),
+        ),
+        code: textTheme.bodyMedium?.copyWith(
+          color: textColor,
+          fontFamily: 'monospace',
+          backgroundColor: codeBackground,
+        ),
+        codeblockDecoration: BoxDecoration(
+          color: codeBackground,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: colorScheme.outlineVariant),
+        ),
+        codeblockPadding: const EdgeInsets.all(12),
+      ),
+    );
+  }
+}
+
 class _Composer extends StatelessWidget {
   const _Composer({
     required this.controller,
@@ -381,6 +450,7 @@ class _Composer extends StatelessWidget {
     required this.running,
     required this.onToggleMode,
     required this.onSend,
+    required this.onStop,
   });
 
   final TextEditingController controller;
@@ -388,6 +458,7 @@ class _Composer extends StatelessWidget {
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
   final VoidCallback onSend;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
@@ -441,15 +512,12 @@ class _Composer extends StatelessWidget {
                       onTap: () => onToggleMode(_ComposerMode.promptLab),
                     ),
                     const Spacer(),
-                    FilledButton.tonalIcon(
-                      onPressed: running ? null : onSend,
-                      icon: running
-                          ? const SizedBox.square(
-                              dimension: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.arrow_upward),
-                      label: Text(running ? '生成中' : '发送'),
+                    IconButton.filled(
+                      onPressed: running ? onStop : onSend,
+                      tooltip: running ? '停止生成' : '发送',
+                      icon: Icon(
+                        running ? Icons.stop_rounded : Icons.arrow_upward,
+                      ),
                     ),
                   ],
                 ),

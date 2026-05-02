@@ -60,31 +60,29 @@ class ModelDownloadStatus {
 class ModelDownloadController {
   ModelDownloadController({http.Client? client})
     : _fallback = _DartForegroundModelDownloader(client: client) {
-    if (Platform.isAndroid) {
-      _androidSubscription = _androidEventChannel
-          .receiveBroadcastStream()
-          .listen(
-            (event) => _emit(_statusFromNativeEvent(event)),
-            onError: (Object error) => _emit(
-              ModelDownloadStatus(
-                type: ModelDownloadStatusType.failed,
-                errorMessage: error.toString(),
-              ),
-            ),
-          );
+    if (Platform.isAndroid || Platform.isIOS) {
+      _nativeSubscription = _nativeEventChannel.receiveBroadcastStream().listen(
+        (event) => _emit(_statusFromNativeEvent(event)),
+        onError: (Object error) => _emit(
+          ModelDownloadStatus(
+            type: ModelDownloadStatusType.failed,
+            errorMessage: error.toString(),
+          ),
+        ),
+      );
     }
   }
 
-  static const _androidMethodChannel = MethodChannel(
+  static const _nativeMethodChannel = MethodChannel(
     'com.example.gemma_local_app/model_download',
   );
-  static const _androidEventChannel = EventChannel(
+  static const _nativeEventChannel = EventChannel(
     'com.example.gemma_local_app/model_download_events',
   );
 
   final _DartForegroundModelDownloader _fallback;
   final _statusController = StreamController<ModelDownloadStatus>.broadcast();
-  StreamSubscription<dynamic>? _androidSubscription;
+  StreamSubscription<dynamic>? _nativeSubscription;
   ModelDownloadStatus _status = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
   );
@@ -102,15 +100,25 @@ class ModelDownloadController {
       _fallback.tmpModelPath(config);
 
   Future<ModelDownloadStatus> refreshStatus(GemmaModelConfig config) async {
-    if (Platform.isAndroid) {
-      final result = await _androidMethodChannel
-          .invokeMapMethod<String, Object?>(
-            'refreshStatus',
-            _nativeArgs(config),
-          );
-      final status = _statusFromNativeMap(result ?? const {});
-      _emit(status);
-      return status;
+    if (Platform.isAndroid || Platform.isIOS) {
+      try {
+        final result = await _nativeMethodChannel
+            .invokeMapMethod<String, Object?>(
+              'refreshStatus',
+              _nativeArgs(config),
+            );
+        final status = _statusFromNativeMap(result ?? const {});
+        _emit(status);
+        return status;
+      } catch (error) {
+        final fallbackStatus = await _fallback.refreshStatus(config);
+        final status = fallbackStatus.copyWith(
+          type: ModelDownloadStatusType.failed,
+          errorMessage: '原生后台下载状态读取失败：$error',
+        );
+        _emit(status);
+        return status;
+      }
     }
     final status = await _fallback.refreshStatus(config);
     _emit(status);
@@ -118,19 +126,29 @@ class ModelDownloadController {
   }
 
   Future<void> download(GemmaModelConfig config) async {
-    if (Platform.isAndroid) {
-      await _androidMethodChannel.invokeMethod<void>(
-        'download',
-        _nativeArgs(config),
-      );
+    if (Platform.isAndroid || Platform.isIOS) {
+      try {
+        await _nativeMethodChannel.invokeMethod<void>(
+          'download',
+          _nativeArgs(config),
+        );
+      } catch (error) {
+        _emit(
+          ModelDownloadStatus(
+            type: ModelDownloadStatusType.failed,
+            totalBytes: config.sizeInBytes,
+            errorMessage: '原生后台下载启动失败：$error',
+          ),
+        );
+      }
       return;
     }
     await _fallback.download(config, _emit);
   }
 
   Future<void> delete(GemmaModelConfig config) async {
-    if (Platform.isAndroid) {
-      final result = await _androidMethodChannel
+    if (Platform.isAndroid || Platform.isIOS) {
+      final result = await _nativeMethodChannel
           .invokeMapMethod<String, Object?>('delete', _nativeArgs(config));
       _emit(_statusFromNativeMap(result ?? const {}));
       return;
@@ -140,8 +158,8 @@ class ModelDownloadController {
   }
 
   void cancel() {
-    if (Platform.isAndroid) {
-      _androidMethodChannel.invokeMethod<void>(
+    if (Platform.isAndroid || Platform.isIOS) {
+      _nativeMethodChannel.invokeMethod<void>(
         'cancel',
         _nativeArgs(gemma4E2bIt),
       );
@@ -151,7 +169,7 @@ class ModelDownloadController {
   }
 
   void dispose() {
-    _androidSubscription?.cancel();
+    _nativeSubscription?.cancel();
     _fallback.dispose();
     _statusController.close();
   }
@@ -313,8 +331,16 @@ class _DartForegroundModelDownloader {
           response.statusCode != HttpStatus.partialContent) {
         throw HttpException('HTTP error code: ${response.statusCode}');
       }
+      if (downloadedBytes > 0 && response.statusCode == HttpStatus.ok) {
+        await tmpFile.delete();
+        downloadedBytes = 0;
+        lastBytes = 0;
+      }
 
-      final sink = tmpFile.openWrite(mode: FileMode.append);
+      final writeMode = response.statusCode == HttpStatus.partialContent
+          ? FileMode.append
+          : FileMode.write;
+      final sink = tmpFile.openWrite(mode: writeMode);
       try {
         await for (final chunk in response.stream) {
           if (_cancelRequested) {

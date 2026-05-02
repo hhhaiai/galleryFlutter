@@ -346,7 +346,7 @@ class GemmaRequest {
 }
 ```
 
-### 7.5 当前平台运行时占位
+### 7.5 当前平台运行时
 
 ```text
 lib/src/core/runtime/platform_gemma_runtime.dart
@@ -841,17 +841,182 @@ POST_NOTIFICATIONS
 - [x] 明确：架构设计已完成，可以开始工程编程实现
 - [x] Android 最小 LiteRT-LM 依赖迁移：`com.google.ai.edge.litertlm:litertlm-android:0.10.0`
 - [x] Android `MainActivity.kt` 增加 MethodChannel/EventChannel 桥接骨架
-- [x] Dart `platform_gemma_runtime.dart` 改为 Android MethodChannel 调用，非 Android 保留占位实现
+- [x] Dart `platform_gemma_runtime.dart` 改为 Android/iOS MethodChannel 调用，桌面平台保留占位实现
 - [x] 应用显示名称改为 `galleryFlutter`，已覆盖 Flutter 标题、Android label、iOS/macOS display name、Linux/Windows 窗口/资源名
 - [x] 主界面改为 ChatGPT 类聊天布局：顶部状态、中间消息气泡、底部 composer
 - [x] composer 增加图片、语音、Skills、Prompt Lab 快捷入口
 - [x] Android 模型下载改为系统后台下载：WorkManager + ForegroundInfo 通知 + `.gallerytmp` + HTTP Range 断点续传
 - [x] Android 下载桥接新增 MethodChannel/EventChannel：`com.example.gemma_local_app/model_download` / `model_download_events`
+- [x] Android 模型下载新增并发分片能力：Worker 对支持 Range 的大文件最多开启 4 路 HTTP byte-range coroutine，分片保存为 `{modelFile}.gallerytmp.partN`，每个 part 按已有长度断点续传，全部完成后合并为 `.gallerytmp` 并 rename 为正式 `.litertlm`
+- [x] Android 模型文件路径调整为扁平路径：`/storage/emulated/0/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`；旧嵌套路径下载完成的模型会在 `refreshStatus` 时迁移
+- [x] Android 发送文字后闪退/遮罩根因已定位为 LiteRT-LM 初始化在主线程触发 5s input dispatching ANR；已改为后台单线程初始化/生成，并将首轮推理降为 CPU + maxTokens 1024 + 暂停 vision/audio backend，避免首轮加载阻塞 UI
+- [x] 聊天气泡支持 Markdown 渲染：新增 `flutter_markdown`，用户输入和模型输出均用 `MarkdownBody(selectable: true)` 展示，支持标题、列表、引用、行内代码和代码块
 - [x] Android 真机已重新编译安装，并授予 POST_NOTIFICATIONS 权限用于前台下载通知
 - [x] 常规验证通过：`dart format lib test`、`flutter analyze`、`flutter test`、`flutter build apk --debug`
 - [x] Android 后台下载点击闪退已定位并修复：Android 16 / targetSdk 36 禁止 foreground service type none，已给 WorkManager SystemForegroundService 合并 `android:foregroundServiceType="dataSync"`，ForegroundInfo 显式传 `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC`；adb 点击下载验证无 FATAL/ANR，WorkManager 持续下载，退后台仍有 progress，回前台 pid 不变
+- [x] iOS 不再显示死胡同式“暂不支持”：参考 Google AI Edge Gallery 已上架 iOS App Store、Gallery README、LiteRT-LM iOS/macOS prebuilt 和 iOS allowlist，Dart runtime 旧 iOS 文案已移除；iOS 必须进入原生 MethodChannel runtime。
+- [x] iOS 原生模型下载断点续传修复：`IOSModelDownloadManager.swift` 使用 `URLSessionConfiguration.background`，对已有 `.gallerytmp` 发送 `Range`；续传响应为 HTTP 206 时把本次下载片段追加到旧 `.gallerytmp`，响应为 200 时认为服务端忽略 Range 并覆盖重下，避免旧逻辑把剩余片段当成完整模型导致损坏文件；进度统计加入 resume offset。
+- [x] Dart 前台下载兜底修复：如果已有 `.gallerytmp` 但 Range 请求返回 200，则删除旧 tmp 并用 `FileMode.write` 覆盖，不再 append 完整响应。
+- [x] iOS runtime channel 已注册到 `com.example.gemma_local_app/runtime`：Flutter 侧现在 iOS 也走 MethodChannel，不再走 Dart Placeholder/占位输出。
+- [x] Xcode/Swift toolchain 已从 Xcode 15.0.1 升级到 Xcode 26.4.1 / Swift 6.3.1，`ios/Podfile` 已启用 `MediaPipeTasksGenAI 0.10.35`，`pod install` 与 `flutter build ios --no-codesign` 均可成功链接。
+- [x] iOS 真实文字对话 runtime 已接入：`IOSGemmaRuntime.swift` 使用 `LlmInference.Options(modelPath:)` 初始化模型，创建 `LlmInference.Session`，`generate` 调用 `session.addQueryChunk(inputText:)` 与 `session.generateResponseAsync()`，并把 partial token 通过 `com.example.gemma_local_app/runtime_events` 流式返回 Flutter。
+
+## 12.5 Google AI Edge GitHub 参考与用户体验设计（2026-05-02）
+
+用户明确要求：必须参考 `https://github.com/google-ai-edge` 的公开代码，并基于 Google AI Edge Gallery 已在 App Store 上架的事实，设计良好的 iOS/Android/macOS 跨平台体验。
+
+已调研的关键来源：
+
+```text
+google-ai-edge/gallery
+google-ai-edge/LiteRT-LM
+google-ai-edge/LiteRT
+google-ai-edge/mediapipe-samples
+App Store: Google AI Edge Gallery
+```
+
+结论：
+
+1. `google-ai-edge/gallery` README 同时提供 Google Play 与 App Store 下载入口；本项目不能再把 iOS 简单标记为“暂不支持”。
+2. `gallery/model_allowlists/ios_1_0_0.json` 存在 iOS allowlist，Gemma 3n E2B/E4B 条目明确描述 iOS 上支持 text、vision、audio input，说明 Gallery 的产品能力已经面向 iOS 规划/分发。
+3. `google-ai-edge/LiteRT-LM` 存在 iOS/macOS 预编译组件目录，例如 `prebuilt/ios_arm64`、`prebuilt/ios_sim_arm64`、`prebuilt/macos_arm64`，说明 `.litertlm`/LiteRT-LM 路线不应被视为 Android-only。
+4. `google-ai-edge/gallery` Android 端模型下载采用 `DownloadRepository.kt` + `DownloadWorker.kt` + WorkManager + notification；本项目 Android 已按该方向升级为系统后台下载、多 Range 分片、断点续传。
+5. `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 展示 iOS LLM 示例的模型选择、下载页、聊天页、`NetworkService.swift`、`OnDeviceModel.swift`；可作为 iOS 下载/初始化/聊天体验参考。
+6. Gallery Skills 公开资料包含 `skills/README.md`、`skill.proto`、内置/featured skills、本地导入、URL 导入、免责声明与校验流程。本项目 Skills Hub 设计应沿用这一产品形态。
+
+新增 UX 设计文档：
+
+```text
+/Users/sanbo/Desktop/gallery/gemma_local_app/docs/google_ai_edge_ux_design.md
+```
+
+核心 UX 决策：
+
+- 不再出现笼统“iOS 暂不支持 / 暂时不支持”。文字对话必须走真实 iOS runtime channel；如果失败，只能显示具体原因（模型未下载、文件缺失、初始化失败、安装包不是最新、签名/设备信任问题、MediaPipe 初始化错误）。图片/语音等未完成能力只描述具体能力边界，不能把 iOS 平台整体说成不支持。
+- Models 页面采用 Gallery 风格单模型卡片，展示模型大小、来源、commit hash、保存路径、能力标签、平台状态、下载速度、剩余时间、暂停/继续/取消/删除/校验。
+- iOS 下载主路径改为原生 Swift `URLSessionConfiguration.background`；前台可做 2-4 路 Range 分片加速，后台优先系统托管可靠性，UI 文案明确“前台加速，后台由 iOS 系统托管”。
+- Chat 首页未下载时显示“下载并开始”行动卡片，不用 dead-end 支持提示。
+- 图片/语音先完成权限、选择、预览和附件状态；runtime 未开启多模态时显示清晰降级提示，不阻塞文字对话。
+- Skills 先实现内置/featured/URL/本地导入的 Hub 骨架、启用状态、Prompt 注入和免责声明，再逐步接真实工具调用。
+
+下一步工程顺序：
+
+1. 修复当前 iOS 原生下载编译接入：完整加入 `IOSModelDownloadManager.swift` 到 Xcode target，并修正 `AppDelegate.swift` channel 注册。
+2. 通过 `flutter build ios --profile` 并安装 iPhone 验证启动。
+3. 打通 iOS `refreshStatus/download/cancel/delete/EventChannel`。
+4. 再实现 iOS 前台 Range 多分片与后台系统托管切换策略。
+5. 每阶段同步 docs/CLAUDE.md，并在验证通过后提交 GitHub。
+
+验证记录（2026-05-02）：
+
+```text
+flutter build ios --profile                         PASS
+flutter analyze                                     PASS
+flutter test                                        PASS
+xcrun devicectl install/launch iPhone              BLOCKED: 指定 UDID 设备当前未连接/未被 CoreDevice 发现
+flutter devices                                     仅发现 Android Pixel 8、iOS Simulator、macOS、Chrome；未发现 iPhone 真机
+```
+
+本次修复了 iOS 编译阻塞，但还不能声明 iOS 真机后台下载已完成；下一步需要在 iPhone 重新连接后安装 Profile 包并验证下载 channel、后台切换、重启恢复。
+
+追加修复（2026-05-02）：
+
+```text
+flutter analyze                                     PASS
+flutter build ios --no-codesign                    PASS
+```
+
+修复点：iOS runtime 不再使用 Dart Placeholder/占位输出；已新增 `IOSGemmaRuntime.swift` 注册原生 runtime channel，Flutter 侧 iOS 进入 MethodChannel。已按 `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 的 `MediaPipeTasksGenAI` + `LlmInference.Session.generateResponseAsync()` 路线写出接入方案并尝试集成；当前构建机 Xcode 15.0.1 可编译 app，但链接 MediaPipeTasksGenAI 0.10.35 时缺 Swift 6 runtime 符号，因此真实 iOS 推理还需升级 Xcode 后启用 Podfile 中的依赖。下载侧：iOS `URLSessionDownloadTask` 的 Range 续传不再删除旧 `.gallerytmp` 后把剩余片段当完整文件，HTTP 206 追加、HTTP 200 覆盖重下，并修正进度 offset。还修复 Dart 前台下载兜底的 200+append 坏文件风险。真机下载长时间后台/断网/重启恢复仍需在可用 iPhone 上验证。
+
+追加修复（2026-05-02，升级 Xcode 后继续推进 iOS 真对话）：
+
+```text
+xcodebuild -version                              Xcode 26.4.1 / Build 17E202
+swift --version                                  Apple Swift 6.3.1
+pod install                                      PASS，安装 MediaPipeTasksGenAI 0.10.35 / MediaPipeTasksGenAIC 0.10.35
+flutter analyze                                  PASS
+flutter test                                     PASS
+flutter build ios --no-codesign                 PASS，Runner.app 38.2MB
+flutter build ios --release                     PASS，自动签名 Team 6X97AH5URL，Runner.app 38.3MB
+devicectl install iPhone                         BLOCKED: 设备安装阶段签名完整性校验失败，Flutter.framework verification failed 0xe8008001
+flutter run -d 00008120-000605C42244201E --release --no-resident  BLOCKED: install/launch 阶段失败，需用 Xcode 打开 ios/Runner.xcworkspace 修复设备签名/信任/嵌入 framework 签名
+```
+
+本次已完成真实 iOS 对话链路的代码接入与构建验证：
+
+- `ios/Podfile` 正式启用 `pod 'MediaPipeTasksGenAI', '~> 0.10.35'`，不再注释掉 GenAI Pod。
+- `ios/Podfile.lock` 记录 `MediaPipeTasksGenAI 0.10.35` 与 `MediaPipeTasksGenAIC 0.10.35`。
+- `ios/Runner/IOSGemmaRuntime.swift` 现在持有 `LlmInference` 与 `LlmInference.Session`，`initialize` 在后台队列加载模型，`generate` 用 Swift concurrency Task 调 `generateResponseAsync()` 并通过 EventChannel 流式发 token；`stop/dispose` 取消生成并释放 session/inference。
+- `lib/src/core/runtime/platform_gemma_runtime.dart` 已移除旧 iOS “还没有接通 LiteRT-LM iOS 推理引擎”文案。若手机上仍显示该文案，说明安装的是旧包，或新包没有成功覆盖安装。
+
+仍未能声明 iPhone 上已“实际看到 token 输出”，原因不是 iOS runtime 仍是占位，而是当前真机安装被代码签名完整性校验挡住。下一步应优先用 Xcode 打开 `ios/Runner.xcworkspace`，选择已连接 iPhone 与 Team `6X97AH5URL` 执行 Product > Run，让 Xcode 重新修复 Runner/嵌入 framework 签名；安装成功后再下载或确认模型文件存在，发送一条短中文 prompt 验证 `runtime_events` 是否返回真实 token。
+
+
+追加修复（2026-05-02，iOS 系统后台下载与已下载模型恢复）：
+
+```text
+flutter build ios --release                         PASS
+flutter run -d 00008120-000605C42244201E --release --no-resident  PASS，安装并启动到 iPhone people
+xcrun devicectl device info processes               PASS，Runner.app/Runner 进程存在
+```
+
+用户反馈：模型之前已下载完毕，但当前 iOS 仍显示下载失败/无法正常下载，并明确希望使用系统级、支持后台的下载方式。
+
+处理结果：
+
+- iOS 下载主路径确认是 `IOSModelDownloadManager.swift` 的 `URLSessionConfiguration.background(withIdentifier:)`，不是 Dart 前台 HTTP 下载；Flutter 侧 Android/iOS 都优先调用 `com.example.gemma_local_app/model_download` 原生 MethodChannel。
+- 增强 `refreshStatus` 与 `download` 前的恢复逻辑：扫描 Application Support、Documents、Caches 中已有的 `gemma-4-E2B-it.litertlm`、小写 `gemma-4-e2b-it.litertlm`、以及 Gallery 风格嵌套目录；如果发现大小达到 `2583085056` 的完整模型，会迁移到当前 iOS 标准路径 `{ApplicationSupport}/Gemma_4_E2B_it/{commitHash}/gemma-4-E2B-it.litertlm` 并直接返回 `succeeded`，避免重复下载。
+- 如果发现 final 文件存在但大小不足，会转成 `.gallerytmp` 并显示 partiallyDownloaded，后续使用 HTTP Range 续传。
+- 如果 `.gallerytmp` 已经完整，会 promote 为正式模型文件。
+- 下载仍由 iOS background URLSession 托管，支持 App 切后台后由系统继续调度。
+
+下一步：请在 iPhone 上打开刚安装的 galleryFlutter，进入 Models 点“刷新”。如果之前完整模型仍在当前 App 容器的 Application Support/Documents/Caches 内，应直接识别为已下载；如果旧模型属于被 iOS 卸载后删除的旧容器，则需要重新点下载，但新下载会走系统后台 URLSession。
+
+
+追加修复（2026-05-02，iOS MissingPluginException down）：
+
+用户反馈 iOS 下载报错：`MissingPluginException no implementation found for method down on channel com.example.gemma_local_app/model_download`。
+
+根因处理：
+
+- Flutter iOS 工程启用了 SceneDelegate，`AppDelegate.didFinishLaunching` 中 `window?.rootViewController` 可能还不是最终 FlutterViewController，导致原生 `model_download` channel 没有注册到当前 messenger，Dart 侧调用时出现 MissingPluginException。
+- `SceneDelegate.swift` 已新增 `scene(_:willConnectTo:options:)`，在 FlutterViewController 可用后调用 `AppDelegate.registerFlutterChannels(with:)` 注册 `IOSModelDownloadManager` 与 `IOSGemmaRuntime`。
+- `AppDelegate.swift` 增加 `didRegisterFlutterChannels` 防重复注册保护，并保留 AppDelegate 路径注册。
+- `IOSModelDownloadManager.swift` 同时兼容 `download` 与用户当前旧包/旧调用里出现的 `down` 方法名，避免 method name 不一致时再次 MissingPluginException。
+
+验证：
+
+```text
+flutter build ios --release                                      PASS
+flutter run -d 00008120-000605C42244201E --release --no-resident PASS，已安装并启动到 iPhone people
+flutter analyze                                                  PASS
+flutter test                                                     PASS
+```
 
 ## 13. 待完成规划
+
+### 13.0 自动工作模式总计划
+
+用户已授权自动工作模式，要求持续推进以下能力，并且每个功能实现、测试后立即同步文档并提交 GitHub：
+
+1. iOS 下载改造为后台下载模式：原生 `URLSessionConfiguration.background`，支持后台继续下载、基础断点续传；多线程/多连接分片作为第二阶段，需兼容 iOS background session 限制。
+2. 图片支持：相机拍摄 + 系统图片选择；优先 Android/iOS，macOS/Linux/Windows 先做文件选择或可用降级。
+3. 语音支持：录音文件选择 + 实时录音；移动端优先，桌面端可降级到音频文件选择。
+4. Skills：参考 Google AI Edge Gallery 的 assets/skills、SkillManager、ToolProvider 机制，构建本地 skills 目录、启用状态和 Skills Hub 雏形。
+5. Markdown：文字输入与输出均支持 Markdown 合理渲染，当前已接入 `flutter_markdown`，后续继续优化代码块、主题和复制体验。
+
+详细实施方案已新增：
+
+```text
+docs/auto_work_plan.md
+```
+
+自动工作规则：
+
+- 每个功能块完成后运行 `flutter analyze`、`flutter test` 和相关平台 build。
+- Android/iOS 有设备时安装并启动验证。
+- 同步 `CLAUDE.md` 与 `docs/`。
+- 每个功能块单独 git commit 并 push 当前 `ios` 分支到 GitHub。
 
 优先级 P0：Android 真推理
 
@@ -892,6 +1057,8 @@ POST_NOTIFICATIONS
 - [ ] sha256 或 size 校验。
 - [ ] 下载失败重试策略。
 - [x] Android 后台下载/通知：WorkManager + ForegroundInfo dataSync + SystemForegroundService dataSync。
+- [x] Android 并发分片下载：最多 4 路 Range part，支持 `.partN` 级断点续传。
+- [x] Android 模型最终路径扁平化为 `/storage/emulated/0/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`。
 - [ ] 下载速度、剩余时间展示优化。
 
 优先级 P2：Prompt Lab
@@ -951,7 +1118,40 @@ pid: 31382
 
 结论：Android 真机 Debug APK 已可安装并启动，当前只验证到 App 启动稳定；尚未验证模型下载完成后的真实 LiteRT-LM 推理。下一步仍必须继续 Android 真机：下载 Gemma-4-E2B-it，触发 initialize/generate，检查 GemmaLiteRtRuntime 日志和模型输出。
 
-### 14.3 常规工程验证
+### 14.3 iOS 真机 Profile 安装验证
+
+设备：
+
+```text
+people • 00008120-000605C42244201E • iPhone 14 Pro Max • iOS 18.3.2
+```
+
+已执行：
+
+```bash
+cd /Users/sanbo/Desktop/gallery/gemma_local_app
+git switch -c ios
+flutter analyze
+flutter test
+flutter build ios --profile
+xcrun devicectl device install app --device 00008120-000605C42244201E build/ios/iphoneos/Runner.app
+xcrun devicectl device process launch --device 00008120-000605C42244201E com.example.gemmaLocalApp
+```
+
+结果：
+
+```text
+flutter analyze: No issues found
+flutter test: All tests passed
+flutter build ios --profile: Built build/ios/iphoneos/Runner.app
+install: App installed, bundleID com.example.gemmaLocalApp
+launch: RequestDenied / Security
+Unable to launch com.example.gemmaLocalApp because it has an invalid code signature, inadequate entitlements or its profile has not been explicitly trusted by the user.
+```
+
+结论：iOS Profile 包已成功构建并安装到物理 iPhone，但首次启动被 iOS 系统拦截。需要在 iPhone 上手动信任开发者证书/描述文件后再重新执行 `devicectl process launch` 做进程存活和 crash log 验证。该状态不是 Dart/Flutter 页面崩溃。
+
+### 14.4 常规工程验证
 
 最近一次常规验证命令：
 
@@ -1015,9 +1215,17 @@ import 'package:gemma_local_app/src/core/model/gemma_model_config.dart';
 {modelFile}.gallerytmp
 ```
 
-临时文件存在时，使用 HTTP Range 继续下载。
+Android 并发分片下载额外使用：
 
-下载完成后 rename 为正式文件。
+```text
+{modelFile}.gallerytmp.part0
+{modelFile}.gallerytmp.part1
+...
+```
+
+临时文件或 part 文件存在时，使用 HTTP Range 继续下载。part 续传规则是：根据该 part 文件已有长度，从 `partStart + existingBytes` 继续请求到 `partEnd`。
+
+下载完成后，Android 先把所有 part 合并为 `.gallerytmp`，再 rename 为正式文件；非 Android 单流下载直接把 `.gallerytmp` rename 为正式文件。
 
 ### 15.5 iOS 真机验证注意
 
@@ -1137,3 +1345,4 @@ flutter build ios --release
    - 重要决策
 4. 运行验证命令。
 5. 最终回复用户时说明改动路径和验证结果。
+
