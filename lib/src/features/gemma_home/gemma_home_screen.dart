@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../core/model/gemma_model_config.dart';
 import '../../core/runtime/local_gemma_runtime.dart';
@@ -44,11 +45,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _downloadSubscription = _downloadController.statusStream.listen((status) {
       if (mounted) setState(() => _downloadStatus = status);
     });
-    _downloadController.refreshStatus(gemma4E2bIt).then((status) async {
+    _downloadController.refreshStatus(gemma4E2bIt).then((status) {
       if (mounted) setState(() => _downloadStatus = status);
-      if (status.isDownloaded) {
-        await _runtime.initialize(gemma4E2bIt);
-      }
     });
   }
 
@@ -64,9 +62,6 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   Future<void> _downloadModel() async {
     await _downloadController.download(gemma4E2bIt);
-    if (_downloadController.status.isDownloaded) {
-      await _runtime.initialize(gemma4E2bIt);
-    }
   }
 
   Future<void> _send() async {
@@ -101,6 +96,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     }
 
     try {
+      await _runtime.initialize(gemma4E2bIt);
       await for (final token in _runtime.generate(
         GemmaRequest(
           prompt: prompt,
@@ -124,8 +120,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         _appendAssistantText(token);
       }
       _finishAssistantMessage();
+    } on RuntimeUnavailableException catch (error) {
+      _appendAssistantText(error.message, done: true);
     } catch (error) {
-      _appendAssistantText('\n运行时错误：$error', done: true);
+      _appendAssistantText('生成失败：$error', done: true);
     }
   }
 
@@ -351,11 +349,11 @@ class _MessageBubble extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                SelectableText(
-                  message.text.isEmpty && message.streaming
+                _MarkdownMessageText(
+                  text: message.text.isEmpty && message.streaming
                       ? '思考中…'
                       : message.text,
-                  style: Theme.of(context).textTheme.bodyMedium,
+                  isUser: isUser,
                 ),
                 if (message.streaming) ...[
                   const SizedBox(height: 8),
@@ -369,6 +367,58 @@ class _MessageBubble extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _MarkdownMessageText extends StatelessWidget {
+  const _MarkdownMessageText({required this.text, required this.isUser});
+
+  final String text;
+  final bool isUser;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final colorScheme = Theme.of(context).colorScheme;
+    final baseStyle = textTheme.bodyMedium ?? const TextStyle();
+    final textColor = isUser
+        ? colorScheme.onPrimaryContainer
+        : colorScheme.onSurfaceVariant;
+    final codeBackground = isUser
+        ? colorScheme.primary.withValues(alpha: 0.12)
+        : colorScheme.surface;
+
+    return MarkdownBody(
+      data: text,
+      selectable: true,
+      softLineBreak: true,
+      styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+        p: baseStyle.copyWith(color: textColor, height: 1.35),
+        strong: baseStyle.copyWith(
+          color: textColor,
+          fontWeight: FontWeight.w700,
+        ),
+        em: baseStyle.copyWith(color: textColor, fontStyle: FontStyle.italic),
+        h1: textTheme.titleLarge?.copyWith(color: textColor),
+        h2: textTheme.titleMedium?.copyWith(color: textColor),
+        h3: textTheme.titleSmall?.copyWith(color: textColor),
+        listBullet: baseStyle.copyWith(color: textColor, height: 1.35),
+        blockquote: baseStyle.copyWith(
+          color: textColor.withValues(alpha: 0.82),
+        ),
+        code: textTheme.bodyMedium?.copyWith(
+          color: textColor,
+          fontFamily: 'monospace',
+          backgroundColor: codeBackground,
+        ),
+        codeblockDecoration: BoxDecoration(
+          color: codeBackground,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: colorScheme.outlineVariant),
+        ),
+        codeblockPadding: const EdgeInsets.all(12),
       ),
     );
   }

@@ -857,6 +857,7 @@ POST_NOTIFICATIONS
 - [x] iOS 不再显示死胡同式“暂不支持”：参考 Google AI Edge Gallery 已上架 iOS App Store、Gallery README、LiteRT-LM iOS/macOS prebuilt 和 iOS allowlist，Dart runtime 占位文案改为“iOS 后台下载已接入、LiteRT-LM iOS 推理桥接接入中”，避免误导用户以为 Google AI Edge/Gallery 不支持 iOS。
 - [x] iOS 原生模型下载断点续传修复：`IOSModelDownloadManager.swift` 使用 `URLSessionConfiguration.background`，对已有 `.gallerytmp` 发送 `Range`；续传响应为 HTTP 206 时把本次下载片段追加到旧 `.gallerytmp`，响应为 200 时认为服务端忽略 Range 并覆盖重下，避免旧逻辑把剩余片段当成完整模型导致损坏文件；进度统计加入 resume offset。
 - [x] Dart 前台下载兜底修复：如果已有 `.gallerytmp` 但 Range 请求返回 200，则删除旧 tmp 并用 `FileMode.write` 覆盖，不再 append 完整响应。
+- [x] iOS runtime channel 已注册到 `com.example.gemma_local_app/runtime`：Flutter 侧现在 iOS 也走 MethodChannel，不再走 Dart Placeholder/占位输出；当前 native channel 会验证模型文件存在并返回真实阻断原因。尝试按 google-ai-edge/mediapipe-samples iOS `MediaPipeTasksGenAI` 路线接入真实 `LlmInference`，但本机 Xcode 15.0.1 链接 `MediaPipeTasksGenAI 0.10.35` 失败（缺少 Swift 6 runtime 符号如 `swiftXPC`、`swift_Builtin_float`），因此 Pod 暂时注释，需升级 Xcode/Swift toolchain 后启用。
 
 ## 12.5 Google AI Edge GitHub 参考与用户体验设计（2026-05-02）
 
@@ -923,7 +924,7 @@ flutter analyze                                     PASS
 flutter build ios --no-codesign                    PASS
 ```
 
-修复点：iOS runtime 占位文案不再说“只有 Android/其它平台待实现”，改为说明 Google AI Edge Gallery iOS 已公开分发、本项目 iOS 后台下载已接入、LiteRT-LM iOS 推理桥接接入中；iOS `URLSessionDownloadTask` 的 Range 续传不再删除旧 `.gallerytmp` 后把剩余片段当完整文件，HTTP 206 追加、HTTP 200 覆盖重下，并修正进度 offset。还修复 Dart 前台下载兜底的 200+append 坏文件风险。真机下载长时间后台/断网/重启恢复仍需在可用 iPhone 上验证。
+修复点：iOS runtime 不再使用 Dart Placeholder/占位输出；已新增 `IOSGemmaRuntime.swift` 注册原生 runtime channel，Flutter 侧 iOS 进入 MethodChannel。已按 `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 的 `MediaPipeTasksGenAI` + `LlmInference.Session.generateResponseAsync()` 路线写出接入方案并尝试集成；当前构建机 Xcode 15.0.1 可编译 app，但链接 MediaPipeTasksGenAI 0.10.35 时缺 Swift 6 runtime 符号，因此真实 iOS 推理还需升级 Xcode 后启用 Podfile 中的依赖。下载侧：iOS `URLSessionDownloadTask` 的 Range 续传不再删除旧 `.gallerytmp` 后把剩余片段当完整文件，HTTP 206 追加、HTTP 200 覆盖重下，并修正进度 offset。还修复 Dart 前台下载兜底的 200+append 坏文件风险。真机下载长时间后台/断网/重启恢复仍需在可用 iPhone 上验证。
 
 ## 13. 待完成规划
 

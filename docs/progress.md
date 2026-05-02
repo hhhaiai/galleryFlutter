@@ -25,6 +25,8 @@
 - [x] 参考 Google AI Edge Gallery 已上架 iOS App Store、Gallery README、LiteRT-LM iOS/macOS prebuilt 等事实，移除 iOS 死胡同式“不支持”文案，改为 iOS 下载可用、推理桥接接入中的行动状态
 - [x] iOS 模型下载接入 Swift `URLSessionConfiguration.background`，并修复 `.gallerytmp` + HTTP Range 断点续传：206 追加 partial，200 覆盖重下，避免生成损坏模型
 - [x] Dart 前台下载兜底同步修复 Range 被忽略时错误 append 的坏文件风险
+- [x] iOS runtime channel 原生注册：Flutter iOS 不再走 Dart Placeholder/占位输出；已新增 `IOSGemmaRuntime.swift` 验证模型文件并接收 generate 调用
+- [x] 参考 `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 完成 MediaPipeTasksGenAI 接入路径调研与代码草案；当前构建机 Xcode 15.0.1 无法链接 0.10.35，需要升级 Xcode 后启用 Podfile 中的依赖
 - [x] 文档同步到 `docs/`
 
 ## 待完成
@@ -34,7 +36,7 @@
 - [ ] 图片选择与平台侧 Bitmap 转换
 - [ ] 音频选择/录音与 ByteArray 转换
 - [ ] Skills 的 `load_skill` / `run_intent` 工具桥接
-- [ ] iOS LiteRT-LM 本地推理桥接：接入 google-ai-edge/LiteRT-LM iOS 预编译组件，不再作为不支持平台处理
+- [ ] iOS 真实推理启用：升级 Xcode/Swift toolchain 后启用 `MediaPipeTasksGenAI` 或 LiteRT-LM Swift/C++ bridge，并把 `IOSGemmaRuntime` 从能力检测替换为真实 `LlmInference` 流式输出
 - [ ] iOS 后台下载真机长时间验证：前台下载、切后台、取消、重启、断网恢复、续传后 size 校验
 - [ ] macOS/Windows/Linux 本地后端选型和接入
 - [ ] 真机 Release/Profile 包验证

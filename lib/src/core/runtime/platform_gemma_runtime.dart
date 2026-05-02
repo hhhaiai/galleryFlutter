@@ -8,7 +8,7 @@ import '../model/gemma_model_config.dart';
 import 'local_gemma_runtime.dart';
 
 LocalGemmaRuntime createLocalGemmaRuntime() {
-  if (Platform.isAndroid) {
+  if (Platform.isAndroid || Platform.isIOS) {
     return MethodChannelGemmaRuntime();
   }
   return PlaceholderGemmaRuntime();
@@ -30,7 +30,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   @override
   Future<void> initialize(GemmaModelConfig config) async {
     _config = config;
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isIOS) return;
 
     _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
       _handleRuntimeEvent,
@@ -55,7 +55,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
   @override
   Stream<String> generate(GemmaRequest request) async* {
-    if (!Platform.isAndroid) {
+    if (!Platform.isAndroid && !Platform.isIOS) {
       yield* PlaceholderGemmaRuntime(config: _config).generate(request);
       return;
     }
@@ -80,7 +80,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
   @override
   Future<void> stop() async {
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       await _methodChannel.invokeMethod<void>('stop');
     }
   }
@@ -89,7 +89,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   Future<void> dispose() async {
     await _eventSubscription?.cancel();
     _eventSubscription = null;
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       await _methodChannel.invokeMethod<void>('dispose');
     }
     await _tokenController.close();
@@ -138,35 +138,22 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 }
 
 class PlaceholderGemmaRuntime implements LocalGemmaRuntime {
-  PlaceholderGemmaRuntime({GemmaModelConfig? config}) : _config = config;
-
-  GemmaModelConfig? _config;
+  PlaceholderGemmaRuntime({GemmaModelConfig? config});
 
   @override
-  Future<void> initialize(GemmaModelConfig config) async {
-    _config = config;
-  }
+  Future<void> initialize(GemmaModelConfig config) async {}
 
   @override
   Stream<String> generate(GemmaRequest request) async* {
-    final platform = Platform.operatingSystem;
-    final config = _config ?? gemma4E2bIt;
-    yield '[本地运行时接入中][$platform] 已锁定模型 ${config.name}。';
     if (Platform.isIOS) {
-      yield '\n\nGoogle AI Edge Gallery 已在 iOS App Store 分发；本项目 iOS 后台模型下载已接入，LiteRT-LM iOS 推理桥接正在按 Gallery/LiteRT-LM 路线接入。请先在 Models 完成模型下载，当前文字推理会在 iOS runtime 接通后启用。';
-    } else {
-      yield '\n\n当前平台本地推理后端正在接入；Android 已优先接入 LiteRT-LM MethodChannel，其它平台会复用同一 LocalGemmaRuntime 接口逐步启用。';
+      throw const RuntimeUnavailableException(
+        'iOS 模型已下载，但当前安装版本还没有接通 LiteRT-LM iOS 推理引擎。'
+        '这不是模型下载失败，也不是 iOS 不支持；下一步需要接入 google-ai-edge/LiteRT-LM 的 iOS runtime 后才能开始本地对话。',
+      );
     }
-    yield '\n\n输入: ${request.prompt}';
-    if (request.imagePaths.isNotEmpty) {
-      yield '\n图片: ${request.imagePaths.length} 个';
-    }
-    if (request.audioPaths.isNotEmpty) {
-      yield '\n音频: ${request.audioPaths.length} 个';
-    }
-    if (request.enabledSkillNames.isNotEmpty) {
-      yield "\nSkills: ${request.enabledSkillNames.join(', ')}";
-    }
+    throw RuntimeUnavailableException(
+      '${Platform.operatingSystem} 本地推理引擎尚未接通。请先在 Android 真机完成当前 LiteRT-LM 验证，随后按平台接入本地 runtime。',
+    );
   }
 
   @override

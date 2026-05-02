@@ -4,6 +4,7 @@ import UIKit
 @main
 @objc class AppDelegate: FlutterAppDelegate {
   private let modelDownloadManager = IOSModelDownloadManager()
+  private let gemmaRuntime = IOSGemmaRuntime()
 
   override func application(
     _ application: UIApplication,
@@ -12,6 +13,7 @@ import UIKit
     GeneratedPluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
       modelDownloadManager.register(with: controller.binaryMessenger)
+      gemmaRuntime.register(with: controller.binaryMessenger)
     }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
