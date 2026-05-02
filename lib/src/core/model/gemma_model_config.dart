@@ -68,6 +68,9 @@ class GemmaModelConfig {
 
   String localModelPath(String appFilesDir) =>
       '$appFilesDir/$normalizedName/$commitHash/$modelFile';
+
+  String androidFlatModelPath(String externalFilesDir) =>
+      '$externalFilesDir/${modelFile.toLowerCase()}';
 }
 
 const gemma4E2bIt = GemmaModelConfig(
