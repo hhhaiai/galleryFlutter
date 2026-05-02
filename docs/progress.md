@@ -15,6 +15,16 @@
 - [x] 建立 Skills 数据结构和系统提示词骨架
 - [x] 实现侧边设置 `Models` 中下载 Gemma-4-E2B-it
 - [x] 实现 `.gallerytmp` 临时文件和 HTTP Range 断点续传
+- [x] Android 模型下载改为 WorkManager 系统后台下载
+- [x] Android 下载支持最多 4 路 HTTP Range 并发分片，并通过 `.gallerytmp.partN` 支持断点续传
+- [x] 修复 Android Runtime 初始化路径与 WorkManager 下载路径不一致导致的 `Model file not found`
+- [x] Android 模型文件路径调整为扁平路径：`/storage/emulated/0/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`
+- [x] 增加旧嵌套路径已下载模型到新扁平路径的迁移逻辑
+- [x] 修复发送文字后 Android 5s input dispatching ANR：LiteRT-LM 初始化/生成移到后台单线程，首轮配置降为 CPU + maxTokens 1024
+- [x] 聊天气泡支持 Markdown 渲染和可选中文本，覆盖用户输入与模型输出
+- [x] 参考 Google AI Edge Gallery 已上架 iOS App Store、Gallery README、LiteRT-LM iOS/macOS prebuilt 等事实，移除 iOS 死胡同式“不支持”文案，改为 iOS 下载可用、推理桥接接入中的行动状态
+- [x] iOS 模型下载接入 Swift `URLSessionConfiguration.background`，并修复 `.gallerytmp` + HTTP Range 断点续传：206 追加 partial，200 覆盖重下，避免生成损坏模型
+- [x] Dart 前台下载兜底同步修复 Range 被忽略时错误 append 的坏文件风险
 - [x] 文档同步到 `docs/`
 
 ## 待完成
@@ -24,7 +34,9 @@
 - [ ] 图片选择与平台侧 Bitmap 转换
 - [ ] 音频选择/录音与 ByteArray 转换
 - [ ] Skills 的 `load_skill` / `run_intent` 工具桥接
-- [ ] iOS/macOS/Windows/Linux 本地后端选型和接入
+- [ ] iOS LiteRT-LM 本地推理桥接：接入 google-ai-edge/LiteRT-LM iOS 预编译组件，不再作为不支持平台处理
+- [ ] iOS 后台下载真机长时间验证：前台下载、切后台、取消、重启、断网恢复、续传后 size 校验
+- [ ] macOS/Windows/Linux 本地后端选型和接入
 - [ ] 真机 Release/Profile 包验证
 
 ## 校验命令

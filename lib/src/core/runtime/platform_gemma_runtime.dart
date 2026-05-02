@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -39,16 +39,16 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       },
     );
 
-    final appFilesDir = (await getApplicationSupportDirectory()).path;
+    final modelPath = await _resolveModelPath(config);
     await _methodChannel.invokeMethod<void>('initialize', {
-      'modelPath': config.localModelPath(appFilesDir),
+      'modelPath': modelPath,
       'topK': config.topK,
       'topP': config.topP,
       'temperature': config.temperature,
-      'maxTokens': config.maxTokens,
-      'supportImage': config.supportImage,
-      'supportAudio': config.supportAudio,
-      'accelerator': config.accelerators.first.id,
+      'maxTokens': 1024,
+      'supportImage': false,
+      'supportAudio': false,
+      'accelerator': 'cpu',
     });
     _initialized = true;
   }
@@ -96,6 +96,27 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     _initialized = false;
   }
 
+  Future<String> _resolveModelPath(GemmaModelConfig config) async {
+    final appFilesDir = (await getApplicationSupportDirectory()).path;
+    final supportPath = config.localModelPath(appFilesDir);
+    if (await File(supportPath).exists()) return supportPath;
+
+    if (Platform.isAndroid) {
+      final externalFilesDir = await _methodChannel.invokeMethod<String>(
+        'getExternalFilesDir',
+      );
+      if (externalFilesDir != null && externalFilesDir.isNotEmpty) {
+        final flatPath = config.androidFlatModelPath(externalFilesDir);
+        if (await File(flatPath).exists()) return flatPath;
+        final legacyPath = config.localModelPath(externalFilesDir);
+        if (await File(legacyPath).exists()) return legacyPath;
+        return flatPath;
+      }
+    }
+
+    return supportPath;
+  }
+
   void _handleRuntimeEvent(dynamic event) {
     if (event is! Map) return;
     final type = event['type']?.toString();
@@ -130,8 +151,12 @@ class PlaceholderGemmaRuntime implements LocalGemmaRuntime {
   Stream<String> generate(GemmaRequest request) async* {
     final platform = Platform.operatingSystem;
     final config = _config ?? gemma4E2bIt;
-    yield '[本地运行时占位][$platform] 已锁定模型 ${config.name}。';
-    yield '\n\n当前只有 Android 正在接入 LiteRT-LM MethodChannel；其它平台后端待实现。';
+    yield '[本地运行时接入中][$platform] 已锁定模型 ${config.name}。';
+    if (Platform.isIOS) {
+      yield '\n\nGoogle AI Edge Gallery 已在 iOS App Store 分发；本项目 iOS 后台模型下载已接入，LiteRT-LM iOS 推理桥接正在按 Gallery/LiteRT-LM 路线接入。请先在 Models 完成模型下载，当前文字推理会在 iOS runtime 接通后启用。';
+    } else {
+      yield '\n\n当前平台本地推理后端正在接入；Android 已优先接入 LiteRT-LM MethodChannel，其它平台会复用同一 LocalGemmaRuntime 接口逐步启用。';
+    }
     yield '\n\n输入: ${request.prompt}';
     if (request.imagePaths.isNotEmpty) {
       yield '\n图片: ${request.imagePaths.length} 个';
