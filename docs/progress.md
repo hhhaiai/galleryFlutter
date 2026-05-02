@@ -26,7 +26,13 @@
 - [x] iOS 模型下载接入 Swift `URLSessionConfiguration.background`，并修复 `.gallerytmp` + HTTP Range 断点续传：206 追加 partial，200 覆盖重下，避免生成损坏模型
 - [x] Dart 前台下载兜底同步修复 Range 被忽略时错误 append 的坏文件风险
 - [x] iOS runtime channel 原生注册：Flutter iOS 不再走 Dart Placeholder/占位输出；已新增 `IOSGemmaRuntime.swift` 验证模型文件并接收 generate 调用
-- [x] 参考 `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 完成 MediaPipeTasksGenAI 接入路径调研与代码草案；当前构建机 Xcode 15.0.1 无法链接 0.10.35，需要升级 Xcode 后启用 Podfile 中的依赖
+- [x] Xcode/Swift toolchain 已升级到 Xcode 26.4.1 / Swift 6.3.1，`MediaPipeTasksGenAI 0.10.35` Pod 已启用并成功链接
+- [x] iOS 真实文字对话 runtime 已接入：`IOSGemmaRuntime.swift` 使用 `LlmInference.Options(modelPath:)` 初始化模型，创建 `LlmInference.Session`，通过 `generateResponseAsync()` 把 token 经 `runtime_events` EventChannel 流式返回 Flutter
+- [x] 移除 Dart 层 iOS “还没有接通 / 不支持”旧文案；iOS 现在应进入原生 MethodChannel runtime。若安装包仍显示旧文案，说明手机上仍是旧构建或安装未成功覆盖
+- [x] 通过 GitHub API 扫描 `google-ai-edge` 公开仓库，并把与 iOS 真对话相关的 `gallery`、`LiteRT-LM`、`LiteRT`、`mediapipe`、`mediapipe-samples` 参考结论同步到 `docs/google_ai_edge_ux_design.md`
+- [x] iOS 模型下载确认走系统后台 `URLSessionConfiguration.background`，并增加已下载模型恢复：refresh/download 会扫描 Application Support、Documents、Caches 中已有的 `gemma-4-E2B-it.litertlm` / 小写文件名，发现完整文件后迁移到当前标准目录，避免重复下载
+- [x] iOS Release 已重新编译并运行到 iPhone：`flutter run -d 00008120-000605C42244201E --release --no-resident` 安装启动成功
+- [x] 修复 iOS `MissingPluginException: no implementation found for method down on channel com.example.gemma_local_app/model_download`：AppDelegate/SceneDelegate 双路径注册原生 channel，并在 iOS manager 同时兼容 `download` 与旧误调用 `down` 方法名
 - [x] 文档同步到 `docs/`
 
 ## 待完成
@@ -36,7 +42,7 @@
 - [ ] 图片选择与平台侧 Bitmap 转换
 - [ ] 音频选择/录音与 ByteArray 转换
 - [ ] Skills 的 `load_skill` / `run_intent` 工具桥接
-- [ ] iOS 真实推理启用：升级 Xcode/Swift toolchain 后启用 `MediaPipeTasksGenAI` 或 LiteRT-LM Swift/C++ bridge，并把 `IOSGemmaRuntime` 从能力检测替换为真实 `LlmInference` 流式输出
+- [ ] iOS 真机模型下载后真实首轮对话验证：当前 Release 构建已通过，但 `devicectl` 安装到 iPhone 仍被签名完整性校验阻断，需要用 Xcode/签名设置修复后在设备上验证 token 输出
 - [ ] iOS 后台下载真机长时间验证：前台下载、切后台、取消、重启、断网恢复、续传后 size 校验
 - [ ] macOS/Windows/Linux 本地后端选型和接入
 - [ ] 真机 Release/Profile 包验证
@@ -47,4 +53,7 @@
 cd /Users/sanbo/Desktop/gallery/gemma_local_app
 flutter analyze
 flutter test
+flutter build ios --no-codesign
+flutter build ios --release
 ```
+

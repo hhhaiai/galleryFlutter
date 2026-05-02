@@ -38,6 +38,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   ];
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
   bool _running = false;
+  bool _stopRequested = false;
 
   @override
   void initState() {
@@ -67,6 +68,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   Future<void> _send() async {
     final rawInput = _inputController.text.trim();
     if (rawInput.isEmpty || _running) return;
+    _stopRequested = false;
 
     final prompt = _enabledModes.contains(_ComposerMode.promptLab)
         ? _template.buildPrompt(rawInput)
@@ -117,9 +119,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
               : const [],
         ),
       )) {
+        if (_stopRequested) break;
         _appendAssistantText(token);
       }
-      _finishAssistantMessage();
+      _finishAssistantMessage(stopped: _stopRequested);
     } on RuntimeUnavailableException catch (error) {
       _appendAssistantText(error.message, done: true);
     } catch (error) {
@@ -139,12 +142,23 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _scrollToBottom();
   }
 
-  void _finishAssistantMessage() {
+  void _stopGeneration() {
+    if (!_running || _stopRequested) return;
+    _stopRequested = true;
+    _runtime.stop();
+    _finishAssistantMessage(stopped: true);
+  }
+
+  void _finishAssistantMessage({bool stopped = false}) {
     if (!mounted) return;
     setState(() {
       final last = _messages.removeLast();
-      _messages.add(last.copyWith(streaming: false));
+      final text = stopped && last.text.trim().isNotEmpty
+          ? '${last.text}\n\n_已停止生成。_'
+          : last.text;
+      _messages.add(last.copyWith(text: text, streaming: false));
       _running = false;
+      _stopRequested = false;
     });
     _scrollToBottom();
   }
@@ -210,9 +224,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
                 setState(() => _template = template),
           ),
           Expanded(
-            child: _ChatTranscript(
-              controller: _scrollController,
-              messages: _messages,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+              child: _ChatTranscript(
+                controller: _scrollController,
+                messages: _messages,
+              ),
             ),
           ),
           _Composer(
@@ -221,6 +239,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             running: _running,
             onToggleMode: _toggleMode,
             onSend: _send,
+            onStop: _stopGeneration,
           ),
         ],
       ),
@@ -431,6 +450,7 @@ class _Composer extends StatelessWidget {
     required this.running,
     required this.onToggleMode,
     required this.onSend,
+    required this.onStop,
   });
 
   final TextEditingController controller;
@@ -438,6 +458,7 @@ class _Composer extends StatelessWidget {
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
   final VoidCallback onSend;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
@@ -491,15 +512,12 @@ class _Composer extends StatelessWidget {
                       onTap: () => onToggleMode(_ComposerMode.promptLab),
                     ),
                     const Spacer(),
-                    FilledButton.tonalIcon(
-                      onPressed: running ? null : onSend,
-                      icon: running
-                          ? const SizedBox.square(
-                              dimension: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.arrow_upward),
-                      label: Text(running ? '生成中' : '发送'),
+                    IconButton.filled(
+                      onPressed: running ? onStop : onSend,
+                      tooltip: running ? '停止生成' : '发送',
+                      icon: Icon(
+                        running ? Icons.stop_rounded : Icons.arrow_upward,
+                      ),
                     ),
                   ],
                 ),

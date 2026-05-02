@@ -1,5 +1,5 @@
 # Google AI Edge Gallery iOS and MediaPipe GenAI require a modern iOS target.
-platform :ios, '15.0'
+platform :ios, '16.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -27,12 +27,23 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 
 flutter_ios_podfile_setup
 
-target 'Runner' do
-  use_frameworks!
+# Force flutter_gemma iOS to build only the .litertlm FFI runtime. The pub.dev
+# podspec still declares MediaPipe pods for .task fallback, which forces a slow
+# 422MB download and re-enters the broken MediaPipe path. Our iOS runtime only
+# uses ModelFileType.litertlm, so patch the plugin podspec locally before pods
+# are resolved.
+flutter_gemma_podspec = File.expand_path(File.join('..', '.symlinks', 'plugins', 'flutter_gemma', 'ios', 'flutter_gemma.podspec'), __FILE__)
+if File.exist?(flutter_gemma_podspec)
+  spec = File.read(flutter_gemma_podspec)
+  spec = spec.gsub(/\n\s*s\.dependency 'MediaPipeTasksGenAI'.*$/, '')
+  spec = spec.gsub(/\n\s*s\.dependency 'MediaPipeTasksGenAIC'.*$/, '')
+  spec = spec.gsub(/\n\s*s\.dependency 'TensorFlowLiteC'.*$/, '')
+  File.write(flutter_gemma_podspec, spec)
+end
 
-  # 0.10.35 requires a newer Xcode/Swift toolchain than this machine provides.
-  # Keep this disabled until the iOS build host upgrades past Xcode 15.0.1.
-  # pod 'MediaPipeTasksGenAI', '~> 0.10.35'
+
+target 'Runner' do
+  use_frameworks! :linkage => :static
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
@@ -43,5 +54,32 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+  end
+
+  # flutter_gemma / LiteRT-LM: Native Assets bundle accelerator dylibs as
+  # frameworks, while LiteRT-LM's GPU registry may dlopen by flat basename.
+  # Add symlinks inside Runner.app/Frameworks for physical iOS devices.
+  installer.aggregate_targets.each do |aggregate_target|
+    aggregate_target.user_targets.each do |user_target|
+      phase_name = '[flutter_gemma] Setup LiteRT-LM iOS dylib symlinks'
+      phase = user_target.shell_script_build_phases.find { |p| p.name == phase_name } ||
+              user_target.new_shell_script_build_phase(phase_name)
+      phase.shell_script = <<~SHELL
+        set -e
+        FRAMEWORKS="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Frameworks"
+        if [ ! -d "${FRAMEWORKS}" ]; then
+          echo "[flutter_gemma] no Frameworks dir, skipping"
+          exit 0
+        fi
+        for base in LiteRtMetalAccelerator LiteRtTopKMetalSampler GemmaModelConstraintProvider; do
+          src="${base}.framework/${base}"
+          dst="${FRAMEWORKS}/lib${base}.dylib"
+          if [ -e "${FRAMEWORKS}/${src}" ] && [ ! -e "${dst}" ]; then
+            ln -sf "${src}" "${dst}"
+            echo "[flutter_gemma] symlinked lib${base}.dylib -> ${src}"
+          fi
+        done
+      SHELL
+    end
   end
 end

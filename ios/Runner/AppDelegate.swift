@@ -5,6 +5,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate {
   private let modelDownloadManager = IOSModelDownloadManager()
   private let gemmaRuntime = IOSGemmaRuntime()
+  private var didRegisterFlutterChannels = false
 
   override func application(
     _ application: UIApplication,
@@ -12,10 +13,16 @@ import UIKit
   ) -> Bool {
     GeneratedPluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
-      modelDownloadManager.register(with: controller.binaryMessenger)
-      gemmaRuntime.register(with: controller.binaryMessenger)
+      registerFlutterChannels(with: controller.binaryMessenger)
     }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  func registerFlutterChannels(with messenger: FlutterBinaryMessenger) {
+    guard !didRegisterFlutterChannels else { return }
+    didRegisterFlutterChannels = true
+    modelDownloadManager.register(with: messenger)
+    gemmaRuntime.register(with: messenger)
   }
 
   override func application(

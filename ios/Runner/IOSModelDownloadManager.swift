@@ -36,7 +36,7 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
         switch call.method {
         case "refreshStatus":
           result(try self.refreshStatus(args: args))
-        case "download":
+        case "download", "down":
           try self.download(args: args)
           result(nil)
         case "cancel":
@@ -71,6 +71,7 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
 
   private func refreshStatus(args: [String: Any]) throws -> [String: Any] {
     let request = try DownloadRequest(args: args)
+    try recoverExistingModelIfPossible(request)
     let finalFile = request.finalFile
     let tmpFile = request.tmpFile
     if FileManager.default.fileExists(atPath: finalFile.path) {
@@ -78,9 +79,16 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
       if request.totalBytes <= 0 || size >= request.totalBytes {
         return statusMap(status: "succeeded", receivedBytes: size, totalBytes: request.totalBytes, localPath: finalFile.path)
       }
+      try moveReplacingItem(from: finalFile, to: tmpFile)
+      return statusMap(status: "partiallyDownloaded", receivedBytes: size, totalBytes: request.totalBytes, localPath: finalFile.path)
     }
     if FileManager.default.fileExists(atPath: tmpFile.path) {
-      return statusMap(status: "partiallyDownloaded", receivedBytes: fileSize(tmpFile), totalBytes: request.totalBytes, localPath: finalFile.path)
+      let tmpSize = fileSize(tmpFile)
+      if request.totalBytes > 0 && tmpSize >= request.totalBytes {
+        try promoteTmpFile(request)
+        return statusMap(status: "succeeded", receivedBytes: fileSize(finalFile), totalBytes: request.totalBytes, localPath: finalFile.path)
+      }
+      return statusMap(status: "partiallyDownloaded", receivedBytes: tmpSize, totalBytes: request.totalBytes, localPath: finalFile.path)
     }
     return statusMap(status: "notDownloaded", totalBytes: request.totalBytes, localPath: finalFile.path)
   }
@@ -89,6 +97,7 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
     let request = try DownloadRequest(args: args)
     current = request
     try FileManager.default.createDirectory(at: request.directory, withIntermediateDirectories: true)
+    try recoverExistingModelIfPossible(request)
 
     if FileManager.default.fileExists(atPath: request.finalFile.path) {
       let size = fileSize(request.finalFile)
@@ -159,10 +168,7 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
         emit(statusMap(status: "partiallyDownloaded", receivedBytes: tmpSize, totalBytes: request.totalBytes, localPath: request.finalFile.path))
         return
       }
-      if FileManager.default.fileExists(atPath: request.finalFile.path) {
-        try FileManager.default.removeItem(at: request.finalFile)
-      }
-      try FileManager.default.moveItem(at: request.tmpFile, to: request.finalFile)
+      try promoteTmpFile(request)
       let size = fileSize(request.finalFile)
       emit(statusMap(status: "succeeded", receivedBytes: size, totalBytes: max(size, request.totalBytes), localPath: request.finalFile.path))
       resumeOffsets.removeValue(forKey: downloadTask.taskIdentifier)
@@ -264,6 +270,74 @@ final class IOSModelDownloadManager: NSObject, URLSessionDownloadDelegate, URLSe
   private func fileSize(_ url: URL) -> Int64 {
     let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
     return attrs?[.size] as? Int64 ?? 0
+  }
+
+  private func promoteTmpFile(_ request: DownloadRequest) throws {
+    try FileManager.default.createDirectory(at: request.directory, withIntermediateDirectories: true)
+    try moveReplacingItem(from: request.tmpFile, to: request.finalFile)
+  }
+
+  private func moveReplacingItem(from source: URL, to destination: URL) throws {
+    guard FileManager.default.fileExists(atPath: source.path) else { return }
+    try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: destination.path) {
+      try FileManager.default.removeItem(at: destination)
+    }
+    do {
+      try FileManager.default.moveItem(at: source, to: destination)
+    } catch {
+      try FileManager.default.copyItem(at: source, to: destination)
+      try? FileManager.default.removeItem(at: source)
+    }
+  }
+
+  private func recoverExistingModelIfPossible(_ request: DownloadRequest) throws {
+    let manager = FileManager.default
+    try manager.createDirectory(at: request.directory, withIntermediateDirectories: true)
+
+    if manager.fileExists(atPath: request.finalFile.path), request.totalBytes <= 0 || fileSize(request.finalFile) >= request.totalBytes {
+      return
+    }
+    if manager.fileExists(atPath: request.tmpFile.path), request.totalBytes > 0, fileSize(request.tmpFile) >= request.totalBytes {
+      try promoteTmpFile(request)
+      return
+    }
+
+    for candidate in recoveryCandidates(for: request) {
+      guard candidate.path != request.finalFile.path,
+        manager.fileExists(atPath: candidate.path),
+        request.totalBytes <= 0 || fileSize(candidate) >= request.totalBytes else {
+        continue
+      }
+      try moveReplacingItem(from: candidate, to: request.finalFile)
+      return
+    }
+  }
+
+  private func recoveryCandidates(for request: DownloadRequest) -> [URL] {
+    let manager = FileManager.default
+    let roots = [
+      manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
+      manager.urls(for: .documentDirectory, in: .userDomainMask).first,
+      manager.urls(for: .cachesDirectory, in: .userDomainMask).first,
+    ].compactMap { $0 }
+    let fileNames = Array(Set([
+      request.fileName,
+      request.fileName.lowercased(),
+      request.fileName.replacingOccurrences(of: "E2B", with: "e2b"),
+    ]))
+    var candidates: [URL] = []
+    for root in roots {
+      candidates.append(root.appendingPathComponent(request.normalizedName).appendingPathComponent(request.version).appendingPathComponent(request.fileName))
+      candidates.append(root.appendingPathComponent(request.fileName))
+      candidates.append(root.appendingPathComponent(request.fileName.lowercased()))
+      if let enumerator = manager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+        for case let url as URL in enumerator where fileNames.contains(url.lastPathComponent) {
+          candidates.append(url)
+        }
+      }
+    }
+    return candidates
   }
 }
 

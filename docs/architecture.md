@@ -45,4 +45,13 @@ Android 目标实现映射到原工程 `LlmChatModelHelper`：
 - `ConversationConfig.systemInstruction` -> Skills 系统提示词
 - `ConversationConfig.tools` -> Skills 工具提供器
 
-桌面/iOS 先保持同一 Dart 接口，后续可接入对应平台本地后端。
+iOS 当前已走同一 Dart 接口背后的原生 MethodChannel/EventChannel runtime，不再使用 Dart 侧占位输出：
+
+- `ios/Podfile` 启用 `MediaPipeTasksGenAI 0.10.35`。
+- `ios/Runner/IOSGemmaRuntime.swift` 注册 `com.example.gemma_local_app/runtime` 与 `com.example.gemma_local_app/runtime_events`。
+- `initialize` 校验模型路径后使用 `LlmInference.Options(modelPath:)` 创建 MediaPipe GenAI `LlmInference`，并按 Dart 传入的 `topK/topP/temperature/maxTokens` 创建 `LlmInference.Session`。
+- `generate` 使用 `session.addQueryChunk(inputText:)` + `session.generateResponseAsync()` 流式生成，并把 partial token 以 `{type: token, text: ...}` 发回 Flutter；完成时发送 `{type: done}`。
+- `stop` 取消当前生成 Task 并发送 done；`dispose` 清理 session/inference。
+
+桌面平台继续保持同一 Dart 接口，后续可接入对应平台本地后端。
+

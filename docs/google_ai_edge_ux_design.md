@@ -4,6 +4,27 @@
 
 ## 参考来源
 
+本设计基于以下公开来源与当前工程状态。用户再次强调：Google AI Edge Gallery 已经在 iOS App Store 上架（https://apps.apple.com/us/app/google-ai-edge-gallery/id6749645337?l=zh-Hans-CN），因此本工程不得把 iOS 呈现为“暂时不支持”；iOS 应被视为真实目标平台，至少要走原生下载、原生 runtime channel 和可验证的本地推理接入路径。
+
+已扫描 `google-ai-edge` 组织当前公开仓库（GitHub API，2026-05-02）：
+
+```text
+google-ai-edge/gallery                 Gallery App，展示 on-device ML/GenAI，用于模型下载、聊天、Skills、iOS/Android 产品形态参考
+google-ai-edge/LiteRT-LM               跨平台边缘 LLM runtime，包含 iOS/macOS prebuilt 方向
+google-ai-edge/LiteRT                  LiteRT runtime / converter / optimization，作为跨端推理基础设施参考
+google-ai-edge/mediapipe               MediaPipe cross-platform ML runtime
+google-ai-edge/mediapipe-samples       iOS LLM inference sample，`OnDeviceModel.swift` / `LlmInference.Session.generateResponseAsync()` 是当前 iOS 真对话接入参考
+google-ai-edge/litert-samples          LiteRT 示例工程，后续桌面/移动端 runtime 验证参考
+google-ai-edge/models-samples          模型示例与端侧任务参考
+google-ai-edge/google-ai-edge.github.io Google AI Edge 资源索引
+google-ai-edge/ai-edge-quantizer       LiteRT post-training quantization，后续模型优化参考
+google-ai-edge/litert-torch            PyTorch -> LiteRT 转换参考
+google-ai-edge/model-explorer          模型图可视化/调试，非当前 P0 runtime 阻塞项
+google-ai-edge/mediapipe-samples-web   Web 端 MediaPipe samples，非当前 iOS P0 阻塞项
+```
+
+本轮结论：当前 P0 与 iOS 真对话直接相关的是 `gallery`、`LiteRT-LM`、`LiteRT`、`mediapipe`、`mediapipe-samples`；其它仓库作为后续模型优化、桌面/Web、多模态和调试参考，不应阻断 iOS 文字对话闭环。
+
 本设计基于以下公开来源与当前工程状态：
 
 1. `google-ai-edge/gallery`
@@ -66,7 +87,7 @@
 - 模型名：Gemma-4-E2B-it。
 - 大小、来源、commit hash、保存路径。
 - 能力标签：Text、Vision、Audio、Skills-ready。
-- 平台标签：Android 已验证；iOS 接入中/已下载/可推理；macOS/Windows/Linux 待验证。
+- 平台标签：Android 已验证；iOS 原生下载 + MediaPipe GenAI runtime 已接入、需真机安装最新包后验证 token 输出；macOS/Windows/Linux 待验证。
 - 下载进度条：百分比、已下载/总大小、速度、剩余时间。
 - 下载状态按钮：下载 / 暂停 / 继续 / 取消 / 删除 / 重新校验。
 - 后台说明：Android 通知栏可见；iOS 可切后台继续，系统可能调度速率。
@@ -173,3 +194,4 @@ P4：图片、语音、Skills Hub
 3. Android：不破坏已验证文字对话与系统通知下载。
 4. iOS：不出现“暂不支持”死胡同；至少具备可下载、可管理、可启动的真实路径。
 5. 用户体验：任何不可用能力都必须有明确原因、下一步动作和降级方案。
+
