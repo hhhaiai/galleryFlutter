@@ -24,3 +24,7 @@ flutter run -d macos
 ```text
 https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm?download=true
 ```
+
+## 感谢
+
+* https://github.com/google-ai-edge/gallery
