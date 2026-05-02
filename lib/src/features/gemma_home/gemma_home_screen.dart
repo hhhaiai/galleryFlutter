@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../core/model/gemma_model_config.dart';
@@ -22,6 +23,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _runtime = createLocalGemmaRuntime();
   final _downloadController = ModelDownloadController();
   final _inputController = TextEditingController();
+  final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
 
@@ -55,6 +57,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   void dispose() {
     _downloadSubscription?.cancel();
     _inputController.dispose();
+    _inputFocusNode.dispose();
     _scrollController.dispose();
     _downloadController.dispose();
     _runtime.dispose();
@@ -235,6 +238,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
           ),
           _Composer(
             controller: _inputController,
+            focusNode: _inputFocusNode,
             enabledModes: _enabledModes,
             running: _running,
             onToggleMode: _toggleMode,
@@ -446,6 +450,7 @@ class _MarkdownMessageText extends StatelessWidget {
 class _Composer extends StatelessWidget {
   const _Composer({
     required this.controller,
+    required this.focusNode,
     required this.enabledModes,
     required this.running,
     required this.onToggleMode,
@@ -454,6 +459,7 @@ class _Composer extends StatelessWidget {
   });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final Set<_ComposerMode> enabledModes;
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
@@ -480,9 +486,19 @@ class _Composer extends StatelessWidget {
               children: [
                 TextField(
                   controller: controller,
+                  focusNode: focusNode,
                   minLines: 1,
                   maxLines: 5,
+                  keyboardType: TextInputType.multiline,
                   textInputAction: TextInputAction.newline,
+                  enableSuggestions: true,
+                  autocorrect: true,
+                  onTap: () {
+                    focusNode.requestFocus();
+                    SystemChannels.textInput.invokeMethod<void>(
+                      'TextInput.show',
+                    );
+                  },
                   decoration: const InputDecoration(
                     hintText: '发送消息，或添加图片/语音/Skills/Prompt Lab…',
                     border: InputBorder.none,
