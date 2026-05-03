@@ -32,10 +32,11 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // Match Google AI Edge Gallery. LiteRT-LM JNI reflects into Kotlin
+            // config classes during createConversation(); R8 obfuscation can
+            // make nativeCreateConversation abort with "mid == null".
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
