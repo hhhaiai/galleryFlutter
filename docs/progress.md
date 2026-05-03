@@ -35,8 +35,9 @@
 - [x] 修复 iOS `MissingPluginException: no implementation found for method down on channel com.example.gemma_local_app/model_download`：AppDelegate/SceneDelegate 双路径注册原生 channel，并在 iOS manager 同时兼容 `download` 与旧误调用 `down` 方法名
 - [x] 图片入口升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」二选项，拍照或选择后图片缩略图附着在输入框上方，可删除，可附带文字一起发送
 - [x] Android 图片消息接入 LiteRT-LM：参考 Google AI Edge Gallery，启用 `supportImage` 时固定 `visionBackend = Backend.GPU()`，并将图片按 1024x1024 采样、读取 EXIF 方向并旋转后转为 PNG `Content.ImageBytes`，避免大图/错误 vision backend 触发 LiteRT-LM `Status Code: 12/13 / Failed to invoke the compiled model`
-- [x] iOS 图片消息接入 flutter_gemma：启用 `supportImage`，选择图片后用 `Message.withImage` 把图片 bytes 与文本一起发送
-- [x] 图片识别真机测试成功：Android 与 iOS 均已完成真实图片发送、模型识别与回复验证；iOS 为保证连续多次稳定识别，图片请求会完整重建 vision runtime/model client
+- [x] iOS 图片消息接入 flutter_gemma：`.litertlm` FFI 路径启用 `supportImage` 与 `maxNumImages: 1`，选择图片后用 `Message.withImage` 把图片 bytes 与文本一起发送；为避免第二次图片识别失败/忽略图片，每次图片请求完整重建 vision runtime/model client
+- [x] 已发送图片 UX 完成：用户消息气泡展示真实图片缩略图，不再只显示 `[图片 × 1]`；点击缩略图可全屏预览、缩放，多图可翻页
+- [x] 图片识别真机测试成功：Android 与 iOS 均已完成真实图片发送、模型识别与回复验证；iOS 连续多次图片识别通过，当前以稳定性优先
 - [x] 补齐图片能力依赖与权限：`image_picker`、Android `CAMERA`/camera feature、iOS `NSCameraUsageDescription`/`NSPhotoLibraryUsageDescription`
 - [x] 文档同步到 `docs/`
 

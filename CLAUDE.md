@@ -572,13 +572,19 @@ EngineConfig.visionBackend
 runInference(images: List<Bitmap>)
 ```
 
-当前 Flutter 抽取：
+当前 Flutter 抽取与稳定实现：
 
 - 入口：`GemmaTaskId.askImage`
 - 请求字段：`GemmaRequest.imagePaths`
-- UI 已接入真实图片附件流程：点击图片按钮弹出「拍照 / 从相册选择」，拍照或选择后缩略图附着在输入框上方，可删除，可附带文字一起发送。
-- Android：MethodChannel 传图片路径；原生 `MainActivity.kt` 参考 Google AI Edge Gallery，读取图片 EXIF 方向、按 1024x1024 采样解码并旋转，再编码为 PNG bytes，通过 `Content.ImageBytes` 与文本一起发送给 LiteRT-LM；启用图片时固定 `visionBackend = Backend.GPU()`（Gemma 4 多模态要求 vision encoder 走 GPU）。避免直接传原始大图或错误 vision backend 导致 `Status Code: 12/13 / Failed to invoke the compiled model`。
-- iOS：`flutter_gemma` 初始化启用 `supportImage`，发送时读取图片 bytes 并使用 `Message.withImage(text:imageBytes:isUser:)`。
+- UI 流程：点击图片按钮弹出「拍照 / 从相册选择」，通过 `image_picker` 得到本地图片路径；发送前图片缩略图附着在输入框上方，可删除，可附带文字一起发送。
+- 已发送图片展示：`_ChatMessage.imagePaths` 保存图片路径；`_SentImagePreviewGrid` 在用户消息气泡内展示缩略图，不再只显示 `[图片 × 1]`；点击图片打开 `_ImagePreviewDialog`，支持全屏查看、多图翻页、`InteractiveViewer` 缩放。
+- Android 图片输入：Flutter MethodChannel 传 `imagePaths` 到 `android/app/src/main/kotlin/com/example/gemma_local_app/MainActivity.kt`；原生端按 Google AI Edge Gallery 的 `handleImagesSelected()` / `decodeSampledBitmapFromUri()` / `rotateBitmap()` 思路读取 EXIF 方向、按 1024x1024 采样解码、旋转 Bitmap，再转 PNG bytes。
+- Android LiteRT-LM 内容构造：先将图片加入 `Content.ImageBytes(imageBytes)`，再将 prompt 加入 `Content.Text(prompt)`，最终调用 `currentConversation.sendMessageAsync(Contents.of(contents), callback)`。
+- Android backend 关键决策：图片能力开启时必须走 Gallery 同款 GPU 多模态路线。Dart 侧 `platform_gemma_runtime.dart` 在 `supportImage` 为 true 时传 `accelerator: 'gpu'`；Kotlin 侧 `EngineConfig.backend = Backend.GPU()`，`visionBackend = Backend.GPU()`。此前 CPU 主 backend 或错误 vision backend 会导致 LiteRT-LM `Status Code: 12/13 / Failed to invoke the compiled model`。
+- iOS 图片输入：Flutter 通过 `flutter_gemma` 的 `.litertlm` FFI 路径加载模型，`getActiveModel()` 显式 `supportImage: true` 与 `maxNumImages: 1`；发送图片时调用 `Message.withImage(text:imageBytes:isUser:)`。
+- iOS 稳定性策略：iOS `.litertlm` FFI 的 vision session 不可靠复用，第一次图片识别成功后第二次可能失败或忽略图片。当前对每次图片请求执行 `forceReload`：关闭旧 chat session、关闭旧 `_flutterGemmaModel`、重新 `installModel/getActiveModel/createChat`，再发送图片；文字请求不做完整重启，避免普通对话变慢。
+- Prompt 策略：`_visionPrompt()` 会把默认图片描述请求转换为明确视觉问答指令；用户带文字时转换为「请根据图片内容回答：...」，避免模型进入无图普通聊天。
+- 真机验证：Android 与 iOS 均已完成真实图片发送、模型识别与回复验证；iOS 连续多次图片识别已测试成功。当前优先保证识别稳定性，接受 iOS 图片请求略慢。
 
 ### 9.3 声音理解
 

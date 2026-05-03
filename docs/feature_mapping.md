@@ -25,7 +25,14 @@
 
 - Flutter 页面入口：`GemmaTaskId.askImage`
 - 请求字段：`GemmaRequest.imagePaths`
-- 原生桥接时需要把图片路径转换为平台侧 Bitmap / tensor 输入。
+- UI 流程：点击 composer 图片按钮 → bottom sheet 选择「拍照 / 从相册选择」→ `image_picker` 返回本地路径 → 输入框上方显示可删除缩略图 → 发送后用户消息气泡展示图片缩略图。
+- 已发送图片展示：`_ChatMessage.imagePaths` 保存本地图片路径；`_SentImagePreviewGrid` 在消息气泡中展示图片卡片；点击图片打开 `_ImagePreviewDialog`，支持全屏查看、左右翻页和 `InteractiveViewer` 缩放。
+- Android 实现：Flutter 通过 MethodChannel 把 `imagePaths` 传给 `MainActivity.kt`；原生端按 Google AI Edge Gallery 做法读取 EXIF 方向、按 1024x1024 采样 decode、旋转 Bitmap、转 PNG bytes 后加入 `Content.ImageBytes`，再把文本作为 `Content.Text` 放在图片之后调用 `sendMessageAsync(Contents.of(contents), ...)`。
+- Android backend：多模态初始化必须使用 Gallery 同款 GPU 路线。Dart 侧图片能力开启时传 `accelerator: 'gpu'`；Kotlin 侧 `EngineConfig.backend = Backend.GPU()`，`visionBackend = Backend.GPU()`。此前 CPU 主 backend 或错误 vision backend 会触发 LiteRT-LM `Status Code: 12/13 / Failed to invoke the compiled model`。
+- iOS 实现：Flutter 通过 `flutter_gemma` 的 `.litertlm` FFI 路径加载模型，初始化时显式 `supportImage: true` 与 `maxNumImages: 1`，发送时用 `Message.withImage(text:imageBytes:isUser:)`。
+- iOS 稳定性策略：iOS `.litertlm` FFI vision session 不可靠复用，第二次图片请求可能失败或忽略图片。当前实现对每次图片请求执行 `forceReload`：关闭旧 chat session、关闭旧 `_flutterGemmaModel`、重新 `installModel/getActiveModel/createChat`，再发送图片；文字请求不做完整重启。
+- Prompt 策略：图片默认 prompt 会被 `_visionPrompt()` 转成明确视觉问答指令；用户带文字时转成「请根据图片内容回答：...」，避免模型进入无图普通聊天。
+- 真机验证：Android 与 iOS 均已完成真实图片发送、模型识别与回复验证；iOS 连续多次图片识别通过，当前以稳定性优先，牺牲少量二次启动速度。
 
 ## 声音理解
 
