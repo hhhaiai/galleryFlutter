@@ -53,7 +53,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       'topP': config.topP,
       'temperature': config.temperature,
       'maxTokens': 1024,
-      'supportImage': false,
+      'supportImage': config.supportImage,
       'supportAudio': false,
       'accelerator': 'cpu',
     });
@@ -87,14 +87,14 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       _flutterGemmaModel = await fg.FlutterGemma.getActiveModel(
         maxTokens: 1024,
         preferredBackend: fg.PreferredBackend.gpu,
-        supportImage: false,
+        supportImage: config.supportImage,
         supportAudio: false,
       );
       _flutterGemmaChat = await _flutterGemmaModel!.createChat(
         temperature: config.temperature,
         topK: config.topK,
         topP: config.topP,
-        supportImage: false,
+        supportImage: config.supportImage,
         supportAudio: false,
         modelType: fg.ModelType.gemma4,
         isThinking: false,
@@ -154,9 +154,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     if (chat == null) {
       throw const RuntimeUnavailableException('iOS flutter_gemma chat 尚未初始化。');
     }
-    if (request.imagePaths.isNotEmpty || request.audioPaths.isNotEmpty) {
+    if (request.audioPaths.isNotEmpty) {
       throw const RuntimeUnavailableException(
-        '当前先验证 iOS Gemma-4 文字对话；图片/音频会在文字首 token 稳定后接入。',
+        '当前先验证 Gemma-4 文字/图片对话；音频会在文字和图片稳定后接入。',
       );
     }
     var prompt = request.prompt;
@@ -169,7 +169,23 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           'Enabled skills: ${request.enabledSkillNames.join(', ')}\n\n$prompt';
     }
 
-    await chat.addQueryChunk(fg.Message.text(text: prompt, isUser: true));
+    if (request.imagePaths.isNotEmpty) {
+      final firstImage = File(request.imagePaths.first);
+      if (!await firstImage.exists()) {
+        throw RuntimeUnavailableException(
+          '图片文件不存在：${request.imagePaths.first}',
+        );
+      }
+      await chat.addQueryChunk(
+        fg.Message.withImage(
+          text: prompt,
+          imageBytes: await firstImage.readAsBytes(),
+          isUser: true,
+        ),
+      );
+    } else {
+      await chat.addQueryChunk(fg.Message.text(text: prompt, isUser: true));
+    }
     await for (final response in chat.generateChatResponseAsync()) {
       if (response is fg.TextResponse) {
         yield response.token;

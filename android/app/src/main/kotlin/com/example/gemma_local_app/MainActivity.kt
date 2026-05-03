@@ -1,6 +1,8 @@
 package com.example.gemma_local_app
 
 import android.Manifest
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -26,6 +28,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
 
@@ -172,7 +176,7 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     val engineConfig = EngineConfig(
       modelPath = args.modelPath,
       backend = backend,
-      visionBackend = null,
+      visionBackend = if (args.supportImage) Backend.GPU() else null,
       audioBackend = null,
       maxNumTokens = args.maxTokens,
     )
@@ -206,7 +210,8 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
 
   fun generate(call: MethodCall, result: MethodChannel.Result) {
     val prompt = call.argument<String>("prompt") ?: ""
-    if (prompt.isBlank()) {
+    val imagePaths = call.argument<List<String>>("imagePaths") ?: emptyList()
+    if (prompt.isBlank() && imagePaths.isEmpty()) {
       result.error("EMPTY_PROMPT", "prompt is empty.", null)
       return
     }
@@ -219,8 +224,22 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
       }
 
       try {
+        val contents = mutableListOf<Content>()
+        for (imagePath in imagePaths) {
+          val imageFile = File(imagePath)
+          if (!imageFile.exists()) {
+            throw IllegalArgumentException("Image file not found: $imagePath")
+          }
+          val bitmap = BitmapFactory.decodeFile(imagePath)
+            ?: throw IllegalArgumentException("Unable to decode image: $imagePath")
+          contents.add(Content.ImageBytes(bitmap.toPngByteArray()))
+        }
+        if (prompt.trim().isNotEmpty()) {
+          contents.add(Content.Text(prompt))
+        }
+
         currentConversation.sendMessageAsync(
-          Contents.of(Content.Text(prompt)),
+          Contents.of(contents),
           object : MessageCallback {
             override fun onMessage(message: Message) {
               runOnMainThread {
@@ -301,6 +320,12 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
 
   private fun runOnMainThread(block: () -> Unit) {
     Handler(Looper.getMainLooper()).post(block)
+  }
+
+  private fun Bitmap.toPngByteArray(): ByteArray {
+    val stream = ByteArrayOutputStream()
+    compress(Bitmap.CompressFormat.PNG, 100, stream)
+    return stream.toByteArray()
   }
 
   private fun closeCurrentRuntime() {

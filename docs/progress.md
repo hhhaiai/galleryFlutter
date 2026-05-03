@@ -33,13 +33,16 @@
 - [x] iOS 模型下载确认走系统后台 `URLSessionConfiguration.background`，并增加已下载模型恢复：refresh/download 会扫描 Application Support、Documents、Caches 中已有的 `gemma-4-E2B-it.litertlm` / 小写文件名，发现完整文件后迁移到当前标准目录，避免重复下载
 - [x] iOS Release 已重新编译并运行到 iPhone：`flutter run -d 00008120-000605C42244201E --release --no-resident` 安装启动成功
 - [x] 修复 iOS `MissingPluginException: no implementation found for method down on channel com.example.gemma_local_app/model_download`：AppDelegate/SceneDelegate 双路径注册原生 channel，并在 iOS manager 同时兼容 `download` 与旧误调用 `down` 方法名
+- [x] 图片入口升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」二选项，拍照或选择后图片缩略图附着在输入框上方，可删除，可附带文字一起发送
+- [x] Android 图片消息接入 LiteRT-LM：启用 `supportImage` 时配置 `visionBackend = Backend.GPU()`，把图片路径解码为 Bitmap/PNG bytes 后作为 `Content.ImageBytes` 与文本一起发送
+- [x] iOS 图片消息接入 flutter_gemma：启用 `supportImage`，选择图片后用 `Message.withImage` 把图片 bytes 与文本一起发送
+- [x] 补齐图片能力依赖与权限：`image_picker`、Android `CAMERA`/camera feature、iOS `NSCameraUsageDescription`/`NSPhotoLibraryUsageDescription`
 - [x] 文档同步到 `docs/`
 
 ## 待完成
 
 - [ ] Android MethodChannel 接入 LiteRT-LM `Engine` / `Conversation`
 - [ ] 下载文件完整性校验/sha256 校验
-- [ ] 图片选择与平台侧 Bitmap 转换
 - [ ] 音频选择/录音与 ByteArray 转换
 - [ ] Skills 的 `load_skill` / `run_intent` 工具桥接
 - [ ] iOS 真机模型下载后真实首轮对话验证：当前 Release 构建已通过，但 `devicectl` 安装到 iPhone 仍被签名完整性校验阻断，需要用 Xcode/签名设置修复后在设备上验证 token 输出

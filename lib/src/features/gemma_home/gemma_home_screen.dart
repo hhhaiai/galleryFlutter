@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:io' show File;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../core/model/gemma_model_config.dart';
 import '../../core/runtime/local_gemma_runtime.dart';
@@ -22,6 +24,7 @@ class GemmaHomeScreen extends StatefulWidget {
 class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _runtime = createLocalGemmaRuntime();
   final _downloadController = ModelDownloadController();
+  final _imagePicker = ImagePicker();
   final _inputController = TextEditingController();
   final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
@@ -39,6 +42,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     ),
   ];
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
+  final List<XFile> _attachedImages = [];
   bool _running = false;
   bool _stopRequested = false;
 
@@ -70,14 +74,20 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   Future<void> _send() async {
     final rawInput = _inputController.text.trim();
-    if (rawInput.isEmpty || _running) return;
+    final imagePaths = _attachedImages.map((image) => image.path).toList();
+    if ((rawInput.isEmpty && imagePaths.isEmpty) || _running) return;
     _stopRequested = false;
 
+    final promptInput = rawInput.isEmpty ? '请描述这张图片。' : rawInput;
     final prompt = _enabledModes.contains(_ComposerMode.promptLab)
-        ? _template.buildPrompt(rawInput)
-        : rawInput;
-    final userText = _buildUserMessageText(rawInput);
+        ? _template.buildPrompt(promptInput)
+        : promptInput;
+    final userText = _buildUserMessageText(rawInput, imagePaths.length);
     _inputController.clear();
+    setState(() {
+      _attachedImages.clear();
+      if (imagePaths.isEmpty) _enabledModes.remove(_ComposerMode.image);
+    });
 
     setState(() {
       _messages.add(_ChatMessage(role: _ChatRole.user, text: userText));
@@ -108,9 +118,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
           systemPrompt: _enabledModes.contains(_ComposerMode.skills)
               ? agentSkillsSystemPrompt
               : null,
-          imagePaths: _enabledModes.contains(_ComposerMode.image)
-              ? const ['pending-image-picker']
-              : const [],
+          imagePaths: imagePaths,
           audioPaths: _enabledModes.contains(_ComposerMode.voice)
               ? const ['pending-audio-recorder']
               : const [],
@@ -177,17 +185,81 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
   }
 
-  String _buildUserMessageText(String rawInput) {
-    final badges = _enabledModes
-        .where((mode) => mode != _ComposerMode.text)
-        .map((mode) => mode.label)
-        .join(' · ');
-    if (badges.isEmpty) return rawInput;
-    return '$rawInput\n\n[$badges]';
+  String _buildUserMessageText(String rawInput, int imageCount) {
+    final badges = <String>[
+      if (imageCount > 0) '图片 × $imageCount',
+      ..._enabledModes
+          .where(
+            (mode) => mode != _ComposerMode.text && mode != _ComposerMode.image,
+          )
+          .map((mode) => mode.label),
+    ].join(' · ');
+    final text = rawInput.isEmpty ? '请描述这张图片。' : rawInput;
+    if (badges.isEmpty) return text;
+    return '$text\n\n[$badges]';
+  }
+
+  Future<void> _showImageSourceSheet() async {
+    if (_running) return;
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('拍照'),
+              subtitle: const Text('调用相机拍摄一张图片'),
+              onTap: () => Navigator.pop(context, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('从相册选择'),
+              subtitle: const Text('加载手机中的图片'),
+              onTap: () => Navigator.pop(context, ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+    try {
+      final image = await _imagePicker.pickImage(
+        source: source,
+        imageQuality: 92,
+        maxWidth: 1600,
+      );
+      if (image == null || !mounted) return;
+      setState(() {
+        _attachedImages
+          ..clear()
+          ..add(image);
+        _enabledModes.add(_ComposerMode.image);
+      });
+      _inputFocusNode.requestFocus();
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('图片获取失败：${error.message ?? error.code}')),
+      );
+    }
+  }
+
+  void _removeAttachedImage(XFile image) {
+    setState(() {
+      _attachedImages.remove(image);
+      if (_attachedImages.isEmpty) _enabledModes.remove(_ComposerMode.image);
+    });
   }
 
   void _toggleMode(_ComposerMode mode) {
     if (mode == _ComposerMode.text) return;
+    if (mode == _ComposerMode.image) {
+      _showImageSourceSheet();
+      return;
+    }
     setState(() {
       if (_enabledModes.contains(mode)) {
         _enabledModes.remove(mode);
@@ -240,8 +312,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             controller: _inputController,
             focusNode: _inputFocusNode,
             enabledModes: _enabledModes,
+            attachedImages: _attachedImages,
             running: _running,
             onToggleMode: _toggleMode,
+            onRemoveImage: _removeAttachedImage,
             onSend: _send,
             onStop: _stopGeneration,
           ),
@@ -452,8 +526,10 @@ class _Composer extends StatelessWidget {
     required this.controller,
     required this.focusNode,
     required this.enabledModes,
+    required this.attachedImages,
     required this.running,
     required this.onToggleMode,
+    required this.onRemoveImage,
     required this.onSend,
     required this.onStop,
   });
@@ -461,8 +537,10 @@ class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
   final Set<_ComposerMode> enabledModes;
+  final List<XFile> attachedImages;
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
+  final ValueChanged<XFile> onRemoveImage;
   final VoidCallback onSend;
   final VoidCallback onStop;
 
@@ -484,6 +562,13 @@ class _Composer extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (attachedImages.isNotEmpty) ...[
+                  _AttachedImageStrip(
+                    images: attachedImages,
+                    onRemoveImage: onRemoveImage,
+                  ),
+                  const SizedBox(height: 8),
+                ],
                 TextField(
                   controller: controller,
                   focusNode: focusNode,
@@ -541,6 +626,64 @@ class _Composer extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _AttachedImageStrip extends StatelessWidget {
+  const _AttachedImageStrip({
+    required this.images,
+    required this.onRemoveImage,
+  });
+
+  final List<XFile> images;
+  final ValueChanged<XFile> onRemoveImage;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 86,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        itemCount: images.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final image = images[index];
+          return Stack(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: Image.file(
+                  File(image.path),
+                  width: 86,
+                  height: 86,
+                  fit: BoxFit.cover,
+                ),
+              ),
+              Positioned(
+                top: 4,
+                right: 4,
+                child: InkWell(
+                  onTap: () => onRemoveImage(image),
+                  borderRadius: BorderRadius.circular(14),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: colorScheme.scrim.withValues(alpha: 0.62),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(3),
+                      child: Icon(Icons.close, color: Colors.white, size: 18),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

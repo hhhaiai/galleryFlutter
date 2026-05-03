@@ -4,6 +4,8 @@ PODS:
   - Flutter (1.0.0)
   - flutter_gemma (0.14.1):
     - Flutter
+  - image_picker_ios (0.0.1):
+    - Flutter
   - large_file_handler (0.0.1):
     - Flutter
   - shared_preferences_foundation (0.0.1):
@@ -14,6 +16,7 @@ DEPENDENCIES:
   - background_downloader (from `.symlinks/plugins/background_downloader/ios`)
   - Flutter (from `Flutter`)
   - flutter_gemma (from `.symlinks/plugins/flutter_gemma/ios`)
+  - image_picker_ios (from `.symlinks/plugins/image_picker_ios/ios`)
   - large_file_handler (from `.symlinks/plugins/large_file_handler/ios`)
   - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
 
@@ -24,6 +27,8 @@ EXTERNAL SOURCES:
     :path: Flutter
   flutter_gemma:
     :path: ".symlinks/plugins/flutter_gemma/ios"
+  image_picker_ios:
+    :path: ".symlinks/plugins/image_picker_ios/ios"
   large_file_handler:
     :path: ".symlinks/plugins/large_file_handler/ios"
   shared_preferences_foundation:
@@ -33,6 +38,7 @@ SPEC CHECKSUMS:
   background_downloader: 50e91d979067b82081aba359d7d916b3ba5fadad
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   flutter_gemma: d8a9e124c883bccf2d019ee0b7cdf57552ff31a6
+  image_picker_ios: e0ece4aa2a75771a7de3fa735d26d90817041326
   large_file_handler: b37481e9b4972562ffcdc8f75700f47cd592bcec
   shared_preferences_foundation: 7036424c3d8ec98dfe75ff1667cb0cd531ec82bb
 

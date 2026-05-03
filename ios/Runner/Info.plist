@@ -6,6 +6,10 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app uses local on-device model runtime resources.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用于拍照并把图片发送给本地 Gemma 模型理解。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用于从相册选择图片并发送给本地 Gemma 模型理解。</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
