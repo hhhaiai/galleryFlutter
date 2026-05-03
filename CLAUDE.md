@@ -577,7 +577,7 @@ runInference(images: List<Bitmap>)
 - 入口：`GemmaTaskId.askImage`
 - 请求字段：`GemmaRequest.imagePaths`
 - UI 已接入真实图片附件流程：点击图片按钮弹出「拍照 / 从相册选择」，拍照或选择后缩略图附着在输入框上方，可删除，可附带文字一起发送。
-- Android：MethodChannel 传图片路径；原生 `MainActivity.kt` 参考 Google AI Edge Gallery，读取图片 EXIF 方向、按 1024x1024 采样解码并旋转，再编码为 PNG bytes，通过 `Content.ImageBytes` 与文本一起发送给 LiteRT-LM；启用图片时配置 vision backend。避免直接传原始大图导致 `Status Code: 12 / Failed to invoke the compiled model`。
+- Android：MethodChannel 传图片路径；原生 `MainActivity.kt` 参考 Google AI Edge Gallery，读取图片 EXIF 方向、按 1024x1024 采样解码并旋转，再编码为 PNG bytes，通过 `Content.ImageBytes` 与文本一起发送给 LiteRT-LM；启用图片时固定 `visionBackend = Backend.GPU()`（Gemma 4 多模态要求 vision encoder 走 GPU）。避免直接传原始大图或错误 vision backend 导致 `Status Code: 12/13 / Failed to invoke the compiled model`。
 - iOS：`flutter_gemma` 初始化启用 `supportImage`，发送时读取图片 bytes 并使用 `Message.withImage(text:imageBytes:isUser:)`。
 
 ### 9.3 声音理解

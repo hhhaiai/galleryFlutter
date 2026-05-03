@@ -182,7 +182,8 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     val engineConfig = EngineConfig(
       modelPath = args.modelPath,
       backend = backend,
-      visionBackend = if (args.supportImage) createBackend(args.accelerator) else null,
+      // Match Google AI Edge Gallery for Gemma multimodal chat: main backend GPU + vision GPU.
+      visionBackend = if (args.supportImage) Backend.GPU() else null,
       audioBackend = null,
       maxNumTokens = args.maxTokens,
     )

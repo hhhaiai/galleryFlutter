@@ -55,7 +55,10 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       'maxTokens': 1024,
       'supportImage': config.supportImage,
       'supportAudio': false,
-      'accelerator': 'cpu',
+      // Google AI Edge Gallery defaults Gemma multimodal chat to GPU.
+      // CPU text-only is stable, but image prefill can fail on Android with
+      // LiteRT-LM Status Code 13 / Failed to invoke the compiled model.
+      'accelerator': config.supportImage ? 'gpu' : 'cpu',
     });
     _initialized = true;
   }
