@@ -515,7 +515,7 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
         }
         for (audioPath in audioPaths.take(1)) {
           val audioBytes = readAudioForGemma(audioPath)
-          Log.d(TAG, "audio input ready: pcmBytes=${audioBytes.size}")
+          Log.d(TAG, "audio input ready: wavBytes=${audioBytes.size}")
           contents.add(Content.AudioBytes(audioBytes))
         }
         if (prompt.trim().isNotEmpty()) {
@@ -693,11 +693,12 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     if (bytes.size < 44 || bytes.copyOfRange(0, 4).toString(Charsets.US_ASCII) != "RIFF") {
       throw IllegalArgumentException("Gemma audio requires a WAV file. Please record in-app or pick a WAV file.")
     }
-    // Match Google AI Edge Gallery exactly: Content.AudioBytes receives raw
-    // mono 16-bit PCM bytes, not a WAV container. Passing the RIFF header makes
-    // the audio encoder see header bytes as samples and causes unstable / empty
-    // audio understanding.
-    return extractMono16BitPcm(bytes, MAX_AUDIO_SECONDS)
+    // LiteRT-LM Android Content.AudioBytes is decoded by miniaudio. The native
+    // decoder needs a valid audio container, otherwise nativeSendMessageAsync
+    // fails with miniaudio error -10 and Flutter stays in the streaming state.
+    // Normalize to model-friendly 16 kHz mono 16-bit PCM, then wrap it back in
+    // a minimal WAV container.
+    return normalizeWavForGemma(bytes, MAX_AUDIO_SECONDS)
   }
 
   private fun extractMono16BitPcm(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
@@ -771,6 +772,42 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     val output = ByteBuffer.allocate(trimmedSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
     for (sample in trimmedSamples) output.putShort(sample)
     return output.array()
+  }
+
+  private fun normalizeWavForGemma(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
+    val pcmBytes = extractMono16BitPcm(wavBytes, maxSeconds)
+    val output = ByteArrayOutputStream()
+    output.write("RIFF".toByteArray(Charsets.US_ASCII))
+    output.writeIntLE(36 + pcmBytes.size)
+    output.write("WAVE".toByteArray(Charsets.US_ASCII))
+    output.write("fmt ".toByteArray(Charsets.US_ASCII))
+    output.writeIntLE(16)
+    output.writeShortLE(1)
+    output.writeShortLE(1)
+    output.writeIntLE(SAMPLE_RATE)
+    output.writeIntLE(SAMPLE_RATE * 2)
+    output.writeShortLE(2)
+    output.writeShortLE(16)
+    output.write("data".toByteArray(Charsets.US_ASCII))
+    output.writeIntLE(pcmBytes.size)
+    output.write(pcmBytes)
+    return output.toByteArray()
+  }
+
+  private fun ByteArrayOutputStream.writeIntLE(value: Int) {
+    write(byteArrayOf(
+      (value and 0xFF).toByte(),
+      ((value shr 8) and 0xFF).toByte(),
+      ((value shr 16) and 0xFF).toByte(),
+      ((value shr 24) and 0xFF).toByte(),
+    ))
+  }
+
+  private fun ByteArrayOutputStream.writeShortLE(value: Int) {
+    write(byteArrayOf(
+      (value and 0xFF).toByte(),
+      ((value shr 8) and 0xFF).toByte(),
+    ))
   }
 
   private fun resampleMono(inputSamples: ShortArray, originalSampleRate: Int, targetSampleRate: Int): ShortArray {

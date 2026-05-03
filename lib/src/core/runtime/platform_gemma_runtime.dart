@@ -170,13 +170,22 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     await _activeGenerationController?.close();
     _activeGenerationController = generationController;
     try {
-      await _methodChannel.invokeMethod<void>('generate', {
-        'prompt': request.prompt,
-        'systemPrompt': request.systemPrompt,
-        'imagePaths': request.imagePaths,
-        'audioPaths': request.audioPaths,
-        'enabledSkillNames': request.enabledSkillNames,
-      });
+      try {
+        await _methodChannel.invokeMethod<void>('generate', {
+          'prompt': request.prompt,
+          'systemPrompt': request.systemPrompt,
+          'imagePaths': request.imagePaths,
+          'audioPaths': request.audioPaths,
+          'enabledSkillNames': request.enabledSkillNames,
+        });
+      } on PlatformException catch (error) {
+        if (!generationController.isClosed) {
+          generationController.addError(
+            RuntimeUnavailableException(error.message ?? error.code),
+          );
+          await generationController.close();
+        }
+      }
 
       await for (final token in generationController.stream.timeout(
         const Duration(seconds: 90),
