@@ -3,13 +3,16 @@ package com.example.gemma_local_app
 import android.Manifest
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import com.example.gemma_local_app.download.ModelDownloadRepository
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
@@ -30,8 +33,11 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity() {
   private val runtime = GemmaLiteRtRuntime()
@@ -176,7 +182,7 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     val engineConfig = EngineConfig(
       modelPath = args.modelPath,
       backend = backend,
-      visionBackend = if (args.supportImage) Backend.GPU() else null,
+      visionBackend = if (args.supportImage) createBackend(args.accelerator) else null,
       audioBackend = null,
       maxNumTokens = args.maxTokens,
     )
@@ -225,14 +231,11 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
 
       try {
         val contents = mutableListOf<Content>()
-        for (imagePath in imagePaths) {
-          val imageFile = File(imagePath)
-          if (!imageFile.exists()) {
-            throw IllegalArgumentException("Image file not found: $imagePath")
-          }
-          val bitmap = BitmapFactory.decodeFile(imagePath)
-            ?: throw IllegalArgumentException("Unable to decode image: $imagePath")
-          contents.add(Content.ImageBytes(bitmap.toPngByteArray()))
+        for (imagePath in imagePaths.take(1)) {
+          val bitmap = decodeGalleryStyleBitmap(imagePath)
+          val imageBytes = bitmap.toPngByteArray()
+          Log.d(TAG, "image input ready: ${bitmap.width}x${bitmap.height}, pngBytes=${imageBytes.size}")
+          contents.add(Content.ImageBytes(imageBytes))
         }
         if (prompt.trim().isNotEmpty()) {
           contents.add(Content.Text(prompt))
@@ -320,6 +323,78 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
 
   private fun runOnMainThread(block: () -> Unit) {
     Handler(Looper.getMainLooper()).post(block)
+  }
+
+  private fun decodeGalleryStyleBitmap(imagePath: String): Bitmap {
+    val imageFile = File(imagePath)
+    if (!imageFile.exists()) {
+      throw IllegalArgumentException("Image file not found: $imagePath")
+    }
+    val uri = Uri.fromFile(imageFile)
+    val orientation = try {
+      FileInputStream(imageFile).use { inputStream ->
+        ExifInterface(inputStream).getAttributeInt(
+          ExifInterface.TAG_ORIENTATION,
+          ExifInterface.ORIENTATION_NORMAL,
+        )
+      }
+    } catch (throwable: Throwable) {
+      Log.w(TAG, "failed to read EXIF orientation for $imagePath", throwable)
+      ExifInterface.ORIENTATION_NORMAL
+    }
+
+    val decoded = decodeSampledBitmapFromUri(uri, 1024, 1024)
+      ?: throw IllegalArgumentException("Unable to decode image: $imagePath")
+    return rotateBitmap(decoded, orientation)
+  }
+
+  private fun decodeSampledBitmapFromUri(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
+    val path = uri.path ?: return null
+    val options = BitmapFactory.Options().apply {
+      inJustDecodeBounds = true
+      FileInputStream(path).use { BitmapFactory.decodeStream(it, null, this) }
+      inSampleSize = calculateInSampleSize(this, reqWidth, reqHeight)
+      inJustDecodeBounds = false
+    }
+    return FileInputStream(path).use { BitmapFactory.decodeStream(it, null, options) }
+  }
+
+  private fun calculateInSampleSize(
+    options: BitmapFactory.Options,
+    reqWidth: Int,
+    reqHeight: Int,
+  ): Int {
+    val height = options.outHeight
+    val width = options.outWidth
+    var inSampleSize = 1
+    if (height > reqHeight || width > reqWidth) {
+      val heightRatio = (height.toFloat() / reqHeight.toFloat()).roundToInt()
+      val widthRatio = (width.toFloat() / reqWidth.toFloat()).roundToInt()
+      inSampleSize = max(heightRatio, widthRatio)
+    }
+    return inSampleSize
+  }
+
+  private fun rotateBitmap(bitmap: Bitmap, orientation: Int): Bitmap {
+    val matrix = Matrix()
+    when (orientation) {
+      ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+      ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+      ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+      ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1.0f, 1.0f)
+      ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1.0f, -1.0f)
+      ExifInterface.ORIENTATION_TRANSPOSE -> {
+        matrix.postRotate(90f)
+        matrix.preScale(-1.0f, 1.0f)
+      }
+      ExifInterface.ORIENTATION_TRANSVERSE -> {
+        matrix.postRotate(270f)
+        matrix.preScale(-1.0f, 1.0f)
+      }
+      ExifInterface.ORIENTATION_NORMAL -> return bitmap
+      else -> return bitmap
+    }
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
   }
 
   private fun Bitmap.toPngByteArray(): ByteArray {

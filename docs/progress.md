@@ -34,7 +34,7 @@
 - [x] iOS Release 已重新编译并运行到 iPhone：`flutter run -d 00008120-000605C42244201E --release --no-resident` 安装启动成功
 - [x] 修复 iOS `MissingPluginException: no implementation found for method down on channel com.example.gemma_local_app/model_download`：AppDelegate/SceneDelegate 双路径注册原生 channel，并在 iOS manager 同时兼容 `download` 与旧误调用 `down` 方法名
 - [x] 图片入口升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」二选项，拍照或选择后图片缩略图附着在输入框上方，可删除，可附带文字一起发送
-- [x] Android 图片消息接入 LiteRT-LM：启用 `supportImage` 时配置 `visionBackend = Backend.GPU()`，把图片路径解码为 Bitmap/PNG bytes 后作为 `Content.ImageBytes` 与文本一起发送
+- [x] Android 图片消息接入 LiteRT-LM：参考 Google AI Edge Gallery，启用 `supportImage` 时配置 vision backend，并将图片按 1024x1024 采样、读取 EXIF 方向并旋转后转为 PNG `Content.ImageBytes`，避免大图直接触发 LiteRT-LM `Status Code: 12 / Failed to invoke the compiled model`
 - [x] iOS 图片消息接入 flutter_gemma：启用 `supportImage`，选择图片后用 `Message.withImage` 把图片 bytes 与文本一起发送
 - [x] 补齐图片能力依赖与权限：`image_picker`、Android `CAMERA`/camera feature、iOS `NSCameraUsageDescription`/`NSPhotoLibraryUsageDescription`
 - [x] 文档同步到 `docs/`
