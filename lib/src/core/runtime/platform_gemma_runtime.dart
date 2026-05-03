@@ -65,8 +65,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
   Future<void> _initializeFlutterGemma(
     GemmaModelConfig config,
-    String modelPath,
-  ) async {
+    String modelPath, {
+    bool forceReload = false,
+  }) async {
     final file = File(modelPath);
     if (!await file.exists()) {
       throw RuntimeUnavailableException(
@@ -82,12 +83,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
     try {
       await fg.FlutterGemma.initialize(maxDownloadRetries: 8);
+      if (forceReload) {
+        await _flutterGemmaChat?.session.close();
+        _flutterGemmaChat = null;
+        await _flutterGemmaModel?.close();
+        _flutterGemmaModel = null;
+      }
       await fg.FlutterGemma.installModel(
         modelType: fg.ModelType.gemma4,
         fileType: fg.ModelFileType.litertlm,
       ).fromFile(modelPath).install();
 
-      _flutterGemmaModel = await fg.FlutterGemma.getActiveModel(
+      _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
         maxTokens: 1024,
         preferredBackend: fg.PreferredBackend.gpu,
         supportImage: config.supportImage,
@@ -165,11 +172,26 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           'Enabled skills: ${request.enabledSkillNames.join(', ')}\n\n$prompt';
     }
 
-    // iOS flutter_gemma sessions can become invalid after a prior image failure or
-    // stop. Recreate a fresh chat per request, matching Gallery-style stateless
-    // image asking and preventing stale multimodal state from breaking later sends.
-    await _flutterGemmaChat?.session.close();
-    final chat = await model.createChat(
+    // iOS .litertlm FFI image sessions are not reliably reusable: after one
+    // successful vision request, the next request can fail or ignore the image.
+    // For image requests, fully rebuild the FFI model/client so each ask-image
+    // starts with the same clean native state as the first successful request.
+    final isImageRequest = request.imagePaths.isNotEmpty;
+    if (isImageRequest) {
+      final config = _config ?? gemma4E2bIt;
+      final modelPath = await _resolveModelPath(config);
+      await _initializeFlutterGemma(config, modelPath, forceReload: true);
+    } else {
+      await _flutterGemmaChat?.session.close();
+      _flutterGemmaChat = null;
+    }
+    final currentModel = _flutterGemmaModel;
+    if (currentModel == null) {
+      throw const RuntimeUnavailableException(
+        'iOS flutter_gemma model 重新初始化失败。',
+      );
+    }
+    final chat = await currentModel.createChat(
       temperature: _config?.temperature ?? gemma4E2bIt.temperature,
       topK: _config?.topK ?? gemma4E2bIt.topK,
       topP: _config?.topP ?? gemma4E2bIt.topP,
