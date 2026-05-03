@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
 
+import 'audio_input_service.dart';
 import '../../core/model/gemma_model_config.dart';
 import '../../core/runtime/local_gemma_runtime.dart';
 import '../../core/runtime/platform_gemma_runtime.dart';
@@ -25,6 +26,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _runtime = createLocalGemmaRuntime();
   final _downloadController = ModelDownloadController();
   final _imagePicker = ImagePicker();
+  final _audioInput = AudioInputService();
   final _inputController = TextEditingController();
   final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
@@ -43,6 +45,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   ];
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
   final List<XFile> _attachedImages = [];
+  final List<AudioAttachment> _attachedAudios = [];
+  bool _recording = false;
   bool _running = false;
   bool _stopRequested = false;
 
@@ -75,18 +79,31 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   Future<void> _send() async {
     final rawInput = _inputController.text.trim();
     final imagePaths = _attachedImages.map((image) => image.path).toList();
-    if ((rawInput.isEmpty && imagePaths.isEmpty) || _running) return;
+    final audioAttachments = List<AudioAttachment>.of(_attachedAudios);
+    final audioPaths = audioAttachments.map((audio) => audio.path).toList();
+    if ((rawInput.isEmpty && imagePaths.isEmpty && audioPaths.isEmpty) ||
+        _running) {
+      return;
+    }
     _stopRequested = false;
 
-    final promptInput = rawInput.isEmpty ? '请描述这张图片。' : rawInput;
+    final promptInput = rawInput.isEmpty
+        ? (imagePaths.isNotEmpty ? '请描述这张图片。' : '请识别并总结这段语音内容。')
+        : rawInput;
     final prompt = _enabledModes.contains(_ComposerMode.promptLab)
         ? _template.buildPrompt(promptInput)
         : promptInput;
-    final userText = _buildUserMessageText(rawInput, imagePaths.length);
+    final userText = _buildUserMessageText(
+      rawInput,
+      imagePaths.length,
+      audioAttachments.length,
+    );
     _inputController.clear();
     setState(() {
       _attachedImages.clear();
+      _attachedAudios.clear();
       if (imagePaths.isEmpty) _enabledModes.remove(_ComposerMode.image);
+      if (audioPaths.isEmpty) _enabledModes.remove(_ComposerMode.voice);
     });
 
     setState(() {
@@ -95,6 +112,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
           role: _ChatRole.user,
           text: userText,
           imagePaths: imagePaths,
+          audioAttachments: audioAttachments,
         ),
       );
       _messages.add(
@@ -125,9 +143,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
               ? agentSkillsSystemPrompt
               : null,
           imagePaths: imagePaths,
-          audioPaths: _enabledModes.contains(_ComposerMode.voice)
-              ? const ['pending-audio-recorder']
-              : const [],
+          audioPaths: audioPaths,
           enabledSkillNames: _enabledModes.contains(_ComposerMode.skills)
               ? builtInSkills
                     .where((skill) => skill.selected)
@@ -191,16 +207,26 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
   }
 
-  String _buildUserMessageText(String rawInput, int imageCount) {
+  String _buildUserMessageText(
+    String rawInput,
+    int imageCount,
+    int audioCount,
+  ) {
     final badges = <String>[
       if (imageCount > 0) '图片 × $imageCount',
+      if (audioCount > 0) '语音 × $audioCount',
       ..._enabledModes
           .where(
-            (mode) => mode != _ComposerMode.text && mode != _ComposerMode.image,
+            (mode) =>
+                mode != _ComposerMode.text &&
+                mode != _ComposerMode.image &&
+                mode != _ComposerMode.voice,
           )
           .map((mode) => mode.label),
     ].join(' · ');
-    final text = rawInput.isEmpty ? '请描述这张图片。' : rawInput;
+    final text = rawInput.isEmpty
+        ? (imageCount > 0 ? '请描述这张图片。' : '请识别并总结这段语音内容。')
+        : rawInput;
     if (badges.isEmpty) return text;
     return '$text\n\n[$badges]';
   }
@@ -260,10 +286,120 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
   }
 
+  void _removeAttachedAudio(AudioAttachment audio) {
+    setState(() {
+      _attachedAudios.remove(audio);
+      if (_attachedAudios.isEmpty) _enabledModes.remove(_ComposerMode.voice);
+    });
+  }
+
+  Future<void> _showAudioSourceSheet() async {
+    if (_running) return;
+    final action = await showModalBottomSheet<_AudioAction>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(
+                _recording ? Icons.stop_circle_outlined : Icons.mic_none,
+              ),
+              title: Text(_recording ? '停止录音' : '实时录音'),
+              subtitle: const Text('像微信一样录一段语音，发送后可点击播放'),
+              onTap: () => Navigator.pop(context, _AudioAction.record),
+            ),
+            ListTile(
+              leading: const Icon(Icons.audio_file_outlined),
+              title: const Text('选择语音文件'),
+              subtitle: const Text('从系统文件中选择 wav/m4a/mp3 等音频'),
+              onTap: () => Navigator.pop(context, _AudioAction.pickFile),
+            ),
+            ListTile(
+              leading: const Icon(Icons.phone_in_talk_outlined),
+              title: const Text('Live 语音通话探索'),
+              subtitle: const Text('实时连续听写 + 本地模型文字回复，先记录方案后分阶段接入'),
+              onTap: () => Navigator.pop(context, _AudioAction.liveCallInfo),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null) return;
+    switch (action) {
+      case _AudioAction.record:
+        await _toggleRecording();
+      case _AudioAction.pickFile:
+        await _pickAudioFile();
+      case _AudioAction.liveCallInfo:
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Live 语音通话会按“分段实时录音 → 音频理解 → 文字回复”方案继续实现。'),
+          ),
+        );
+    }
+  }
+
+  Future<void> _pickAudioFile() async {
+    try {
+      final audio = await _audioInput.pickAudioFile();
+      if (audio == null || !mounted) return;
+      setState(() {
+        _attachedAudios
+          ..clear()
+          ..add(audio);
+        _enabledModes.add(_ComposerMode.voice);
+      });
+    } on PlatformException catch (error) {
+      _showSnackBar('语音文件选择失败：${error.message ?? error.code}');
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    try {
+      if (!_recording) {
+        await _audioInput.startRecording();
+        if (!mounted) return;
+        setState(() {
+          _recording = true;
+          _enabledModes.add(_ComposerMode.voice);
+        });
+        _showSnackBar('开始录音，再点语音按钮可停止并附加到输入框。');
+        return;
+      }
+      final audio = await _audioInput.stopRecording();
+      if (!mounted) return;
+      setState(() => _recording = false);
+      if (audio == null) return;
+      setState(() {
+        _attachedAudios
+          ..clear()
+          ..add(audio);
+        _enabledModes.add(_ComposerMode.voice);
+      });
+    } on PlatformException catch (error) {
+      if (mounted) setState(() => _recording = false);
+      _showSnackBar('录音失败：${error.message ?? error.code}');
+    }
+  }
+
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
   void _toggleMode(_ComposerMode mode) {
     if (mode == _ComposerMode.text) return;
     if (mode == _ComposerMode.image) {
       _showImageSourceSheet();
+      return;
+    }
+    if (mode == _ComposerMode.voice) {
+      _showAudioSourceSheet();
       return;
     }
     setState(() {
@@ -319,9 +455,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             focusNode: _inputFocusNode,
             enabledModes: _enabledModes,
             attachedImages: _attachedImages,
+            attachedAudios: _attachedAudios,
+            recording: _recording,
             running: _running,
             onToggleMode: _toggleMode,
             onRemoveImage: _removeAttachedImage,
+            onRemoveAudio: _removeAttachedAudio,
+            onPlayAudio: (audio) => _audioInput.play(audio.path),
             onSend: _send,
             onStop: _stopGeneration,
           ),
@@ -454,6 +594,12 @@ class _MessageBubble extends StatelessWidget {
               children: [
                 if (message.imagePaths.isNotEmpty) ...[
                   _SentImagePreviewGrid(imagePaths: message.imagePaths),
+                  if (message.audioAttachments.isNotEmpty ||
+                      message.text.trim().isNotEmpty)
+                    const SizedBox(height: 10),
+                ],
+                if (message.audioAttachments.isNotEmpty) ...[
+                  _VoiceMessageGrid(audios: message.audioAttachments),
                   if (message.text.trim().isNotEmpty)
                     const SizedBox(height: 10),
                 ],
@@ -477,6 +623,105 @@ class _MessageBubble extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _VoiceMessageGrid extends StatelessWidget {
+  const _VoiceMessageGrid({required this.audios});
+
+  final List<AudioAttachment> audios;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [for (final audio in audios) _VoiceMessageCard(audio: audio)],
+    );
+  }
+}
+
+class _VoiceMessageCard extends StatelessWidget {
+  const _VoiceMessageCard({required this.audio, this.onPlay});
+
+  final AudioAttachment audio;
+  final VoidCallback? onPlay;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final waveform = audio.waveform.isEmpty
+        ? List<double>.generate(18, (index) => 0.22 + (index % 5) * 0.13)
+        : audio.waveform.take(24).toList(growable: false);
+    return Semantics(
+      button: true,
+      label: '播放语音 ${audio.durationLabel}',
+      child: InkWell(
+        onTap: onPlay ?? () => AudioInputService().play(audio.path),
+        borderRadius: BorderRadius.circular(18),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: colorScheme.primary.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: colorScheme.outlineVariant),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.play_arrow_rounded, color: colorScheme.primary),
+                const SizedBox(width: 6),
+                SizedBox(
+                  width: 118,
+                  height: 30,
+                  child: _WaveformBars(values: waveform),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  audio.durationLabel,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: colorScheme.primary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WaveformBars extends StatelessWidget {
+  const _WaveformBars({required this.values});
+
+  final List<double> values;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        for (final value in values)
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 1.4),
+              child: FractionallySizedBox(
+                heightFactor: value.clamp(0.08, 1.0),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.75),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -779,9 +1024,13 @@ class _Composer extends StatelessWidget {
     required this.focusNode,
     required this.enabledModes,
     required this.attachedImages,
+    required this.attachedAudios,
+    required this.recording,
     required this.running,
     required this.onToggleMode,
     required this.onRemoveImage,
+    required this.onRemoveAudio,
+    required this.onPlayAudio,
     required this.onSend,
     required this.onStop,
   });
@@ -790,9 +1039,13 @@ class _Composer extends StatelessWidget {
   final FocusNode focusNode;
   final Set<_ComposerMode> enabledModes;
   final List<XFile> attachedImages;
+  final List<AudioAttachment> attachedAudios;
+  final bool recording;
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
   final ValueChanged<XFile> onRemoveImage;
+  final ValueChanged<AudioAttachment> onRemoveAudio;
+  final ValueChanged<AudioAttachment> onPlayAudio;
   final VoidCallback onSend;
   final VoidCallback onStop;
 
@@ -819,6 +1072,18 @@ class _Composer extends StatelessWidget {
                     images: attachedImages,
                     onRemoveImage: onRemoveImage,
                   ),
+                  const SizedBox(height: 8),
+                ],
+                if (attachedAudios.isNotEmpty) ...[
+                  _AttachedAudioStrip(
+                    audios: attachedAudios,
+                    onRemoveAudio: onRemoveAudio,
+                    onPlayAudio: onPlayAudio,
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                if (recording) ...[
+                  const _RecordingBanner(),
                   const SizedBox(height: 8),
                 ],
                 TextField(
@@ -852,6 +1117,7 @@ class _Composer extends StatelessWidget {
                     _ComposerIcon(
                       mode: _ComposerMode.voice,
                       selected: enabledModes.contains(_ComposerMode.voice),
+                      recording: recording,
                       onTap: () => onToggleMode(_ComposerMode.voice),
                     ),
                     _ComposerIcon(
@@ -941,24 +1207,113 @@ class _AttachedImageStrip extends StatelessWidget {
   }
 }
 
+class _AttachedAudioStrip extends StatelessWidget {
+  const _AttachedAudioStrip({
+    required this.audios,
+    required this.onRemoveAudio,
+    required this.onPlayAudio,
+  });
+
+  final List<AudioAttachment> audios;
+  final ValueChanged<AudioAttachment> onRemoveAudio;
+  final ValueChanged<AudioAttachment> onPlayAudio;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 56,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        itemCount: audios.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final audio = audios[index];
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              _VoiceMessageCard(audio: audio, onPlay: () => onPlayAudio(audio)),
+              Positioned(
+                top: -5,
+                right: -5,
+                child: InkWell(
+                  onTap: () => onRemoveAudio(audio),
+                  borderRadius: BorderRadius.circular(14),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.scrim.withValues(alpha: 0.62),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(3),
+                      child: Icon(Icons.close, color: Colors.white, size: 16),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _RecordingBanner extends StatelessWidget {
+  const _RecordingBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: colorScheme.errorContainer,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.fiber_manual_record, color: colorScheme.error),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '正在录音… 再点语音按钮停止',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: colorScheme.onErrorContainer,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ComposerIcon extends StatelessWidget {
   const _ComposerIcon({
     required this.mode,
     required this.selected,
     required this.onTap,
+    this.recording = false,
   });
 
   final _ComposerMode mode;
   final bool selected;
+  final bool recording;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return IconButton.filledTonal(
-      isSelected: selected,
-      tooltip: mode.label,
+      isSelected: selected || recording,
+      tooltip: recording ? '停止录音' : mode.label,
       onPressed: onTap,
-      icon: Icon(mode.icon),
+      icon: Icon(recording ? Icons.stop_circle_outlined : mode.icon),
     );
   }
 }
@@ -988,6 +1343,8 @@ class _ModelStatusChip extends StatelessWidget {
   }
 }
 
+enum _AudioAction { record, pickFile, liveCallInfo }
+
 enum _ComposerMode {
   text('文字', Icons.chat_bubble_outline),
   image('图片', Icons.image_outlined),
@@ -1007,23 +1364,27 @@ class _ChatMessage {
     required this.role,
     required this.text,
     this.imagePaths = const [],
+    this.audioAttachments = const [],
     this.streaming = false,
   });
 
   final _ChatRole role;
   final String text;
   final List<String> imagePaths;
+  final List<AudioAttachment> audioAttachments;
   final bool streaming;
 
   _ChatMessage copyWith({
     String? text,
     List<String>? imagePaths,
+    List<AudioAttachment>? audioAttachments,
     bool? streaming,
   }) {
     return _ChatMessage(
       role: role,
       text: text ?? this.text,
       imagePaths: imagePaths ?? this.imagePaths,
+      audioAttachments: audioAttachments ?? this.audioAttachments,
       streaming: streaming ?? this.streaming,
     );
   }

@@ -1,10 +1,16 @@
 package com.example.gemma_local_app
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaPlayer
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -34,14 +40,24 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity() {
   private val runtime = GemmaLiteRtRuntime()
+  private val audioInput by lazy { AndroidAudioInput(this) }
   private val downloader by lazy { ModelDownloadRepository(applicationContext) }
+
+  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    if (audioInput.onActivityResult(requestCode, resultCode, data)) return
+    super.onActivityResult(requestCode, resultCode, data)
+  }
 
   override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
     super.configureFlutterEngine(flutterEngine)
@@ -64,6 +80,25 @@ class MainActivity : FlutterActivity() {
       flutterEngine.dartExecutor.binaryMessenger,
       GemmaLiteRtRuntime.EVENT_CHANNEL,
     ).setStreamHandler(runtime)
+
+    MethodChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      AUDIO_METHOD_CHANNEL,
+    ).setMethodCallHandler { call, result ->
+      try {
+        when (call.method) {
+          "pickAudioFile" -> audioInput.pickAudioFile(result)
+          "startRecording" -> audioInput.startRecording(result)
+          "stopRecording" -> audioInput.stopRecording(result)
+          "cancelRecording" -> audioInput.cancelRecording(result)
+          "playAudio" -> audioInput.playAudio(call, result)
+          "stopPlayback" -> audioInput.stopPlayback(result)
+          else -> result.notImplemented()
+        }
+      } catch (throwable: Throwable) {
+        result.error("AUDIO_INPUT_ERROR", throwable.message, null)
+      }
+    }
 
     MethodChannel(
       flutterEngine.dartExecutor.binaryMessenger,
@@ -126,7 +161,242 @@ class MainActivity : FlutterActivity() {
   companion object {
     private const val DOWNLOAD_METHOD_CHANNEL = "com.example.gemma_local_app/model_download"
     private const val DOWNLOAD_EVENT_CHANNEL = "com.example.gemma_local_app/model_download_events"
+    private const val AUDIO_METHOD_CHANNEL = "com.example.gemma_local_app/audio_input"
     private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 44002
+  }
+}
+
+private class AndroidAudioInput(private val activity: MainActivity) {
+  private var pendingPickResult: MethodChannel.Result? = null
+  @Volatile private var audioRecord: AudioRecord? = null
+  @Volatile private var recordingThread: Thread? = null
+  @Volatile private var isRecording = false
+  private var recordingFile: File? = null
+  private var recordingStartedAtMs: Long = 0
+  private var player: MediaPlayer? = null
+
+  fun pickAudioFile(result: MethodChannel.Result) {
+    if (pendingPickResult != null) {
+      result.error("PICK_IN_PROGRESS", "Another audio picker is already open.", null)
+      return
+    }
+    pendingPickResult = result
+    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+      addCategory(Intent.CATEGORY_OPENABLE)
+      type = "audio/*"
+    }
+    activity.startActivityForResult(intent, PICK_AUDIO_REQUEST_CODE)
+  }
+
+  fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+    if (requestCode != PICK_AUDIO_REQUEST_CODE) return false
+    val result = pendingPickResult
+    pendingPickResult = null
+    if (result == null) return true
+    if (resultCode != Activity.RESULT_OK || data?.data == null) {
+      result.success(null)
+      return true
+    }
+    try {
+      val uri = data.data!!
+      val destination = File(activity.cacheDir, "picked_audio_${System.currentTimeMillis()}.wav")
+      activity.contentResolver.openInputStream(uri)?.use { input ->
+        destination.outputStream().use { output -> input.copyTo(output) }
+      } ?: throw IllegalArgumentException("Unable to open selected audio")
+      result.success(audioMap(destination, durationMs = readDurationMs(destination)))
+    } catch (throwable: Throwable) {
+      result.error("PICK_AUDIO_FAILED", throwable.message, null)
+    }
+    return true
+  }
+
+  fun startRecording(result: MethodChannel.Result) {
+    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+      ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_REQUEST_CODE)
+      result.error("MIC_PERMISSION_REQUIRED", "请授权麦克风权限后重试。", null)
+      return
+    }
+    if (audioRecord != null || isRecording) {
+      result.error("ALREADY_RECORDING", "Audio recording is already running.", null)
+      return
+    }
+    val minBuffer = AudioRecord.getMinBufferSize(
+      SAMPLE_RATE,
+      AudioFormat.CHANNEL_IN_MONO,
+      AudioFormat.ENCODING_PCM_16BIT,
+    )
+    val bufferSize = max(minBuffer, SAMPLE_RATE * 2)
+    val record = AudioRecord(
+      MediaRecorder.AudioSource.MIC,
+      SAMPLE_RATE,
+      AudioFormat.CHANNEL_IN_MONO,
+      AudioFormat.ENCODING_PCM_16BIT,
+      bufferSize,
+    )
+    if (record.state != AudioRecord.STATE_INITIALIZED) {
+      record.release()
+      result.error("RECORD_INIT_FAILED", "AudioRecord 初始化失败。", null)
+      return
+    }
+    val file = File(activity.cacheDir, "voice_${System.currentTimeMillis()}.wav")
+    val thread = Thread {
+      val pcm = ByteArrayOutputStream()
+      val buffer = ByteArray(bufferSize)
+      try {
+        record.startRecording()
+        while (isRecording) {
+          val read = record.read(buffer, 0, buffer.size)
+          if (read > 0) pcm.write(buffer, 0, read)
+          val elapsedSec = (System.currentTimeMillis() - recordingStartedAtMs) / 1000
+          if (elapsedSec >= MAX_AUDIO_SECONDS) isRecording = false
+        }
+        writeWavFile(file, pcm.toByteArray())
+      } catch (throwable: Throwable) {
+        Log.e("AndroidAudioInput", "recording failed", throwable)
+      } finally {
+        try { record.stop() } catch (_: Throwable) {}
+        record.release()
+      }
+    }
+    audioRecord = record
+    recordingFile = file
+    recordingStartedAtMs = System.currentTimeMillis()
+    isRecording = true
+    recordingThread = thread
+    thread.start()
+    result.success(null)
+  }
+
+  fun stopRecording(result: MethodChannel.Result) {
+    val file = recordingFile
+    if (file == null || audioRecord == null) {
+      result.success(null)
+      return
+    }
+    isRecording = false
+    recordingThread?.join(1200)
+    audioRecord = null
+    recordingThread = null
+    recordingFile = null
+    val durationMs = (System.currentTimeMillis() - recordingStartedAtMs).toInt().coerceAtLeast(1000)
+    result.success(audioMap(file, durationMs = durationMs))
+  }
+
+  fun cancelRecording(result: MethodChannel.Result) {
+    isRecording = false
+    recordingThread?.join(800)
+    audioRecord = null
+    recordingThread = null
+    recordingFile?.delete()
+    recordingFile = null
+    result.success(null)
+  }
+
+  fun playAudio(call: MethodCall, result: MethodChannel.Result) {
+    val path = call.argument<String>("path") ?: run {
+      result.error("PATH_REQUIRED", "path is required", null)
+      return
+    }
+    stopPlaybackInternal()
+    player = MediaPlayer().apply {
+      setDataSource(path)
+      setOnCompletionListener { stopPlaybackInternal() }
+      prepare()
+      start()
+    }
+    result.success(null)
+  }
+
+  fun stopPlayback(result: MethodChannel.Result) {
+    stopPlaybackInternal()
+    result.success(null)
+  }
+
+  private fun stopPlaybackInternal() {
+    try {
+      player?.stop()
+    } catch (_: Throwable) {
+    }
+    player?.release()
+    player = null
+  }
+
+  private fun readDurationMs(file: File): Int {
+    val probe = MediaPlayer()
+    return try {
+      probe.setDataSource(file.absolutePath)
+      probe.prepare()
+      probe.duration
+    } catch (_: Throwable) {
+      0
+    } finally {
+      probe.release()
+    }
+  }
+
+  private fun audioMap(file: File, durationMs: Int): Map<String, Any> {
+    return mapOf(
+      "path" to file.absolutePath,
+      "durationMs" to durationMs,
+      "waveform" to estimateWaveform(file),
+    )
+  }
+
+  private fun estimateWaveform(file: File): List<Double> {
+    val bytes = file.readBytes()
+    if (bytes.isEmpty()) return List(18) { 0.28 + (it % 4) * 0.12 }
+    val bucketCount = 24
+    val bucketSize = max(1, bytes.size / bucketCount)
+    return (0 until bucketCount).map { bucket ->
+      val start = bucket * bucketSize
+      val end = minOf(bytes.size, start + bucketSize)
+      var sum = 0L
+      for (i in start until end) sum += kotlin.math.abs(bytes[i].toInt())
+      ((sum.toDouble() / max(1, end - start)) / 128.0).coerceIn(0.08, 1.0)
+    }
+  }
+
+  private fun writeWavFile(file: File, pcmBytes: ByteArray) {
+    RandomAccessFile(file, "rw").use { wav ->
+      wav.setLength(0)
+      wav.writeBytes("RIFF")
+      wav.writeIntLE(36 + pcmBytes.size)
+      wav.writeBytes("WAVE")
+      wav.writeBytes("fmt ")
+      wav.writeIntLE(16)
+      wav.writeShortLE(1)
+      wav.writeShortLE(1)
+      wav.writeIntLE(SAMPLE_RATE)
+      wav.writeIntLE(SAMPLE_RATE * 2)
+      wav.writeShortLE(2)
+      wav.writeShortLE(16)
+      wav.writeBytes("data")
+      wav.writeIntLE(pcmBytes.size)
+      wav.write(pcmBytes)
+    }
+  }
+
+  private fun RandomAccessFile.writeIntLE(value: Int) {
+    write(byteArrayOf(
+      (value and 0xFF).toByte(),
+      ((value shr 8) and 0xFF).toByte(),
+      ((value shr 16) and 0xFF).toByte(),
+      ((value shr 24) and 0xFF).toByte(),
+    ))
+  }
+
+  private fun RandomAccessFile.writeShortLE(value: Int) {
+    write(byteArrayOf(
+      (value and 0xFF).toByte(),
+      ((value shr 8) and 0xFF).toByte(),
+    ))
+  }
+
+  companion object {
+    private const val PICK_AUDIO_REQUEST_CODE = 55001
+    private const val RECORD_AUDIO_REQUEST_CODE = 55002
+    private const val SAMPLE_RATE = 16000
+    private const val MAX_AUDIO_SECONDS = 30
   }
 }
 
@@ -147,6 +417,7 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
   @Volatile private var engine: Engine? = null
   @Volatile private var conversation: Conversation? = null
   private var eventSink: EventChannel.EventSink? = null
+  @Volatile private var initArgs: RuntimeInitArgs? = null
 
   fun initialize(call: MethodCall, result: MethodChannel.Result) {
     val args = RuntimeInitArgs(
@@ -178,13 +449,15 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
   @OptIn(ExperimentalApi::class)
   private fun initializeBlocking(args: RuntimeInitArgs) {
     closeCurrentRuntime()
-    val backend = createBackend(args.accelerator)
+    val backend = createBackend(args.accelerator, args.supportImage)
+    Log.d(TAG, "initializing runtime: backend=$backend, supportImage=${args.supportImage}, supportAudio=${args.supportAudio}")
     val engineConfig = EngineConfig(
       modelPath = args.modelPath,
       backend = backend,
-      // Match Google AI Edge Gallery for Gemma multimodal chat: main backend GPU + vision GPU.
       visionBackend = if (args.supportImage) Backend.GPU() else null,
-      audioBackend = null,
+      // Match Google AI Edge Gallery: audio backend is CPU-only and enabled
+      // only for explicit audio requests. Text stays CPU-only; image stays GPU vision.
+      audioBackend = if (args.supportAudio) Backend.CPU() else null,
       maxNumTokens = args.maxTokens,
     )
 
@@ -213,12 +486,14 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
 
     engine = newEngine
     conversation = newConversation
+    initArgs = args
   }
 
   fun generate(call: MethodCall, result: MethodChannel.Result) {
     val prompt = call.argument<String>("prompt") ?: ""
     val imagePaths = call.argument<List<String>>("imagePaths") ?: emptyList()
-    if (prompt.isBlank() && imagePaths.isEmpty()) {
+    val audioPaths = call.argument<List<String>>("audioPaths") ?: emptyList()
+    if (prompt.isBlank() && imagePaths.isEmpty() && audioPaths.isEmpty()) {
       result.error("EMPTY_PROMPT", "prompt is empty.", null)
       return
     }
@@ -237,6 +512,11 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
           val imageBytes = bitmap.toPngByteArray()
           Log.d(TAG, "image input ready: ${bitmap.width}x${bitmap.height}, pngBytes=${imageBytes.size}")
           contents.add(Content.ImageBytes(imageBytes))
+        }
+        for (audioPath in audioPaths.take(1)) {
+          val audioBytes = readAudioForGemma(audioPath)
+          Log.d(TAG, "audio input ready: pcmBytes=${audioBytes.size}")
+          contents.add(Content.AudioBytes(audioBytes))
         }
         if (prompt.trim().isNotEmpty()) {
           contents.add(Content.Text(prompt))
@@ -313,12 +593,12 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     eventSink = null
   }
 
-  private fun createBackend(accelerator: String): Backend {
+  private fun createBackend(accelerator: String, supportImage: Boolean): Backend {
     return when (accelerator.lowercase()) {
       "cpu" -> Backend.CPU()
-      "gpu" -> Backend.GPU()
+      "gpu" -> if (supportImage) Backend.GPU() else Backend.CPU()
       "npu", "tpu" -> Backend.NPU()
-      else -> Backend.GPU()
+      else -> if (supportImage) Backend.GPU() else Backend.CPU()
     }
   }
 
@@ -404,6 +684,108 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     return stream.toByteArray()
   }
 
+  private fun readAudioForGemma(audioPath: String): ByteArray {
+    val audioFile = File(audioPath)
+    if (!audioFile.exists()) {
+      throw IllegalArgumentException("Audio file not found: $audioPath")
+    }
+    val bytes = audioFile.readBytes()
+    if (bytes.size < 44 || bytes.copyOfRange(0, 4).toString(Charsets.US_ASCII) != "RIFF") {
+      throw IllegalArgumentException("Gemma audio requires a WAV file. Please record in-app or pick a WAV file.")
+    }
+    // Match Google AI Edge Gallery exactly: Content.AudioBytes receives raw
+    // mono 16-bit PCM bytes, not a WAV container. Passing the RIFF header makes
+    // the audio encoder see header bytes as samples and causes unstable / empty
+    // audio understanding.
+    return extractMono16BitPcm(bytes, MAX_AUDIO_SECONDS)
+  }
+
+  private fun extractMono16BitPcm(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
+    val riff = wavBytes.copyOfRange(0, 4).toString(Charsets.US_ASCII)
+    val wave = wavBytes.copyOfRange(8, 12).toString(Charsets.US_ASCII)
+    if (riff != "RIFF" || wave != "WAVE") {
+      throw IllegalArgumentException("Invalid WAV header")
+    }
+    var offset = 12
+    var channels = 1
+    var sampleRate = SAMPLE_RATE
+    var bitsPerSample = 16
+    var dataOffset = -1
+    var dataSize = 0
+    while (offset + 8 <= wavBytes.size) {
+      val chunkId = wavBytes.copyOfRange(offset, offset + 4).toString(Charsets.US_ASCII)
+      val chunkSize = ByteBuffer.wrap(wavBytes, offset + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+      val chunkDataOffset = offset + 8
+      if (chunkDataOffset + chunkSize > wavBytes.size) break
+      when (chunkId) {
+        "fmt " -> {
+          val fmt = ByteBuffer.wrap(wavBytes, chunkDataOffset, chunkSize).order(ByteOrder.LITTLE_ENDIAN)
+          val audioFormat = fmt.short.toInt()
+          if (audioFormat != 1) throw IllegalArgumentException("Only PCM WAV is supported for Gemma audio")
+          channels = fmt.short.toInt()
+          sampleRate = fmt.int
+          fmt.int // byte rate
+          fmt.short // block align
+          bitsPerSample = fmt.short.toInt()
+        }
+        "data" -> {
+          dataOffset = chunkDataOffset
+          dataSize = chunkSize
+          break
+        }
+      }
+      offset = chunkDataOffset + chunkSize + (chunkSize and 1)
+    }
+    if (dataOffset < 0 || dataSize <= 0) throw IllegalArgumentException("WAV data chunk not found")
+
+    val rawData = wavBytes.copyOfRange(dataOffset, dataOffset + dataSize)
+    val pcmSamples = when (bitsPerSample) {
+      8 -> ShortArray(rawData.size) { i -> (((rawData[i].toInt() and 0xFF) - 128) * 256).toShort() }
+      16 -> {
+        val shortBuffer = ByteBuffer.wrap(rawData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        ShortArray(shortBuffer.remaining()).also { shortBuffer.get(it) }
+      }
+      else -> throw IllegalArgumentException("Only 8/16-bit PCM WAV is supported for Gemma audio")
+    }
+
+    val monoSamples = if (channels == 1) {
+      pcmSamples
+    } else {
+      val frames = pcmSamples.size / channels
+      ShortArray(frames) { frame ->
+        var sum = 0
+        for (channel in 0 until channels) sum += pcmSamples[frame * channels + channel].toInt()
+        (sum / channels).toShort()
+      }
+    }
+
+    val normalizedSamples = if (sampleRate == SAMPLE_RATE) {
+      monoSamples
+    } else {
+      resampleMono(monoSamples, sampleRate, SAMPLE_RATE)
+    }
+    val trimmedSamples = normalizedSamples.copyOfRange(
+      0,
+      minOf(normalizedSamples.size, SAMPLE_RATE * maxSeconds),
+    )
+    val output = ByteBuffer.allocate(trimmedSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+    for (sample in trimmedSamples) output.putShort(sample)
+    return output.array()
+  }
+
+  private fun resampleMono(inputSamples: ShortArray, originalSampleRate: Int, targetSampleRate: Int): ShortArray {
+    if (originalSampleRate <= 0 || originalSampleRate == targetSampleRate) return inputSamples
+    val ratio = targetSampleRate.toDouble() / originalSampleRate.toDouble()
+    val outputLength = max(1, (inputSamples.size * ratio).roundToInt())
+    return ShortArray(outputLength) { index ->
+      val position = index / ratio
+      val left = position.toInt().coerceIn(0, inputSamples.lastIndex)
+      val right = minOf(left + 1, inputSamples.lastIndex)
+      val fraction = position - left
+      (inputSamples[left] * (1.0 - fraction) + inputSamples[right] * fraction).roundToInt().toShort()
+    }
+  }
+
   private fun closeCurrentRuntime() {
     try {
       conversation?.close()
@@ -417,11 +799,14 @@ private class GemmaLiteRtRuntime : EventChannel.StreamHandler {
     }
     conversation = null
     engine = null
+    initArgs = null
   }
 
   companion object {
     const val METHOD_CHANNEL = "com.example.gemma_local_app/runtime"
     const val EVENT_CHANNEL = "com.example.gemma_local_app/runtime_events"
     private const val TAG = "GemmaLiteRtRuntime"
+    private const val SAMPLE_RATE = 16000
+    private const val MAX_AUDIO_SECONDS = 30
   }
 }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io' show File, Platform;
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/flutter_gemma.dart' as fg;
@@ -47,26 +48,41 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       onError: (Object error) => _activeGenerationController?.addError(error),
     );
 
+    // Keep Android initial runtime text-only. Google Gallery enables image/audio
+    // per task/session; enabling multimodal backends globally made Android stay
+    // in "思考中" even for normal chat.
+    await _initializeAndroidRuntime(
+      config,
+      supportImage: false,
+      supportAudio: false,
+    );
+    _initialized = true;
+  }
+
+  Future<void> _initializeAndroidRuntime(
+    GemmaModelConfig config, {
+    required bool supportImage,
+    required bool supportAudio,
+  }) async {
+    final modelPath = await _resolveModelPath(config);
     await _methodChannel.invokeMethod<void>('initialize', {
       'modelPath': modelPath,
       'topK': config.topK,
       'topP': config.topP,
       'temperature': config.temperature,
       'maxTokens': 1024,
-      'supportImage': config.supportImage,
-      'supportAudio': false,
-      // Google AI Edge Gallery defaults Gemma multimodal chat to GPU.
-      // CPU text-only is stable, but image prefill can fail on Android with
-      // LiteRT-LM Status Code 13 / Failed to invoke the compiled model.
-      'accelerator': config.supportImage ? 'gpu' : 'cpu',
+      'supportImage': supportImage,
+      'supportAudio': supportAudio,
+      'accelerator': supportImage ? 'gpu' : 'cpu',
     });
-    _initialized = true;
   }
 
   Future<void> _initializeFlutterGemma(
     GemmaModelConfig config,
     String modelPath, {
     bool forceReload = false,
+    bool supportImage = true,
+    bool supportAudio = false,
   }) async {
     final file = File(modelPath);
     if (!await file.exists()) {
@@ -97,9 +113,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
         maxTokens: 1024,
         preferredBackend: fg.PreferredBackend.gpu,
-        supportImage: config.supportImage,
-        supportAudio: false,
-        maxNumImages: config.supportImage ? 1 : null,
+        supportImage: supportImage && config.supportImage,
+        supportAudio: supportAudio && config.supportAudio,
+        maxNumImages: supportImage && config.supportImage ? 1 : null,
       );
       _flutterGemmaChat = null;
     } catch (error) {
@@ -127,6 +143,29 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       return;
     }
 
+    final config = _config ?? gemma4E2bIt;
+    final needsImageRuntime = request.imagePaths.isNotEmpty;
+    final needsAudioRuntime = request.audioPaths.isNotEmpty;
+    try {
+      await _initializeAndroidRuntime(
+        config,
+        supportImage: needsImageRuntime,
+        supportAudio: needsAudioRuntime,
+      );
+    } on PlatformException catch (error) {
+      if (!needsImageRuntime && !needsAudioRuntime) rethrow;
+      await _initializeAndroidRuntime(
+        config,
+        supportImage: false,
+        supportAudio: false,
+      );
+      throw RuntimeUnavailableException(
+        needsAudioRuntime
+            ? '当前设备 audio backend 初始化失败，已回退到文字模式。音频理解需要 LiteRT-LM CPU audio backend。原始错误：${error.message ?? error.code}'
+            : '当前设备 GPU/vision 初始化失败，已回退到文字模式。图片理解需要支持 LiteRT-LM GPU vision 的设备。原始错误：${error.message ?? error.code}',
+      );
+    }
+
     final generationController = StreamController<String>();
     await _activeGenerationController?.close();
     _activeGenerationController = generationController;
@@ -139,7 +178,17 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'enabledSkillNames': request.enabledSkillNames,
       });
 
-      await for (final token in generationController.stream) {
+      await for (final token in generationController.stream.timeout(
+        const Duration(seconds: 90),
+        onTimeout: (sink) {
+          sink.addError(
+            const RuntimeUnavailableException(
+              '模型 90 秒内没有返回内容，已自动停止。请重试，或切换为纯文字/较短输入。',
+            ),
+          );
+          sink.close();
+        },
+      )) {
         yield token;
       }
     } finally {
@@ -157,11 +206,6 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     if (model == null) {
       throw const RuntimeUnavailableException('iOS flutter_gemma model 尚未初始化。');
     }
-    if (request.audioPaths.isNotEmpty) {
-      throw const RuntimeUnavailableException(
-        '当前先验证 Gemma-4 文字/图片对话；音频会在文字和图片稳定后接入。',
-      );
-    }
     var prompt = request.prompt;
     if (request.systemPrompt != null &&
         request.systemPrompt!.trim().isNotEmpty) {
@@ -172,15 +216,20 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           'Enabled skills: ${request.enabledSkillNames.join(', ')}\n\n$prompt';
     }
 
-    // iOS .litertlm FFI image sessions are not reliably reusable: after one
-    // successful vision request, the next request can fail or ignore the image.
-    // For image requests, fully rebuild the FFI model/client so each ask-image
-    // starts with the same clean native state as the first successful request.
+    // iOS .litertlm FFI multimodal sessions are not reliably reusable. Rebuild
+    // per image/audio request so text/image/audio modalities stay isolated.
+    final isAudioRequest = request.audioPaths.isNotEmpty;
     final isImageRequest = request.imagePaths.isNotEmpty;
-    if (isImageRequest) {
+    if (isImageRequest || isAudioRequest) {
       final config = _config ?? gemma4E2bIt;
       final modelPath = await _resolveModelPath(config);
-      await _initializeFlutterGemma(config, modelPath, forceReload: true);
+      await _initializeFlutterGemma(
+        config,
+        modelPath,
+        forceReload: true,
+        supportImage: isImageRequest,
+        supportAudio: isAudioRequest,
+      );
     } else {
       await _flutterGemmaChat?.session.close();
       _flutterGemmaChat = null;
@@ -196,14 +245,29 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       topK: _config?.topK ?? gemma4E2bIt.topK,
       topP: _config?.topP ?? gemma4E2bIt.topP,
       supportImage: _config?.supportImage ?? gemma4E2bIt.supportImage,
-      supportAudio: false,
+      supportAudio:
+          isAudioRequest && (_config?.supportAudio ?? gemma4E2bIt.supportAudio),
       modelType: fg.ModelType.gemma4,
       isThinking: false,
     );
     _flutterGemmaChat = chat;
 
     try {
-      if (request.imagePaths.isNotEmpty) {
+      if (request.audioPaths.isNotEmpty) {
+        final firstAudio = File(request.audioPaths.first);
+        if (!await firstAudio.exists()) {
+          throw RuntimeUnavailableException(
+            '音频文件不存在：${request.audioPaths.first}',
+          );
+        }
+        await chat.addQueryChunk(
+          fg.Message.withAudio(
+            text: _audioPrompt(prompt),
+            audioBytes: _extractMono16BitPcm(await firstAudio.readAsBytes()),
+            isUser: true,
+          ),
+        );
+      } else if (request.imagePaths.isNotEmpty) {
         final firstImage = File(request.imagePaths.first);
         if (!await firstImage.exists()) {
           throw RuntimeUnavailableException(
@@ -223,7 +287,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     } catch (error) {
       await chat.session.close();
       if (identical(_flutterGemmaChat, chat)) _flutterGemmaChat = null;
-      throw RuntimeUnavailableException('iOS 图片/文本输入失败，已重置会话，请重试：$error');
+      throw RuntimeUnavailableException('iOS 多模态/文本输入失败，已重置会话，请重试：$error');
     }
 
     await for (final response in chat.generateChatResponseAsync()) {
@@ -243,6 +307,109 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       return '请直接观察并描述这张图片中的主要对象、场景、文字和可见细节。不要回答无关内容。';
     }
     return '请根据图片内容回答：$trimmed';
+  }
+
+  String _audioPrompt(String prompt) {
+    final trimmed = prompt.trim();
+    if (trimmed.isEmpty || trimmed == '请听这段声音并说明内容。') {
+      return '请直接听这段音频，说明你听到的主要内容、声音类型、语言或环境线索。不要回答无关内容。';
+    }
+    return '请根据音频内容回答：$trimmed';
+  }
+
+  Uint8List _extractMono16BitPcm(Uint8List wavBytes) {
+    if (wavBytes.length < 44 ||
+        String.fromCharCodes(wavBytes.sublist(0, 4)) != 'RIFF') {
+      throw const RuntimeUnavailableException(
+        'Gemma 音频理解需要 16k mono PCM WAV；请使用应用内录音或选择 WAV 文件。',
+      );
+    }
+    final data = ByteData.sublistView(wavBytes);
+    if (String.fromCharCodes(wavBytes.sublist(8, 12)) != 'WAVE') {
+      throw const RuntimeUnavailableException('无效 WAV 文件。');
+    }
+    var offset = 12;
+    var channels = 1;
+    var sampleRate = 16000;
+    var bitsPerSample = 16;
+    var dataOffset = -1;
+    var dataSize = 0;
+    while (offset + 8 <= wavBytes.length) {
+      final chunkId = String.fromCharCodes(
+        wavBytes.sublist(offset, offset + 4),
+      );
+      final chunkSize = data.getUint32(offset + 4, Endian.little);
+      final chunkDataOffset = offset + 8;
+      if (chunkDataOffset + chunkSize > wavBytes.length) break;
+      if (chunkId == 'fmt ') {
+        final audioFormat = data.getUint16(chunkDataOffset, Endian.little);
+        if (audioFormat != 1) {
+          throw const RuntimeUnavailableException('Gemma 音频只支持 PCM WAV。');
+        }
+        channels = data.getUint16(chunkDataOffset + 2, Endian.little);
+        sampleRate = data.getUint32(chunkDataOffset + 4, Endian.little);
+        bitsPerSample = data.getUint16(chunkDataOffset + 14, Endian.little);
+      } else if (chunkId == 'data') {
+        dataOffset = chunkDataOffset;
+        dataSize = chunkSize;
+        break;
+      }
+      offset = chunkDataOffset + chunkSize + (chunkSize.isOdd ? 1 : 0);
+    }
+    if (dataOffset < 0 || dataSize <= 0) {
+      throw const RuntimeUnavailableException('WAV data chunk 不存在。');
+    }
+    final samples = <int>[];
+    if (bitsPerSample == 16) {
+      for (var i = dataOffset; i + 1 < dataOffset + dataSize; i += 2) {
+        samples.add(data.getInt16(i, Endian.little));
+      }
+    } else if (bitsPerSample == 8) {
+      for (var i = dataOffset; i < dataOffset + dataSize; i += 1) {
+        samples.add(((wavBytes[i] & 0xFF) - 128) * 256);
+      }
+    } else {
+      throw const RuntimeUnavailableException('Gemma 音频只支持 8/16-bit PCM WAV。');
+    }
+    final mono = <int>[];
+    if (channels <= 1) {
+      mono.addAll(samples);
+    } else {
+      for (var i = 0; i + channels <= samples.length; i += channels) {
+        var sum = 0;
+        for (var c = 0; c < channels; c += 1) {
+          sum += samples[i + c];
+        }
+        mono.add((sum / channels).round());
+      }
+    }
+    final normalized = sampleRate == 16000
+        ? mono
+        : _resampleMono(mono, sampleRate, 16000);
+    final maxSamples = 16000 * 30;
+    final trimmed = normalized.length > maxSamples
+        ? normalized.sublist(0, maxSamples)
+        : normalized;
+    final out = ByteData(trimmed.length * 2);
+    for (var i = 0; i < trimmed.length; i += 1) {
+      out.setInt16(i * 2, trimmed[i].clamp(-32768, 32767), Endian.little);
+    }
+    return out.buffer.asUint8List();
+  }
+
+  List<int> _resampleMono(List<int> input, int originalRate, int targetRate) {
+    if (originalRate <= 0 || originalRate == targetRate || input.isEmpty) {
+      return input;
+    }
+    final ratio = targetRate / originalRate;
+    final outputLength = (input.length * ratio).round().clamp(1, 1 << 31);
+    return List<int>.generate(outputLength, (index) {
+      final pos = index / ratio;
+      final left = pos.floor().clamp(0, input.length - 1);
+      final right = (left + 1).clamp(0, input.length - 1);
+      final fraction = pos - left;
+      return (input[left] * (1 - fraction) + input[right] * fraction).round();
+    });
   }
 
   @override
