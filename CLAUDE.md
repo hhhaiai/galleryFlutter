@@ -856,7 +856,7 @@ POST_NOTIFICATIONS
 - [x] iOS runtime channel 已注册到 `com.example.gemma_local_app/runtime`：Flutter 侧现在 iOS 也走 MethodChannel，不再走 Dart Placeholder/占位输出。
 - [x] Xcode/Swift toolchain 已从 Xcode 15.0.1 升级到 Xcode 26.4.1 / Swift 6.3.1，`ios/Podfile` 已启用 `MediaPipeTasksGenAI 0.10.35`，`pod install` 与 `flutter build ios --no-codesign` 均可成功链接。
 - [x] iOS 真实文字对话 runtime 已接入：`IOSGemmaRuntime.swift` 使用 `LlmInference.Options(modelPath:)` 初始化模型，创建 `LlmInference.Session`，`generate` 调用 `session.addQueryChunk(inputText:)` 与 `session.generateResponseAsync()`，并把 partial token 通过 `com.example.gemma_local_app/runtime_events` 流式返回 Flutter。
-- [x] 图片入口已升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」，拍照或选择后缩略图附着到输入框，可删除，可附带文字一起发送；Android 参考 Gallery 以 1024x1024 采样 + EXIF 旋转后通过 `Content.ImageBytes` 接入 LiteRT-LM，iOS 通过 `flutter_gemma` 的 `Message.withImage` 接入。
+- [x] 图片入口已升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」，拍照或选择后缩略图附着到输入框，可删除，可附带文字一起发送；Android 参考 Gallery 以 1024x1024 采样 + EXIF 旋转后通过 `Content.ImageBytes` 接入 LiteRT-LM，iOS 通过 `flutter_gemma` 的 `Message.withImage` 接入。Android 与 iOS 真机图片识别均已测试成功；iOS 连续图片识别为保证稳定性，每次图片请求完整重建 vision runtime/model client。
 
 ## 12.5 Google AI Edge GitHub 参考与用户体验设计（2026-05-02）
 
