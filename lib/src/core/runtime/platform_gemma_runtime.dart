@@ -92,16 +92,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         preferredBackend: fg.PreferredBackend.gpu,
         supportImage: config.supportImage,
         supportAudio: false,
+        maxNumImages: config.supportImage ? 1 : null,
       );
-      _flutterGemmaChat = await _flutterGemmaModel!.createChat(
-        temperature: config.temperature,
-        topK: config.topK,
-        topP: config.topP,
-        supportImage: config.supportImage,
-        supportAudio: false,
-        modelType: fg.ModelType.gemma4,
-        isThinking: false,
-      );
+      _flutterGemmaChat = null;
     } catch (error) {
       _flutterGemmaChat = null;
       await _flutterGemmaModel?.close();
@@ -153,9 +146,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   Stream<String> _generateWithFlutterGemma(GemmaRequest request) async* {
-    final chat = _flutterGemmaChat;
-    if (chat == null) {
-      throw const RuntimeUnavailableException('iOS flutter_gemma chat 尚未初始化。');
+    final model = _flutterGemmaModel;
+    if (model == null) {
+      throw const RuntimeUnavailableException('iOS flutter_gemma model 尚未初始化。');
     }
     if (request.audioPaths.isNotEmpty) {
       throw const RuntimeUnavailableException(
@@ -172,23 +165,45 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           'Enabled skills: ${request.enabledSkillNames.join(', ')}\n\n$prompt';
     }
 
-    if (request.imagePaths.isNotEmpty) {
-      final firstImage = File(request.imagePaths.first);
-      if (!await firstImage.exists()) {
-        throw RuntimeUnavailableException(
-          '图片文件不存在：${request.imagePaths.first}',
+    // iOS flutter_gemma sessions can become invalid after a prior image failure or
+    // stop. Recreate a fresh chat per request, matching Gallery-style stateless
+    // image asking and preventing stale multimodal state from breaking later sends.
+    await _flutterGemmaChat?.session.close();
+    final chat = await model.createChat(
+      temperature: _config?.temperature ?? gemma4E2bIt.temperature,
+      topK: _config?.topK ?? gemma4E2bIt.topK,
+      topP: _config?.topP ?? gemma4E2bIt.topP,
+      supportImage: _config?.supportImage ?? gemma4E2bIt.supportImage,
+      supportAudio: false,
+      modelType: fg.ModelType.gemma4,
+      isThinking: false,
+    );
+    _flutterGemmaChat = chat;
+
+    try {
+      if (request.imagePaths.isNotEmpty) {
+        final firstImage = File(request.imagePaths.first);
+        if (!await firstImage.exists()) {
+          throw RuntimeUnavailableException(
+            '图片文件不存在：${request.imagePaths.first}',
+          );
+        }
+        await chat.addQueryChunk(
+          fg.Message.withImage(
+            text: _visionPrompt(prompt),
+            imageBytes: await firstImage.readAsBytes(),
+            isUser: true,
+          ),
         );
+      } else {
+        await chat.addQueryChunk(fg.Message.text(text: prompt, isUser: true));
       }
-      await chat.addQueryChunk(
-        fg.Message.withImage(
-          text: prompt,
-          imageBytes: await firstImage.readAsBytes(),
-          isUser: true,
-        ),
-      );
-    } else {
-      await chat.addQueryChunk(fg.Message.text(text: prompt, isUser: true));
+    } catch (error) {
+      await chat.session.close();
+      if (identical(_flutterGemmaChat, chat)) _flutterGemmaChat = null;
+      throw RuntimeUnavailableException('iOS 图片/文本输入失败，已重置会话，请重试：$error');
     }
+
     await for (final response in chat.generateChatResponseAsync()) {
       if (response is fg.TextResponse) {
         yield response.token;
@@ -198,6 +213,14 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         yield '\n[function_call] ${response.name}: ${response.args}\n';
       }
     }
+  }
+
+  String _visionPrompt(String prompt) {
+    final trimmed = prompt.trim();
+    if (trimmed.isEmpty || trimmed == '请描述这张图片。') {
+      return '请直接观察并描述这张图片中的主要对象、场景、文字和可见细节。不要回答无关内容。';
+    }
+    return '请根据图片内容回答：$trimmed';
   }
 
   @override

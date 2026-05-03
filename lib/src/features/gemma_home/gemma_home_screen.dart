@@ -90,7 +90,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
 
     setState(() {
-      _messages.add(_ChatMessage(role: _ChatRole.user, text: userText));
+      _messages.add(
+        _ChatMessage(
+          role: _ChatRole.user,
+          text: userText,
+          imagePaths: imagePaths,
+        ),
+      );
       _messages.add(
         const _ChatMessage(
           role: _ChatRole.assistant,
@@ -446,12 +452,18 @@ class _MessageBubble extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _MarkdownMessageText(
-                  text: message.text.isEmpty && message.streaming
-                      ? '思考中…'
-                      : message.text,
-                  isUser: isUser,
-                ),
+                if (message.imagePaths.isNotEmpty) ...[
+                  _SentImagePreviewGrid(imagePaths: message.imagePaths),
+                  if (message.text.trim().isNotEmpty)
+                    const SizedBox(height: 10),
+                ],
+                if (message.text.trim().isNotEmpty || message.streaming)
+                  _MarkdownMessageText(
+                    text: message.text.isEmpty && message.streaming
+                        ? '思考中…'
+                        : message.text,
+                    isUser: isUser,
+                  ),
                 if (message.streaming) ...[
                   const SizedBox(height: 8),
                   const SizedBox(
@@ -463,6 +475,246 @@ class _MessageBubble extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SentImagePreviewGrid extends StatelessWidget {
+  const _SentImagePreviewGrid({required this.imagePaths});
+
+  final List<String> imagePaths;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (var index = 0; index < imagePaths.length; index += 1)
+          _SentImageThumbnail(
+            imagePath: imagePaths[index],
+            label: imagePaths.length == 1 ? '图片' : '图片 ${index + 1}',
+            onTap: () => _showImagePreviewDialog(
+              context,
+              imagePaths: imagePaths,
+              initialIndex: index,
+            ),
+            borderColor: colorScheme.outlineVariant,
+          ),
+      ],
+    );
+  }
+}
+
+class _SentImageThumbnail extends StatelessWidget {
+  const _SentImageThumbnail({
+    required this.imagePath,
+    required this.label,
+    required this.onTap,
+    required this.borderColor,
+  });
+
+  final String imagePath;
+  final String label;
+  final VoidCallback onTap;
+  final Color borderColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: '打开$label预览',
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          width: 168,
+          constraints: const BoxConstraints(maxWidth: 168),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: borderColor),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Stack(
+            children: [
+              AspectRatio(
+                aspectRatio: 4 / 3,
+                child: Image.file(
+                  File(imagePath),
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) => const Center(
+                    child: Icon(Icons.broken_image_outlined, size: 36),
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 8,
+                bottom: 8,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.58),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.image_outlined,
+                          color: Colors.white,
+                          size: 15,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          label,
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const Positioned(
+                right: 8,
+                top: 8,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Padding(
+                    padding: EdgeInsets.all(5),
+                    child: Icon(
+                      Icons.fullscreen_rounded,
+                      color: Colors.white,
+                      size: 18,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _showImagePreviewDialog(
+  BuildContext context, {
+  required List<String> imagePaths,
+  required int initialIndex,
+}) {
+  return showDialog<void>(
+    context: context,
+    barrierColor: Colors.black.withValues(alpha: 0.92),
+    builder: (context) =>
+        _ImagePreviewDialog(imagePaths: imagePaths, initialIndex: initialIndex),
+  );
+}
+
+class _ImagePreviewDialog extends StatefulWidget {
+  const _ImagePreviewDialog({
+    required this.imagePaths,
+    required this.initialIndex,
+  });
+
+  final List<String> imagePaths;
+  final int initialIndex;
+
+  @override
+  State<_ImagePreviewDialog> createState() => _ImagePreviewDialogState();
+}
+
+class _ImagePreviewDialogState extends State<_ImagePreviewDialog> {
+  late final PageController _pageController;
+  late int _index;
+
+  @override
+  void initState() {
+    super.initState();
+    _index = widget.initialIndex;
+    _pageController = PageController(initialPage: widget.initialIndex);
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final count = widget.imagePaths.length;
+    return Dialog.fullscreen(
+      backgroundColor: Colors.black,
+      child: SafeArea(
+        child: Stack(
+          children: [
+            PageView.builder(
+              controller: _pageController,
+              itemCount: count,
+              onPageChanged: (value) => setState(() => _index = value),
+              itemBuilder: (context, index) => InteractiveViewer(
+                minScale: 0.7,
+                maxScale: 5,
+                child: Center(
+                  child: Image.file(
+                    File(widget.imagePaths[index]),
+                    fit: BoxFit.contain,
+                    errorBuilder: (context, error, stackTrace) => const Icon(
+                      Icons.broken_image_outlined,
+                      color: Colors.white,
+                      size: 56,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 12,
+              top: 8,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.46),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  child: Text(
+                    count == 1 ? '图片' : '图片 ${_index + 1} / $count',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 8,
+              top: 4,
+              child: IconButton.filledTonal(
+                onPressed: () => Navigator.of(context).pop(),
+                tooltip: '关闭图片预览',
+                icon: const Icon(Icons.close_rounded),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -754,17 +1006,24 @@ class _ChatMessage {
   const _ChatMessage({
     required this.role,
     required this.text,
+    this.imagePaths = const [],
     this.streaming = false,
   });
 
   final _ChatRole role;
   final String text;
+  final List<String> imagePaths;
   final bool streaming;
 
-  _ChatMessage copyWith({String? text, bool? streaming}) {
+  _ChatMessage copyWith({
+    String? text,
+    List<String>? imagePaths,
+    bool? streaming,
+  }) {
     return _ChatMessage(
       role: role,
       text: text ?? this.text,
+      imagePaths: imagePaths ?? this.imagePaths,
       streaming: streaming ?? this.streaming,
     );
   }
