@@ -1552,6 +1552,39 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
    - Android：Skills Hub 导入线上 skill、loadSkill 调用、send_email intent、run_js pending_bridge 行为。
    - iOS：线上 skill prompt 注入与 FunctionCallResponse 展示。
 
+### 16.11 Android bundled `run_js` 本地 WebView sandbox（2026-05-04）
+
+在已推送 GitHub checkpoint 后，继续推进 Skills 的下一项：把 Android built-in `run_js` 从 `pending_bridge` 提升为本地执行。
+
+已完成：
+
+1. 参考 Gallery `AgentTools.runJs` / `AgentChatScreen`：
+   - 把 `/Users/sanbo/Desktop/gallery/Android/src/app/src/main/assets/skills` 中的 built-in skill assets 复制到 `android/app/src/main/assets/skills`。
+   - 新增 `AndroidSkillJsExecutor`：在 Android 主线程创建临时 headless `WebView`，加载 `file:///android_asset/skills/<skill>/scripts/<script>.html`。
+   - 通过 `JavascriptInterface AiEdgeGallery.onResultReady(...)` 接收 `ai_edge_gallery_get_result(data, secret)` 的返回。
+   - 增加 30 秒执行超时、asset path 校验、脚本名禁止 `..` / 绝对路径 / 非 `.html`，避免任意文件访问。
+2. `GemmaSkillToolSet.runJs(...)`：
+   - 对 enabled skill 做校验。
+   - bundled built-in asset 存在时真实执行 JS。
+   - 解析 JSON 结果：`error` -> failed；`result` -> succeeded；`image` / `webview` 目前返回诚实文字说明 UI 展示桥接仍待接入，不伪装 Flutter 已显示。
+3. Android manifest 增加 `INTERNET`，让 query-wikipedia / qr-code 这类需要网络资源的 bundled JS 能按原 Gallery 语义请求网络。
+4. Dart Skills system prompt 同步更新：Android 支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，iOS/Dart tool-result dispatch 仍明确标为在建。
+
+验证：
+
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+
+仍待做：
+
+1. Android 真机用本地模型触发 `calculate-hash` / `query-wikipedia` / `qr-code` / `mood-tracker`，验证 ToolProvider 是否会稳定调用 `runJs` 并把结果回到 Gemma。
+2. Flutter UI 展示 JS result image/webview，而不是只把 display pending 文案回给模型。
+3. 线上/custom skill 不能只保存 `SKILL.md`；要继续下载/校验 sibling `scripts/` 与 `assets/`，再纳入 sandbox 执行。
+4. Secret/API key 授权弹窗和本地保存仍未接。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：

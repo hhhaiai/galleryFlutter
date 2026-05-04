@@ -21,6 +21,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
@@ -56,6 +60,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -750,6 +755,120 @@ private data class GemmaBuiltinSkill(
   val instructions: String,
 )
 
+
+private class AndroidSkillJsExecutor(private val activity: Activity) {
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  fun run(skillName: String, scriptName: String, data: String, secret: String = ""): String {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      throw IllegalStateException("JS skill execution cannot block the Android main thread.")
+    }
+    val safeSkillName = skillName.trim()
+    val safeScriptName = scriptName.trim().ifEmpty { "index.html" }
+    validateAssetPath(safeSkillName, safeScriptName)
+    val assetPath = "skills/$safeSkillName/scripts/$safeScriptName"
+    activity.assets.open(assetPath).use { }
+
+    val latch = CountDownLatch(1)
+    val completed = AtomicBoolean(false)
+    var resultText: String? = null
+    var errorText: String? = null
+
+    fun complete(result: String?, error: String?) {
+      if (!completed.compareAndSet(false, true)) return
+      resultText = result
+      errorText = error
+      latch.countDown()
+    }
+
+    mainHandler.post {
+      var webView: WebView? = null
+      lateinit var timeoutRunnable: Runnable
+      fun cleanup() {
+        mainHandler.removeCallbacks(timeoutRunnable)
+        val view = webView
+        webView = null
+        view?.stopLoading()
+        view?.removeJavascriptInterface("AiEdgeGallery")
+        view?.destroy()
+      }
+      timeoutRunnable = Runnable {
+        complete(null, "JS skill timed out after 30 seconds.")
+        cleanup()
+      }
+      try {
+        val bridge = object {
+          @JavascriptInterface
+          fun onResultReady(result: String?) {
+            mainHandler.post {
+              complete(result ?: "", null)
+              cleanup()
+            }
+          }
+        }
+        webView = WebView(activity).apply {
+          settings.javaScriptEnabled = true
+          settings.domStorageEnabled = true
+          settings.allowFileAccess = true
+          settings.allowContentAccess = false
+          webChromeClient = object : WebChromeClient() {}
+          webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+              val safeData = JSONObject.quote(data.trim().ifEmpty { "{}" })
+              val safeSecret = JSONObject.quote(secret)
+              val script = """
+                (async function() {
+                  try {
+                    var startTs = Date.now();
+                    while (typeof ai_edge_gallery_get_result !== 'function' && Date.now() - startTs <= 10000) {
+                      await new Promise(function(resolve) { setTimeout(resolve, 100); });
+                    }
+                    if (typeof ai_edge_gallery_get_result !== 'function') {
+                      AiEdgeGallery.onResultReady(JSON.stringify({error: 'ai_edge_gallery_get_result is not defined by this skill script.'}));
+                      return;
+                    }
+                    var result = await ai_edge_gallery_get_result($safeData, $safeSecret);
+                    AiEdgeGallery.onResultReady(String(result || ''));
+                  } catch (e) {
+                    AiEdgeGallery.onResultReady(JSON.stringify({error: String(e && e.message ? e.message : e)}));
+                  }
+                })();
+              """.trimIndent()
+              view?.evaluateJavascript(script, null)
+            }
+          }
+          addJavascriptInterface(bridge, "AiEdgeGallery")
+        }
+        mainHandler.postDelayed(timeoutRunnable, 30_000L)
+        webView?.loadUrl("file:///android_asset/$assetPath")
+      } catch (throwable: Throwable) {
+        complete(null, throwable.message ?: "Unable to start JS skill WebView.")
+        cleanup()
+      }
+    }
+
+    if (!latch.await(35, TimeUnit.SECONDS)) {
+      throw IllegalStateException("JS skill timed out before receiving a bridge result.")
+    }
+    errorText?.let { throw IllegalStateException(it) }
+    return resultText ?: ""
+  }
+
+  private fun validateAssetPath(skillName: String, scriptName: String) {
+    val skillNameOk = Regex("^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$").matches(skillName)
+    if (!skillNameOk) throw IllegalArgumentException("Invalid skill name for bundled JS asset: $skillName")
+    if (
+      scriptName.isBlank() ||
+        scriptName.startsWith("/") ||
+        scriptName.contains("..") ||
+        scriptName.contains("\\") ||
+        !scriptName.endsWith(".html")
+    ) {
+      throw IllegalArgumentException("Invalid JS skill script name: $scriptName")
+    }
+  }
+}
+
 private class GemmaSkillToolSet(
   private val context: Activity,
   enabledSkillNames: List<String>,
@@ -783,19 +902,81 @@ private class GemmaSkillToolSet(
     )
   }
 
-  @Tool(description = "Runs a JS skill. In this Flutter extraction, the JS/WebView bridge is not connected yet.")
+  @Tool(description = "Runs a bundled JS skill in the Android local WebView sandbox.")
   fun runJs(
     @ToolParam(description = "The name of skill.") skillName: String,
     @ToolParam(description = "The script name to run. Use 'index.html' if not provided by user.") scriptName: String,
     @ToolParam(description = "The data JSON string to pass to the script.") data: String,
   ): Map<String, String> {
-    Log.d(TAG, "runJs pending bridge. skill=$skillName script=$scriptName data=$data")
+    Log.d(TAG, "runJs: skill=$skillName script=$scriptName data=$data")
+    val skill = enabledSkills.find { it.name == skillName.trim() }
+      ?: return mapOf(
+        "skill_name" to skillName,
+        "script_name" to scriptName,
+        "status" to "failed",
+        "error" to "Skill not found or not enabled.",
+      )
+    return runCatching {
+      val result = AndroidSkillJsExecutor(context).run(
+        skillName = skill.name,
+        scriptName = scriptName,
+        data = data,
+      )
+      normalizeJsResult(skill.name, scriptName, data, result)
+    }.getOrElse { throwable ->
+      Log.e(TAG, "runJs failed. skill=$skillName script=$scriptName", throwable)
+      mapOf(
+        "skill_name" to skill.name,
+        "script_name" to scriptName.ifBlank { "index.html" },
+        "status" to "failed",
+        "error" to (throwable.message ?: "JS skill execution failed."),
+      )
+    }
+  }
+
+  private fun normalizeJsResult(
+    skillName: String,
+    scriptName: String,
+    data: String,
+    rawResult: String,
+  ): Map<String, String> {
+    val json = runCatching { JSONObject(rawResult.ifBlank { "{}" }) }.getOrNull()
+      ?: return mapOf(
+        "skill_name" to skillName,
+        "script_name" to scriptName.ifBlank { "index.html" },
+        "data" to data,
+        "status" to "succeeded",
+        "result" to rawResult,
+      )
+    val error = json.optString("error").takeIf { it.isNotBlank() && it != "null" }
+    if (error != null) {
+      return mapOf(
+        "skill_name" to skillName,
+        "script_name" to scriptName.ifBlank { "index.html" },
+        "data" to data,
+        "status" to "failed",
+        "error" to error,
+      )
+    }
+    val resultText = json.optString("result").takeIf { it.isNotBlank() && it != "null" }
+    val image = json.optJSONObject("image")
+    val webview = json.optJSONObject("webview")
+    val displayNotes = mutableListOf<String>()
+    if (image != null) {
+      displayNotes.add("JS skill produced image output; Flutter image-result display is pending.")
+    }
+    if (webview != null) {
+      displayNotes.add("JS skill produced webview output: ${webview}; Flutter webview-result display is pending.")
+    }
+    val normalizedResult = listOfNotNull(resultText, displayNotes.takeIf { it.isNotEmpty() }?.joinToString(" "))
+      .joinToString("\n")
+      .ifBlank { json.toString() }
     return mapOf(
       "skill_name" to skillName,
-      "script_name" to scriptName,
+      "script_name" to scriptName.ifBlank { "index.html" },
       "data" to data,
-      "status" to "pending_bridge",
-      "result" to "JS skill execution is waiting for the Flutter native Skills bridge; do not claim it has been executed.",
+      "status" to "succeeded",
+      "result" to normalizedResult,
     )
   }
 

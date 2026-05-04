@@ -16,7 +16,11 @@ void main() {
   test('Skills prompt includes selected Gallery skill instructions', () {
     final prompt = buildAgentSkillsSystemPrompt(builtInSkills);
 
-    expect(prompt, contains('native ToolProvider dispatch is not connected'));
+    expect(prompt, contains('Android supports native ToolProvider'));
+    expect(
+      prompt,
+      contains('iOS/Dart tool-result dispatch is still in progress'),
+    );
     expect(prompt, contains('calculate-hash'));
     expect(prompt, contains('run_js'));
     expect(prompt, contains('send_email'));

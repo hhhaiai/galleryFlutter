@@ -14,7 +14,8 @@ void main() {
 
   final skillsPrompt = buildAgentSkillsSystemPrompt(builtInSkills);
   for (final expected in [
-    'ToolProvider',
+    'Android supports native ToolProvider',
+    'iOS/Dart tool-result dispatch is still in progress',
     'calculate-hash',
     'run_js',
     'send_email',

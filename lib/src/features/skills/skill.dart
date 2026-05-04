@@ -31,8 +31,9 @@ You are an AI assistant that helps users by answering questions and completing t
 For every new request:
 1. Find the most relevant skill from the enabled skill list below.
 2. Follow that skill's instructions exactly.
-3. Current bridge status: native ToolProvider dispatch is not connected yet in this Flutter app. If a skill asks for `run_js` or `run_intent`, do not pretend that it already executed. Instead, output the exact intended tool call payload and clearly say that execution is waiting for the native Skills bridge.
-4. Pure text skills can be completed directly by the local Gemma model.
+3. Current bridge status: Android supports native ToolProvider for `loadSkill`, `run_intent(send_email)`, and bundled built-in `run_js` scripts. If a tool result says `failed`, `pending`, or display output is pending, report that honestly and do not pretend execution or UI rendering succeeded.
+4. iOS/Dart tool-result dispatch is still in progress; if a FunctionCall/tool bridge is unavailable, output the intended tool call payload and clearly say it is waiting for the native Skills bridge.
+5. Pure text skills can be completed directly by the local Gemma model.
 ''';
 
 const builtInSkills = <GemmaSkill>[
