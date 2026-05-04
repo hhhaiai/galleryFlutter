@@ -60,6 +60,7 @@
 - [x] Skills prompt 质量补强：内置 skills 对齐 Gallery `assets/skills/*/SKILL.md` 的名称/说明/工具调用意图；Android 已支持部分原生工具，iOS/Dart 或待接工具不可伪装已执行
 - [x] Skills Hub 第一阶段：点击 `Skills` 打开 Hub 面板；支持内置 skills 启用/禁用；支持粘贴线上 `SKILL.md` / GitHub raw/blob / 包含 `SKILL.md` 链接的页面导入；线上 skill 保存到 Application Support `online_skills.json`
 - [x] SkillHub.cn 入口：Hub 面板提供 `https://skillhub.cn/` 链接复制，作为线上 skills 社区入口；当前不新增外部打开链接依赖
+- [x] SkillHub.cn 目录浏览/搜索第一阶段：Hub 面板接入 `https://api.skillhub.cn/api/skills` 公开目录，可按关键词搜索并从 `/api/v1/skills/{slug}/file?path=SKILL.md` 导入 `SKILL.md`；当前只导入 instructions 给本地 Gemma，不下载或执行远端 `scripts/assets`
 - [x] Android Skills 工具桥接第一阶段：Skills runtime 启用 `ToolProvider` / constrained decoding；支持 `loadSkill` 返回内置/线上 skill instructions；支持 `run_intent(send_email)` 拉起邮件 Intent；已把 Gallery built-in skill assets 打包进 Android 并用本地 headless WebView 执行 bundled `run_js`，image 结果保存到 cache 后附着到 assistant 气泡
 - [x] iOS/Dart Skills tool loop 第一阶段：Skills 模式下为 `flutter_gemma` 注册 `loadSkill` / `runJs` / `runIntent` tools；`loadSkill` 会把 Dart skill instructions 作为 tool response 回传模型继续生成，`runJs` / `runIntent` 仍明确返回 `pending_bridge`
 - [x] 按功能整理 Skills Hub 代码：Hub UI 抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入/持久化抽到 `lib/src/features/skills/skill_repository.dart`，Home 只保留状态编排和发送 Gemma 请求
@@ -74,7 +75,7 @@
 - [ ] Android 真机专项验证语音文件（wav/m4a/mp3）与录音 Gemma 理解，覆盖不同来源音频
 - [ ] iOS 固定 WAV harness 验证 `flutter_gemma Message.withAudio(...)`；若仍 code 13，记录 Gemma iOS audio blocker 并暂停本项目内 iOS audio 深测，不用非 Gemma ASR 方案替代验收
 - [ ] Live 语音通话 Phase 1 深化：继续真机验证静音切段、队列背压、手动中断后的状态恢复
-- [ ] Skills Hub 深化：SkillHub.cn/API 目录浏览、搜索、评分/来源校验、签名或 hash 校验、更新检查
+- [ ] Skills Hub 深化：SkillHub.cn 分页/排序/分类、评分/来源校验、签名或 hash 校验、更新检查
 - [ ] Skills 的 JS/WebView sandbox 深化：线上/custom skill JS 文件下载执行、webview 结果原生展示、secret/API key 管理、Android image 结果真机验证
 - [ ] iOS/Dart `FunctionCallResponse` 深化：接入真实 run_js/run_intent 执行、UI 结构化展示、多轮 tool 调用真机验证
 - [ ] 修复 macOS native asset `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题，使 `flutter test --no-pub` 可恢复

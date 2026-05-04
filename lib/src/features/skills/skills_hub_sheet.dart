@@ -61,10 +61,15 @@ class _SkillsHubSheet extends StatefulWidget {
 
 class _SkillsHubSheetState extends State<_SkillsHubSheet> {
   final _importController = TextEditingController();
+  final _hubSearchController = TextEditingController();
   late List<GemmaSkill> _onlineSkills;
   late Set<String> _enabledSkillNames;
   late bool _skillsModeEnabled;
   bool _importing = false;
+  bool _hubSearching = false;
+  SkillHubSearchResult? _hubSearchResult;
+  String? _hubSearchError;
+  final Set<String> _importingHubSlugs = <String>{};
 
   List<GemmaSkill> get _allSkills => [...builtInSkills, ..._onlineSkills];
 
@@ -74,12 +79,26 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
     _onlineSkills = List<GemmaSkill>.of(widget.onlineSkills);
     _enabledSkillNames = Set<String>.of(widget.enabledSkillNames);
     _skillsModeEnabled = widget.skillsModeEnabled;
+    unawaited(_searchSkillHub());
   }
 
   @override
   void dispose() {
     _importController.dispose();
+    _hubSearchController.dispose();
     super.dispose();
+  }
+
+  void _saveAndEnableSkill(GemmaSkill skill, List<GemmaSkill> saved) {
+    setState(() {
+      _onlineSkills = List<GemmaSkill>.of(saved);
+      _enabledSkillNames.add(skill.name);
+      _skillsModeEnabled = true;
+      _importController.clear();
+    });
+    widget.onOnlineSkillsChanged(saved);
+    widget.onEnabledSkillNamesChanged(Set<String>.of(_enabledSkillNames));
+    widget.onSkillsModeChanged(true);
   }
 
   Future<void> _importSkill() async {
@@ -91,15 +110,7 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
       );
       final saved = await widget.repository.saveOnlineSkill(skill);
       if (!mounted) return;
-      setState(() {
-        _onlineSkills = List<GemmaSkill>.of(saved);
-        _enabledSkillNames.add(skill.name);
-        _skillsModeEnabled = true;
-        _importController.clear();
-      });
-      widget.onOnlineSkillsChanged(saved);
-      widget.onEnabledSkillNamesChanged(Set<String>.of(_enabledSkillNames));
-      widget.onSkillsModeChanged(true);
+      _saveAndEnableSkill(skill, saved);
       widget.onMessage('已导入线上 Skill：${skill.name}');
     } on SkillImportException catch (error) {
       widget.onMessage(error.message);
@@ -107,6 +118,49 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
       widget.onMessage('导入线上 Skill 失败：$error');
     } finally {
       if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  Future<void> _searchSkillHub() async {
+    if (_hubSearching) return;
+    setState(() {
+      _hubSearching = true;
+      _hubSearchError = null;
+    });
+    try {
+      final result = await widget.repository.searchSkillHub(
+        keyword: _hubSearchController.text,
+      );
+      if (!mounted) return;
+      setState(() => _hubSearchResult = result);
+    } on SkillImportException catch (error) {
+      if (!mounted) return;
+      setState(() => _hubSearchError = error.message);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _hubSearchError = 'SkillHub 搜索失败：$error');
+    } finally {
+      if (mounted) setState(() => _hubSearching = false);
+    }
+  }
+
+  Future<void> _importSkillHubSkill(SkillHubSkillSummary summary) async {
+    if (_importingHubSlugs.contains(summary.slug)) return;
+    setState(() => _importingHubSlugs.add(summary.slug));
+    try {
+      final skill = await widget.repository.importSkillHubSkill(summary.slug);
+      final saved = await widget.repository.saveOnlineSkill(skill);
+      if (!mounted) return;
+      _saveAndEnableSkill(skill, saved);
+      widget.onMessage('已从 SkillHub 导入：${skill.name}');
+    } on SkillImportException catch (error) {
+      widget.onMessage(error.message);
+    } catch (error) {
+      widget.onMessage('导入 SkillHub skill 失败：$error');
+    } finally {
+      if (mounted) {
+        setState(() => _importingHubSlugs.remove(summary.slug));
+      }
     }
   }
 
@@ -194,6 +248,7 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
                   child: const Text('复制链接'),
                 ),
               ),
+              ..._buildSkillHubDirectory(context),
               const SizedBox(height: 8),
               TextField(
                 controller: _importController,
@@ -254,4 +309,160 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
       ),
     );
   }
+
+  List<Widget> _buildSkillHubDirectory(BuildContext context) {
+    final result = _hubSearchResult;
+    final textTheme = Theme.of(context).textTheme;
+    return [
+      Card(
+        elevation: 0,
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.travel_explore_outlined),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '浏览 SkillHub 公开目录',
+                      style: textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                '只导入远端 SKILL.md 到本地 Gemma 上下文；不会下载或执行远端 scripts/assets。'
+                '需要 API key 的 skill 会保留提示，当前不自动索取或保存密钥。',
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _hubSearchController,
+                      decoration: InputDecoration(
+                        labelText: '搜索 SkillHub',
+                        hintText: 'github / 文档 / 图片 / 数据分析…',
+                        isDense: true,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      textInputAction: TextInputAction.search,
+                      onSubmitted: (_) => unawaited(_searchSkillHub()),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  FilledButton(
+                    onPressed: _hubSearching
+                        ? null
+                        : () => unawaited(_searchSkillHub()),
+                    child: Text(_hubSearching ? '搜索中' : '搜索'),
+                  ),
+                ],
+              ),
+              if (_hubSearching) ...[
+                const SizedBox(height: 10),
+                const LinearProgressIndicator(),
+              ],
+              if (_hubSearchError != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  _hubSearchError!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+              if (result != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  result.keyword.isEmpty
+                      ? '热门目录：${result.total} 个公开 skills'
+                      : '“${result.keyword}” 搜索结果：${result.total} 个',
+                  style: textTheme.labelLarge,
+                ),
+                const SizedBox(height: 6),
+                for (final summary in result.skills.take(8))
+                  _SkillHubSummaryTile(
+                    summary: summary,
+                    importing: _importingHubSlugs.contains(summary.slug),
+                    alreadyImported: _onlineSkills.any(
+                      (skill) =>
+                          skill.name == summary.slug ||
+                          (skill.sourceUrl?.contains('/${summary.slug}/file') ??
+                              false),
+                    ),
+                    onImport: () => unawaited(_importSkillHubSkill(summary)),
+                  ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
+    ];
+  }
+}
+
+class _SkillHubSummaryTile extends StatelessWidget {
+  const _SkillHubSummaryTile({
+    required this.summary,
+    required this.importing,
+    required this.alreadyImported,
+    required this.onImport,
+  });
+
+  final SkillHubSkillSummary summary;
+  final bool importing;
+  final bool alreadyImported;
+  final VoidCallback onImport;
+
+  @override
+  Widget build(BuildContext context) {
+    final metadata = [
+      if (summary.ownerName.isNotEmpty) '@${summary.ownerName}',
+      if (summary.category.isNotEmpty) summary.category,
+      if (summary.version.isNotEmpty) 'v${summary.version}',
+      '${_compactCount(summary.downloads)} downloads',
+      '${_compactCount(summary.stars)} stars',
+      if (summary.requiresApiKey) '需要 API key',
+    ].join(' · ');
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.extension_outlined),
+      title: Text(summary.name),
+      subtitle: Text(
+        [
+          if (summary.description.isNotEmpty) summary.description,
+          metadata,
+          'slug: ${summary.slug}',
+        ].join('\n'),
+        maxLines: 4,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: TextButton(
+        onPressed: importing || alreadyImported ? null : onImport,
+        child: Text(
+          importing
+              ? '导入中'
+              : alreadyImported
+              ? '已导入'
+              : '导入',
+        ),
+      ),
+    );
+  }
+}
+
+String _compactCount(int value) {
+  if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(1)}M';
+  if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}K';
+  return value.toString();
 }

@@ -1641,6 +1641,51 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 2. Webview result 的 Flutter/Android 展示卡片。
 3. image cache 清理策略，避免长期积累。
 
+### 16.14 SkillHub.cn 公开目录浏览/搜索第一阶段（2026-05-04）
+
+根据用户要求“Skills 最好可以支持 Skills Hub，类似 `https://skillhub.cn/`，希望可以支持线上的 skills”，在已完成粘贴 URL 导入之后，继续接入 SkillHub.cn 公开目录。
+
+核心边界仍不变：Gemma-4-E2B-it 是本项目所有能力的本地模型基础；线上 skill 只能提供 instructions / tool 意图，不能把执行基础替换成云端模型，也不能把未审查的远端脚本当成本地能力直接执行。
+
+已完成：
+
+1. 从 SkillHub 前端 bundle 和线上响应确认当前公开 API：
+   - `https://api.skillhub.cn/api/skills?page=<page>&pageSize=<size>&keyword=<keyword>`：公开目录/搜索。
+   - `https://api.skillhub.cn/api/v1/skills/{slug}/files`：文件清单，包含 `path` / `sha256` / `size`。
+   - `https://api.skillhub.cn/api/v1/skills/{slug}/file?path=SKILL.md`：读取单个 `SKILL.md`。
+2. `SkillRepository` 增加：
+   - `searchSkillHub(...)`：解析公开目录、total、slug、name、description、owner、category、version、downloads、stars、requires_api_key。
+   - `importSkillHubSkill(slug)`：校验 slug，读取文件清单，确认存在 `SKILL.md` 且不超过 512KB，然后只下载 `SKILL.md` 并复用现有 Markdown/front matter parser。
+   - Repository 支持注入 `http.Client` / API base，便于后续测试与 mock。
+3. `Skills Hub` 面板增加“浏览 SkillHub 公开目录”卡片：
+   - 打开 Hub 时自动加载热门目录。
+   - 支持关键词搜索。
+   - 展示 owner/category/version/downloads/stars/API-key 标记。
+   - 点击“导入”后保存到 Application Support `online_skills.json`、自动启用 Skills 模式和该 skill。
+4. 明确安全边界：
+   - 当前只导入远端 `SKILL.md` instructions 给本地 Gemma。
+   - 不下载、不执行远端 `scripts/` / `assets/`。
+   - 需要 API key 的 skill 只显示提示，不自动索取或保存密钥。
+
+验证：
+
+- `https://api.skillhub.cn/api/skills?page=1&pageSize=3&keyword=vetter`：HTTP 200，返回公开目录 JSON。
+- `https://api.skillhub.cn/api/v1/skills/skill-vetter/files`：HTTP 200，返回 `SKILL.md` 与 sha256/size。
+- `https://api.skillhub.cn/api/v1/skills/skill-vetter/file?path=SKILL.md`：HTTP 200，返回 markdown。
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+
+仍待做：
+
+1. SkillHub 分页加载更多、排序、分类筛选、详情页/版本列表。
+2. 对 `/files` 返回的 `sha256` 做下载后完整性校验；当前只记录远端 API 暴露了 sha256，尚未验证本地内容 hash。
+3. 线上/custom skill 的 sibling `scripts/` / `assets/` 下载、大小限制、路径校验、hash/签名校验、信任 UI 和 sandbox 执行策略。
+4. 需要 API key / secret 的 skill 授权弹窗和本地密钥保存策略。
+5. Android/iOS 真机验证目录搜索、导入、Gemma prompt 注入和最终回答质量。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
@@ -1655,7 +1700,7 @@ remote: https://github.com/hhhaiai/galleryFlutter.git
 
 1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
 2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，保持 16k mono 16-bit PCM WAV 输入；iOS 只补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭。
-3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；Android ToolProvider 第一阶段只声明已实际支持的 `loadSkill` / `run_intent(send_email)`，`run_js` 仍返回 `pending_bridge`，不伪装已执行。
+3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入与 SkillHub.cn 公开目录搜索/导入。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
 4. 验证辅助：`tool/check_prompt_and_skills.dart` 作为当前 macOS native asset 问题下的轻量 smoke gate；Flutter 原生测试仍需后续修复 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 
 提交到 GitHub 时必须继续使用 Lore Commit Protocol，并在 commit message 中明确记录：

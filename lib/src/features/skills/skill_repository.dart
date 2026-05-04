@@ -7,9 +7,18 @@ import 'package:path_provider/path_provider.dart';
 import 'skill.dart';
 
 class SkillRepository {
+  SkillRepository({http.Client? client, Uri? skillHubApiBase})
+    : _client = client ?? http.Client(),
+      _skillHubApiBase = skillHubApiBase ?? Uri.parse(skillHubApiBaseUrl);
+
   static const skillHubHomeUrl = 'https://skillhub.cn/';
+  static const skillHubApiBaseUrl = 'https://api.skillhub.cn';
   static const _storageFileName = 'online_skills.json';
   static const _maxSkillBytes = 512 * 1024;
+  static const _skillHubPageSize = 20;
+
+  final http.Client _client;
+  final Uri _skillHubApiBase;
 
   Future<List<GemmaSkill>> loadOnlineSkills() async {
     final file = await _storageFile();
@@ -67,6 +76,76 @@ class SkillRepository {
     return _parseSkillMarkdown(body, sourceUrl: sourceUrl);
   }
 
+  Future<SkillHubSearchResult> searchSkillHub({
+    String keyword = '',
+    int page = 1,
+    int pageSize = _skillHubPageSize,
+  }) async {
+    final normalizedPage = page < 1 ? 1 : page;
+    final normalizedPageSize = pageSize.clamp(1, 50).toInt();
+    final query = <String, String>{
+      'page': normalizedPage.toString(),
+      'pageSize': normalizedPageSize.toString(),
+      if (keyword.trim().isNotEmpty) 'keyword': keyword.trim(),
+    };
+    final uri = _skillHubUri('/api/skills', query);
+    final decoded = await _getJson(uri);
+    if (decoded['code'] != 0) {
+      throw SkillImportException(
+        'SkillHub 返回错误：${decoded['message'] ?? decoded['code']}',
+      );
+    }
+    final data = decoded['data'];
+    if (data is! Map<String, dynamic>) {
+      throw const SkillImportException('SkillHub 返回结构异常：缺少 data。');
+    }
+    final skills = (data['skills'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(SkillHubSkillSummary.fromJson)
+        .where((skill) => skill.slug.isNotEmpty)
+        .toList(growable: false);
+    return SkillHubSearchResult(
+      skills: skills,
+      total: _intFromJson(data['total']),
+      page: normalizedPage,
+      pageSize: normalizedPageSize,
+      keyword: keyword.trim(),
+    );
+  }
+
+  Future<GemmaSkill> importSkillHubSkill(String slug) async {
+    final normalizedSlug = _normalizeSkillHubSlug(slug);
+    final filesUri = _skillHubUri('/api/v1/skills/$normalizedSlug/files');
+    final filesJson = await _getJson(filesUri);
+    final files = (filesJson['files'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
+    final skillFile = files.cast<Map<String, dynamic>?>().firstWhere((file) {
+      final path = file?['path']?.toString() ?? '';
+      return path == 'SKILL.md' || path.endsWith('/SKILL.md');
+    }, orElse: () => null);
+    if (skillFile == null) {
+      throw SkillImportException(
+        'SkillHub skill `$normalizedSlug` 没有 SKILL.md。',
+      );
+    }
+    final skillPath = skillFile['path']?.toString() ?? 'SKILL.md';
+    final size = _intFromJson(skillFile['size']);
+    if (size > _maxSkillBytes) {
+      throw const SkillImportException('Skill 文件超过 512KB，上线导入已拒绝。');
+    }
+
+    final skillUri = _skillHubUri('/api/v1/skills/$normalizedSlug/file', {
+      'path': skillPath,
+    });
+    final response = await _get(skillUri);
+    final body = response.body;
+    if (utf8.encode(body).length > _maxSkillBytes) {
+      throw const SkillImportException('Skill 文件超过 512KB，上线导入已拒绝。');
+    }
+    return _parseSkillMarkdown(body, sourceUrl: skillUri.toString());
+  }
+
   Future<File> _storageFile() async {
     final dir = await getApplicationSupportDirectory();
     return File('${dir.path}/$_storageFileName');
@@ -82,7 +161,7 @@ class SkillRepository {
   }
 
   Future<http.Response> _get(Uri uri) async {
-    final response = await http
+    final response = await _client
         .get(
           uri,
           headers: const {
@@ -97,6 +176,36 @@ class SkillRepository {
       );
     }
     return response;
+  }
+
+  Future<Map<String, dynamic>> _getJson(Uri uri) async {
+    final response = await _client
+        .get(
+          uri,
+          headers: const {
+            'accept': 'application/json,text/plain;q=0.8,*/*;q=0.5',
+            'user-agent': 'galleryFlutter Gemma Skills Hub importer',
+          },
+        )
+        .timeout(const Duration(seconds: 18));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw SkillImportException(
+        'SkillHub 请求失败：HTTP ${response.statusCode} ${response.reasonPhrase ?? ''}',
+      );
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw const SkillImportException('SkillHub 返回不是 JSON object。');
+    }
+    return decoded;
+  }
+
+  Uri _skillHubUri(String path, [Map<String, String>? query]) {
+    final normalizedPath = path.startsWith('/') ? path : '/$path';
+    return _skillHubApiBase.replace(
+      path: normalizedPath,
+      queryParameters: query == null || query.isEmpty ? null : query,
+    );
   }
 
   Uri _normalizeSkillUrl(String input) {
@@ -126,6 +235,14 @@ class SkillRepository {
       }
     }
     return uri;
+  }
+
+  String _normalizeSkillHubSlug(String slug) {
+    final normalized = slug.trim();
+    if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{1,127}$').hasMatch(normalized)) {
+      throw SkillImportException('SkillHub slug 不合法：$slug');
+    }
+    return normalized;
   }
 
   bool _looksLikeHtml(http.Response response, String body) {
@@ -203,6 +320,77 @@ class SkillRepository {
     sourceUrl: json['sourceUrl']?.toString(),
     online: json['online'] == true,
   );
+}
+
+class SkillHubSearchResult {
+  const SkillHubSearchResult({
+    required this.skills,
+    required this.total,
+    required this.page,
+    required this.pageSize,
+    required this.keyword,
+  });
+
+  final List<SkillHubSkillSummary> skills;
+  final int total;
+  final int page;
+  final int pageSize;
+  final String keyword;
+}
+
+class SkillHubSkillSummary {
+  const SkillHubSkillSummary({
+    required this.slug,
+    required this.name,
+    required this.description,
+    required this.ownerName,
+    required this.category,
+    required this.source,
+    required this.version,
+    required this.downloads,
+    required this.installs,
+    required this.stars,
+    required this.requiresApiKey,
+  });
+
+  factory SkillHubSkillSummary.fromJson(Map<String, dynamic> json) {
+    final labels = json['labels'];
+    final requiresApiKey = labels is Map
+        ? labels['requires_api_key']?.toString().toLowerCase() == 'true'
+        : false;
+    return SkillHubSkillSummary(
+      slug: json['slug']?.toString() ?? '',
+      name: (json['name'] ?? json['slug'] ?? '').toString(),
+      description: (json['description_zh'] ?? json['description'] ?? '')
+          .toString(),
+      ownerName: json['ownerName']?.toString() ?? '',
+      category: json['category']?.toString() ?? '',
+      source: json['source']?.toString() ?? '',
+      version: json['version']?.toString() ?? '',
+      downloads: _intFromJson(json['downloads']),
+      installs: _intFromJson(json['installs']),
+      stars: _intFromJson(json['stars']),
+      requiresApiKey: requiresApiKey,
+    );
+  }
+
+  final String slug;
+  final String name;
+  final String description;
+  final String ownerName;
+  final String category;
+  final String source;
+  final String version;
+  final int downloads;
+  final int installs;
+  final int stars;
+  final bool requiresApiKey;
+}
+
+int _intFromJson(Object? value) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString() ?? '') ?? 0;
 }
 
 class SkillImportException implements Exception {
