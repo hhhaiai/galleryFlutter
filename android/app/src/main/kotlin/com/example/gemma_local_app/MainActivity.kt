@@ -1462,60 +1462,10 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     if (bytes.size < 44 || bytes.copyOfRange(0, 4).toString(Charsets.US_ASCII) != "RIFF") {
       throw IllegalArgumentException("Gemma audio requires a WAV file. Please record in-app or pick a WAV file.")
     }
-    // Match Google AI Edge Gallery's Ask Audio data path for compatible input:
-    // Content.AudioBytes receives a 16k / mono / 16-bit PCM WAV. In-app
-    // recordings already satisfy that contract and are returned byte-for-byte;
-    // picked or externally supplied WAV files are normalized only when needed.
-    return normalizeWavForGemmaIfNeeded(bytes, MAX_AUDIO_SECONDS)
-  }
-
-  private fun normalizeWavForGemmaIfNeeded(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
-    if (isGemmaCompatibleWav(wavBytes, maxSeconds)) {
-      return wavBytes
-    }
-    return normalizeWavForGemma(wavBytes, maxSeconds)
-  }
-
-  private fun isGemmaCompatibleWav(wavBytes: ByteArray, maxSeconds: Int): Boolean {
-    if (wavBytes.size < 44) return false
-    if (wavBytes.copyOfRange(8, 12).toString(Charsets.US_ASCII) != "WAVE") return false
-    var offset = 12
-    var channels = 1
-    var sampleRate = SAMPLE_RATE
-    var bitsPerSample = 16
-    var audioFormat = 1
-    var dataSize = 0
-    while (offset + 8 <= wavBytes.size) {
-      val chunkId = wavBytes.copyOfRange(offset, offset + 4).toString(Charsets.US_ASCII)
-      val chunkSize = ByteBuffer.wrap(wavBytes, offset + 4, 4)
-        .order(ByteOrder.LITTLE_ENDIAN)
-        .int
-      val chunkDataOffset = offset + 8
-      if (chunkDataOffset + chunkSize > wavBytes.size) break
-      when (chunkId) {
-        "fmt " -> {
-          val fmt = ByteBuffer.wrap(wavBytes, chunkDataOffset, chunkSize)
-            .order(ByteOrder.LITTLE_ENDIAN)
-          audioFormat = fmt.short.toInt()
-          channels = fmt.short.toInt()
-          sampleRate = fmt.int
-          fmt.int
-          fmt.short
-          bitsPerSample = fmt.short.toInt()
-        }
-        "data" -> {
-          dataSize = chunkSize
-          break
-        }
-      }
-      offset = chunkDataOffset + chunkSize + (chunkSize and 1)
-    }
-    val maxBytes = SAMPLE_RATE * maxSeconds * 2
-    return audioFormat == 1 &&
-      channels == 1 &&
-      sampleRate == SAMPLE_RATE &&
-      bitsPerSample == 16 &&
-      dataSize in 1..maxBytes
+    // Match Google AI Edge Gallery's Ask Audio data path: UI/playback keeps a
+    // WAV file on disk, but Content.AudioBytes must receive raw 16k / mono /
+    // 16-bit little-endian PCM bytes without a RIFF/WAVE header.
+    return extractMono16BitPcm(bytes, MAX_AUDIO_SECONDS)
   }
 
   private fun extractMono16BitPcm(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
@@ -1591,41 +1541,6 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     return output.array()
   }
 
-  private fun normalizeWavForGemma(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
-    val pcmBytes = extractMono16BitPcm(wavBytes, maxSeconds)
-    val output = ByteArrayOutputStream()
-    output.write("RIFF".toByteArray(Charsets.US_ASCII))
-    output.writeIntLE(36 + pcmBytes.size)
-    output.write("WAVE".toByteArray(Charsets.US_ASCII))
-    output.write("fmt ".toByteArray(Charsets.US_ASCII))
-    output.writeIntLE(16)
-    output.writeShortLE(1)
-    output.writeShortLE(1)
-    output.writeIntLE(SAMPLE_RATE)
-    output.writeIntLE(SAMPLE_RATE * 2)
-    output.writeShortLE(2)
-    output.writeShortLE(16)
-    output.write("data".toByteArray(Charsets.US_ASCII))
-    output.writeIntLE(pcmBytes.size)
-    output.write(pcmBytes)
-    return output.toByteArray()
-  }
-
-  private fun ByteArrayOutputStream.writeIntLE(value: Int) {
-    write(byteArrayOf(
-      (value and 0xFF).toByte(),
-      ((value shr 8) and 0xFF).toByte(),
-      ((value shr 16) and 0xFF).toByte(),
-      ((value shr 24) and 0xFF).toByte(),
-    ))
-  }
-
-  private fun ByteArrayOutputStream.writeShortLE(value: Int) {
-    write(byteArrayOf(
-      (value and 0xFF).toByte(),
-      ((value shr 8) and 0xFF).toByte(),
-    ))
-  }
 
   private fun resampleMono(inputSamples: ShortArray, originalSampleRate: Int, targetSampleRate: Int): ShortArray {
     if (originalSampleRate <= 0 || originalSampleRate == targetSampleRate) return inputSamples

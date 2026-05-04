@@ -45,10 +45,11 @@
 - [x] Live 语音通话 Phase 1 已具备基本可用性：可直接开启/停止，最长约 7 秒切段并支持电平静音切段后串行推理；同时补了停止递归问题和静音片段跳过，避免 Live 在安静环境中持续刷空回复
 - [x] Live 语音通话前台体验改为连续通话态：新增全屏 Live overlay、持续时长、统一 AI 回复预览，并让后台分段录音与多次音频推理对用户尽量无感
 - [x] Android 音频 runtime 已重新按 Gallery 路线接入：显式音频请求会启用 `audioBackend = Backend.CPU()` 并把第一条音频作为 `Content.AudioBytes` 发送；当前仍需真机专项验证多来源音频稳定性
-- [x] Android audio 发送前稳健性补强：`readAudioForGemma(...)` 现在对所有 WAV 输入都执行兼容性校验/按需归一化；应用内 16k mono PCM WAV 会 byte-for-byte 保持不变，外部 WAV 会按 Gallery 约束归一化后再进入 `Content.AudioBytes`
+- [x] Android audio 发送前稳健性补强：`readAudioForGemma(...)` 现在对所有 WAV 输入都解析 data chunk，并在发送给 `Content.AudioBytes` 前统一变成 16k mono 16-bit raw PCM；WAV 文件仍只用于 UI 播放/波形，不把 RIFF header 传给模型
 - [x] iOS 音频 runtime 风险回退：`Info.plist` 和原生 audio input 骨架保留，但为避免 `failed to start streaming` 影响文字/图片稳定，暂不启用 `Message.withAudio(...)`；下一步完成音频格式归一化、固定 WAV harness 和真机专项验证后再决定是否开启
 - [x] iOS 真机重新验证确认：当前 `flutter_gemma` + `Gemma-4-E2B-it` 音频链会在实时录音时触发 `Failed to start streaming (code: 13)`；已在 Flutter 层显式关闭 iOS 语音输入 / Live，避免继续暴露不稳定能力
 - [x] iOS audio input 基础补强：`IOSAudioInput.swift` 增加 `audio_input_events`，录音电平事件，文件选择音频统一转 16k mono 16-bit PCM WAV，并对 WAV header/时长做校验；iOS audio runtime 仍保持关闭
+- [x] iOS 固定 WAV harness 第一阶段：默认仍关闭 iOS 语音入口；仅在 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 时允许 iOS 录音/文件入口，并把 16k mono PCM WAV 剥离为 raw PCM 后走 `flutter_gemma Message` audioBytes，用于真机复现/验证 Gemma 原生 audio code 13，不作为发布能力
 - [x] Live 语音通话方案已整理：`docs/audio_voice_live_design.md` 记录分段伪实时、PCM streaming + VAD、TTS 双向语音三个阶段，以及方案对比和架构
 - [x] 文字/Skills prompt 质量补强：Android `generate` 不再丢失 `systemPrompt` / `enabledSkillNames`；Dart runtime 会把 system instructions、enabled skills 与用户请求组合成 contextual prompt 后送入本地 Gemma，iOS 文字路径也复用同一逻辑
 - [x] 图片/音频 prompt 质量补强：Android 图片请求也会注入明确视觉指令；Android audio 请求会注入明确语音理解指令；图片 + 音频混合请求会明确同时利用两类媒体证据
@@ -73,7 +74,7 @@
 
 - [ ] 下载文件完整性校验/sha256 校验
 - [ ] Android 真机专项验证语音文件（wav/m4a/mp3）与录音 Gemma 理解，覆盖不同来源音频
-- [ ] iOS 固定 WAV harness 验证 `flutter_gemma Message.withAudio(...)`；若仍 code 13，记录 Gemma iOS audio blocker 并暂停本项目内 iOS audio 深测，不用非 Gemma ASR 方案替代验收
+- [ ] iOS 真机运行 `GEMMA_IOS_AUDIO_PROBE=true` 固定 WAV harness 验证 `flutter_gemma Message` audioBytes；若仍 code 13，记录 Gemma iOS audio blocker 并暂停本项目内 iOS audio 深测，不用非 Gemma ASR 方案替代验收
 - [ ] Live 语音通话 Phase 1 深化：继续真机验证静音切段、队列背压、手动中断后的状态恢复
 - [ ] Skills Hub 深化：SkillHub.cn 分页/排序/分类、评分/来源校验、签名或 hash 校验、更新检查
 - [ ] Skills 的 JS/WebView sandbox 深化：线上/custom skill JS 文件下载执行、webview 结果原生展示、secret/API key 管理、Android image 结果真机验证

@@ -491,7 +491,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _pickAudioFile() async {
-    if (Platform.isIOS) {
+    if (Platform.isIOS && !_iosAudioProbeEnabled) {
       _showSnackBar(
         'iOS 语音理解当前为稳定性已暂时关闭；本项目会继续验证 Gemma 原生 audio，不用非 Gemma ASR 方案替代验收。',
       );
@@ -516,7 +516,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _toggleRecording() async {
-    if (Platform.isIOS) {
+    if (Platform.isIOS && !_iosAudioProbeEnabled) {
       _showSnackBar(
         'iOS 实时录音当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 会触发 code 13。',
       );
@@ -554,7 +554,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _toggleLiveVoiceCall() async {
-    if (Platform.isIOS) {
+    if (Platform.isIOS && !_iosAudioProbeEnabled) {
       _showSnackBar(
         'iOS Live 语音通话当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 音频链路会触发 code 13。',
       );
@@ -2292,6 +2292,8 @@ enum _ComposerMode {
   final String label;
   final IconData icon;
 }
+
+const _iosAudioProbeEnabled = bool.fromEnvironment('GEMMA_IOS_AUDIO_PROBE');
 
 enum _ChatRole { user, assistant }
 

@@ -627,18 +627,18 @@ Android 第一阶段：
 - `MainActivity.kt` 新增 `AndroidAudioInput`：系统音频文件选择、`AudioRecord` 录音并封装成 16k / mono / 16-bit PCM WAV、`MediaPlayer` 播放。
 - Runtime 初始化对齐 Gallery：`audioBackend = if (supportAudio) Backend.CPU() else null`。
 - Android 音频请求的主 backend 已修正为与 Gallery 一致的多模态优先路径：audio/image 请求优先走 GPU 主 backend，纯文字仍保持 CPU 首轮轻量初始化。
-- Runtime generate 读取 `audioPaths.take(1)`，加入 `Content.AudioBytes(audioBytes)`；内容顺序为图片、音频、文本。
+- Runtime generate 读取 `audioPaths.take(1)`，从 WAV `data` chunk 提取 16k / mono / 16-bit raw PCM 后加入 `Content.AudioBytes(audioBytes)`；内容顺序为图片、音频、文本。
 - 对 audio-only 请求，若 LiteRT-LM native compiled model 调用报 `Status Code: 12/13`，Dart 侧会自动补一次 CPU fallback，再降级回文字模式。
-- 选择语音文件时，若拿到 m4a/mp3 等压缩音频，Android 原生侧会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一落成 16k mono 16-bit PCM WAV；若本身是 WAV，则保留/按需规整成 Gemma 可用格式。
-- 注意：录音链路已是 16k mono PCM WAV；文件选择链路的核心格式归一化已补齐，但仍需继续做多来源真机验证。
+- 选择语音文件时，若拿到 m4a/mp3 等压缩音频，Android 原生侧会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一落成 16k mono 16-bit PCM WAV 存盘；若本身是 WAV，则保留/按需规整成 Gemma 可用格式。
+- 注意：UI/播放/波形继续使用 WAV 文件，但模型输入对齐 Gallery：`Content.AudioBytes` 接收 raw PCM，不再把 RIFF/WAVE header 传给模型。
 
 iOS 第一阶段当前事实：
 
 - 添加 `NSMicrophoneUsageDescription`。
 - iOS 自有 `audio_input` 原生 channel（`UIDocumentPickerViewController`、`AVAudioRecorder`、`AVAudioPlayer`）已接入；`audio_input_events` 已能输出录音状态和电平事件。录音目标格式为 16k / mono / 16-bit PCM WAV，单段上限 30 秒；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
 - `flutter_gemma` API 层存在 `Message.withAudio(...)` / `supportAudio` 等能力，但当前真机验证显示 `Gemma-4-E2B-it` iOS 音频链路会触发 `Failed to start streaming (code: 13)`。
-- 因此 `platform_gemma_runtime.dart` 当前遇到 `audioPaths` 会显式抛出稳定性提示；`gemma_home_screen.dart` 在 iOS 端也暂时关闭语音文件、实时录音和 Live 语音入口，避免影响文字/图片稳定。
-- 下一步不是直接重新打开 iOS 音频，而是先做固定 WAV harness，验证是否还能稳定复现 `Message.withAudio` code 13；若确认 Gemma iOS audio runtime 当前不可用，则暂停本项目内 iOS audio 深测，而不是改用非 Gemma 方案作为成功路径。
+- 因此默认情况下 `platform_gemma_runtime.dart` 遇到 `audioPaths` 仍会显式抛出稳定性提示；`gemma_home_screen.dart` 在 iOS 端也暂时关闭语音文件、实时录音和 Live 语音入口，避免影响文字/图片稳定。
+- 已增加固定 WAV harness：仅在 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 时，iOS UI 才允许语音文件/录音/Live 入口；runtime 会校验 16k mono 16-bit PCM WAV，并只把 raw PCM data chunk 作为 `Message` audioBytes 发送，用于真机专项复现/验证 code 13。若确认 Gemma iOS audio runtime 当前不可用，则暂停本项目内 iOS audio 深测，而不是改用非 Gemma 方案作为成功路径。
 
 Live 语音通话探索：
 
@@ -1686,6 +1686,38 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 4. 需要 API key / secret 的 skill 授权弹窗和本地密钥保存策略。
 5. Android/iOS 真机验证目录搜索、导入、Gemma prompt 注入和最终回答质量。
 
+
+### 16.15 Android audio raw PCM 对齐与 iOS 固定 WAV probe（2026-05-04）
+
+继续按用户要求复查 Android audio 与 iOS audio blocker，重点对齐 `/Users/sanbo/Desktop/gallery/Android` 的实际 Ask Audio 输入路径。
+
+已完成：
+
+1. Android `Content.AudioBytes` 输入修正：
+   - 参考 Gallery `LlmChatModelHelper.kt` / `Utils.kt`，模型侧接收的是 16k / mono / 16-bit raw PCM bytes，而不是带 RIFF/WAVE header 的完整 WAV 文件。
+   - `MainActivity.readAudioForGemma(...)` 现在仍要求 UI/播放层提供 WAV 文件，但发送前会解析 WAV `data` chunk、按需转 mono/resample/trim，然后只把 raw PCM 传入 `Content.AudioBytes`。
+   - 删除旧的“compatible WAV byte-for-byte 直接传给模型”路径，避免把 RIFF header 当作音频 sample 交给 LiteRT-LM。
+2. iOS 固定 WAV probe：
+   - 默认行为不变：iOS 语音文件、实时录音、Live 入口继续关闭，避免普通用户撞到 `Failed to start streaming (code: 13)`。
+   - 新增 `GEMMA_IOS_AUDIO_PROBE` dart-define：只有使用 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 构建时，iOS UI 才允许语音入口。
+   - iOS runtime probe 会校验 16kHz / mono / 16-bit PCM WAV、30 秒上限，并把 WAV `data` chunk 剥离为 raw PCM 后放入 `fg.Message(audioBytes: ...)`，用于真机专项验证 Gemma 原生 audio。
+3. 继续保持项目根因边界：不能用非 Gemma ASR 把 iOS audio “做成可用”来冒充 Gemma 原生语音理解。
+
+验证：
+
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign --dart-define=GEMMA_IOS_AUDIO_PROBE=true`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- `flutter test --no-pub`：未通过，仍卡在既有 macOS native asset `libGemmaModelConstraintProvider.dylib` 的 `install_name_tool` headerpad/load command 问题；不是本次 Android raw PCM / iOS probe 变更引入。
+
+仍待做：
+
+1. Android 真机专项验证录音、WAV、m4a、mp3、多来源导出音频，确认 raw PCM 输入后 Gemma 理解质量。
+2. iOS 真机用 `GEMMA_IOS_AUDIO_PROBE=true` 跑固定 WAV / 录音专项；如果仍 code 13，则把它记录为 Gemma iOS audio runtime blocker 并暂停本项目内 iOS audio 深测。
+3. 如果 iOS probe 有进展，再决定是否把默认 UI 从“关闭”调整为“实验开关”；否则继续保持默认关闭。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
@@ -1699,7 +1731,7 @@ remote: https://github.com/hhhaiai/galleryFlutter.git
 本轮按功能整理后的提交边界：
 
 1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
-2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，保持 16k mono 16-bit PCM WAV 输入；iOS 只补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭。
+2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，UI/播放保留 16k mono 16-bit PCM WAV，送模型前剥离为 raw PCM；iOS 只默认补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭，仅 `GEMMA_IOS_AUDIO_PROBE=true` 可打开固定 WAV harness。
 3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入与 SkillHub.cn 公开目录搜索/导入。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
 4. 验证辅助：`tool/check_prompt_and_skills.dart` 作为当前 macOS native asset 问题下的轻量 smoke gate；Flutter 原生测试仍需后续修复 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 

@@ -50,9 +50,9 @@
 - 方案文档：`docs/audio_voice_live_design.md`
 - UI 流程：点击 composer 语音按钮 → bottom sheet 选择「实时录音 / 选择语音文件 / Live 语音通话探索」→ 录音或音频文件附着到输入框 → 发送后用户消息气泡显示微信式语音波形卡片。
 - 已发送语音展示：`_ChatMessage.audioAttachments` 保存语音路径、时长、波形；`_VoiceMessageCard` 显示播放按钮、波形条和时长；点击调用原生 `playAudio(path)` 播放。
-- Android 实现：`MainActivity.kt` 新增 `AndroidAudioInput`，通过 `com.example.gemma_local_app/audio_input` 提供系统音频文件选择、`AudioRecord` 录音、`MediaPlayer` 播放；系统文件选择若拿到 m4a/mp3 等压缩音频，会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一转成 16k mono 16-bit WAV；runtime 初始化时 `audioBackend = Backend.CPU()`；generate 时 Dart 先注入明确 audio prompt，原生再把第一条 `audioPath` 读为 bytes 并加入 `Content.AudioBytes`，顺序为图片、音频、文本；对 UNKNOWN_LENGTH 的系统 URI 会先复制到 cache 再解码。
-- iOS 实现当前状态：`Info.plist` 添加麦克风权限文案，`IOSAudioInput.swift` 已接入文件选择、录音、播放、`audio_input_events` 电平事件；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。但真机验证显示 `flutter_gemma + Gemma-4-E2B-it` 音频请求会触发 `Failed to start streaming (code: 13)`，所以 `platform_gemma_runtime.dart` 当前显式拦截 `audioPaths`，Flutter UI 也暂时关闭 iOS 语音文件、实时录音和 Live 入口。
-- 格式策略：当前录音与文件选择都尽量在原生侧落成 16k mono 16-bit PCM WAV，再送 `Content.AudioBytes`，降低模型端格式差异；Android 录音达到 30 秒上限会自动停止并回填附件；图片+语音混合输入会使用专门的混合媒体 prompt；Android/iOS 语音波形估算解析 WAV PCM 16-bit sample，不再用 RIFF header 字节估算音量，降低静音判断误差。
+- Android 实现：`MainActivity.kt` 新增 `AndroidAudioInput`，通过 `com.example.gemma_local_app/audio_input` 提供系统音频文件选择、`AudioRecord` 录音、`MediaPlayer` 播放；系统文件选择若拿到 m4a/mp3 等压缩音频，会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一转成 16k mono 16-bit WAV 存盘；runtime 初始化时 `audioBackend = Backend.CPU()`；generate 时 Dart 先注入明确 audio prompt，原生再把第一条 `audioPath` 解析为 16k mono 16-bit raw PCM bytes 并加入 `Content.AudioBytes`，顺序为图片、音频、文本；对 UNKNOWN_LENGTH 的系统 URI 会先复制到 cache 再解码。
+- iOS 实现当前状态：`Info.plist` 添加麦克风权限文案，`IOSAudioInput.swift` 已接入文件选择、录音、播放、`audio_input_events` 电平事件；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。但真机验证显示 `flutter_gemma + Gemma-4-E2B-it` 音频请求会触发 `Failed to start streaming (code: 13)`，所以默认仍显式拦截 iOS audio；仅 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 会打开固定 WAV harness，把 WAV data chunk 剥离成 raw PCM 后送 `Message` audioBytes 复现/验证，不作为发布能力。
+- 格式策略：录音与文件选择在原生侧落成 16k mono 16-bit PCM WAV，便于播放/波形/校验；真正送模型时 Android 与 iOS probe 都剥离 WAV header，只传 raw PCM，尽量对齐 Gallery `Content.AudioBytes` 语义；Android 录音达到 30 秒上限会自动停止并回填附件；图片+语音混合输入会使用专门的混合媒体 prompt；Android/iOS 语音波形估算解析 WAV PCM 16-bit sample，不再用 RIFF header 字节估算音量，降低静音判断误差。
 - Live 策略：Android Phase 1 已先落地固定切段/静音切段的伪实时通话（segment -> `GemmaRequest.audioPaths` -> AI 文字回复）；iOS 等 Gemma audio runtime 路径稳定后再打开，不能以非 Gemma ASR 作为本项目 Live 语音成功路径；最后 Phase 3 接 TTS。
 
 ## Prompt Lab

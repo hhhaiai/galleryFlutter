@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io' show File, Platform;
+import 'dart:typed_data' show ByteData, Endian, Uint8List;
 import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/services.dart';
@@ -22,6 +23,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   );
   static const _eventChannel = EventChannel(
     'com.example.gemma_local_app/runtime_events',
+  );
+  static const _iosAudioProbeEnabled = bool.fromEnvironment(
+    'GEMMA_IOS_AUDIO_PROBE',
   );
 
   StreamController<String>? _activeGenerationController;
@@ -319,7 +323,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   Stream<String> _generateWithFlutterGemma(GemmaRequest request) async* {
-    if (request.audioPaths.isNotEmpty) {
+    if (request.audioPaths.isNotEmpty && !_iosAudioProbeEnabled) {
       throw const RuntimeUnavailableException(
         'iOS 当前的 flutter_gemma + Gemma-4-E2B-it 音频理解链路会触发 Failed to start streaming (code: 13)。为保证稳定性，iOS 端暂时关闭语音输入 / Live 语音通话；本项目不会用非 Gemma ASR 方案替代 Gemma 原生 audio 能力验收。',
       );
@@ -331,10 +335,12 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     final prompt = _contextualPrompt(request);
 
     // iOS .litertlm FFI multimodal sessions are not reliably reusable. Rebuild
-    // per image request so text/image modalities stay isolated. Audio is
-    // currently disabled on iOS for stability with Gemma-4-E2B-it.
+    // per media request so text/image/audio probe modalities stay isolated.
+    // Audio remains disabled by default; GEMMA_IOS_AUDIO_PROBE enables this
+    // fixed-WAV harness only for validating Gemma native audio, not for release.
     final isImageRequest = request.imagePaths.isNotEmpty;
-    if (isImageRequest) {
+    final isAudioRequest = request.audioPaths.isNotEmpty;
+    if (isImageRequest || isAudioRequest) {
       final config = _config ?? gemma4E2bIt;
       final modelPath = await _resolveModelPath(config);
       await _initializeFlutterGemma(
@@ -342,7 +348,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         modelPath,
         forceReload: true,
         supportImage: isImageRequest,
-        supportAudio: false,
+        supportAudio: isAudioRequest,
       );
     } else {
       await _flutterGemmaChat?.session.close();
@@ -360,7 +366,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       topK: _config?.topK ?? gemma4E2bIt.topK,
       topP: _config?.topP ?? gemma4E2bIt.topP,
       supportImage: _config?.supportImage ?? gemma4E2bIt.supportImage,
-      supportAudio: false,
+      supportAudio: isAudioRequest,
       modelType: fg.ModelType.gemma4,
       isThinking: false,
       tools: tools,
@@ -370,17 +376,31 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     _flutterGemmaChat = chat;
 
     try {
-      if (request.imagePaths.isNotEmpty) {
-        final firstImage = File(request.imagePaths.first);
-        if (!await firstImage.exists()) {
-          throw RuntimeUnavailableException(
-            '图片文件不存在：${request.imagePaths.first}',
-          );
+      if (isImageRequest || isAudioRequest) {
+        Uint8List? imageBytes;
+        Uint8List? audioBytes;
+        if (isImageRequest) {
+          final firstImage = File(request.imagePaths.first);
+          if (!await firstImage.exists()) {
+            throw RuntimeUnavailableException(
+              '图片文件不存在：${request.imagePaths.first}',
+            );
+          }
+          imageBytes = await firstImage.readAsBytes();
         }
+        if (isAudioRequest) {
+          audioBytes = await _readGemmaPcm16FromWav(request.audioPaths.first);
+        }
+        final mediaPrompt = isImageRequest && isAudioRequest
+            ? _imageAndAudioPrompt(prompt)
+            : isImageRequest
+            ? _visionPrompt(prompt)
+            : _audioPrompt(prompt);
         await chat.addQueryChunk(
-          fg.Message.withImage(
-            text: _visionPrompt(prompt),
-            imageBytes: await firstImage.readAsBytes(),
+          fg.Message(
+            text: mediaPrompt,
+            imageBytes: imageBytes,
+            audioBytes: audioBytes,
             isUser: true,
           ),
         );
@@ -428,6 +448,71 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       }
       toolRounds += 1;
     } while (shouldContinueAfterTool && toolRounds < 3);
+  }
+
+  Future<Uint8List> _readGemmaPcm16FromWav(String audioPath) async {
+    final file = File(audioPath);
+    if (!await file.exists()) {
+      throw RuntimeUnavailableException('音频文件不存在：$audioPath');
+    }
+    final bytes = await file.readAsBytes();
+    if (bytes.length < 44 ||
+        _ascii(bytes, 0, 4) != 'RIFF' ||
+        _ascii(bytes, 8, 4) != 'WAVE') {
+      throw RuntimeUnavailableException(
+        'iOS audio probe 需要 16k mono PCM WAV：$audioPath',
+      );
+    }
+    final view = ByteData.sublistView(bytes);
+    var offset = 12;
+    var channels = 0;
+    var sampleRate = 0;
+    var bitsPerSample = 0;
+    var audioFormat = 0;
+    var dataOffset = -1;
+    var dataSize = 0;
+    while (offset + 8 <= bytes.length) {
+      final chunkId = _ascii(bytes, offset, 4);
+      final chunkSize = view.getUint32(offset + 4, Endian.little);
+      final chunkDataOffset = offset + 8;
+      if (chunkDataOffset + chunkSize > bytes.length) break;
+      if (chunkId == 'fmt ') {
+        if (chunkSize < 16) {
+          throw RuntimeUnavailableException(
+            'iOS audio probe WAV fmt chunk 无效：$audioPath',
+          );
+        }
+        audioFormat = view.getUint16(chunkDataOffset, Endian.little);
+        channels = view.getUint16(chunkDataOffset + 2, Endian.little);
+        sampleRate = view.getUint32(chunkDataOffset + 4, Endian.little);
+        bitsPerSample = view.getUint16(chunkDataOffset + 14, Endian.little);
+      } else if (chunkId == 'data') {
+        dataOffset = chunkDataOffset;
+        dataSize = chunkSize;
+        break;
+      }
+      offset = chunkDataOffset + chunkSize + (chunkSize.isOdd ? 1 : 0);
+    }
+    final maxBytes = 16000 * 30 * 2;
+    final isPcm = audioFormat == 1 || audioFormat == 0xFFFE;
+    if (!isPcm ||
+        channels != 1 ||
+        sampleRate != 16000 ||
+        bitsPerSample != 16 ||
+        dataOffset < 0 ||
+        dataSize <= 0 ||
+        dataSize > maxBytes) {
+      throw RuntimeUnavailableException(
+        'iOS audio probe 只接受 30 秒内 16kHz / mono / 16-bit PCM WAV。'
+        ' 当前 format=$audioFormat channels=$channels sampleRate=$sampleRate bits=$bitsPerSample dataSize=$dataSize。',
+      );
+    }
+    return Uint8List.sublistView(bytes, dataOffset, dataOffset + dataSize);
+  }
+
+  String _ascii(Uint8List bytes, int offset, int count) {
+    if (offset + count > bytes.length) return '';
+    return String.fromCharCodes(bytes.sublist(offset, offset + count));
   }
 
   List<fg.Tool> _iosSkillToolsFor(GemmaRequest request) {

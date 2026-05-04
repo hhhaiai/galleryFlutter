@@ -106,10 +106,10 @@ stopPlayback()
 - 语音文件通过系统 `ACTION_OPEN_DOCUMENT audio/*` 选择；若是 m4a/mp3 等压缩音频，原生侧会先解码为 PCM，再统一封装成 16k / mono / 16-bit WAV 保存到 cacheDir。
 - 播放使用 `MediaPlayer`。
 - 波形估算解析 WAV 的 PCM 16-bit data chunk 后按 sample 振幅分桶，不再直接统计包含 RIFF header 的原始字节；Live 静音判断因此更接近真实音量。
-- 发送给模型时读取第一条 `audioPaths.take(1)`，加入 `Content.AudioBytes`。
+- 发送给模型时读取第一条 `audioPaths.take(1)`，解析 WAV `data` chunk，送入 `Content.AudioBytes` 的是 16k / mono / 16-bit raw PCM，不包含 RIFF/WAVE header。
 - `EngineConfig.audioBackend = Backend.CPU()`。
 
-注意：当前 Android runtime 对应用内录音保留原始 WAV 字节；对 file picker 选中的外部音频，会在进入消息前先统一落成 16k mono PCM WAV，尽量减少不同容器/采样率导致的 LiteRT-LM 兼容差异。
+注意：当前 Android runtime 对 UI/播放保留 16k mono PCM WAV 文件，但模型输入会剥离 WAV header，仅把 raw PCM 交给 `Content.AudioBytes`，以对齐 Google AI Edge Gallery 的 Ask Audio 路径。
 
 ### iOS
 
@@ -130,13 +130,13 @@ lib/src/core/runtime/platform_gemma_runtime.dart
   - `AVAudioRecorder` 录制 16k / mono / 16-bit PCM WAV 语音。
   - `AVAudioPlayer` 点击播放已发送语音。
 - flutter_gemma API 已存在 `Message.withAudio(...)`、`supportAudio`、`enableAudioModality`、`addAudio(...)` 能力，但当前真机验证显示 `Gemma-4-E2B-it` 音频链路会触发 `Failed to start streaming (code: 13)`。
-- 因此 iOS 运行时当前继续拦截 `audioPaths`，暂不暴露 `Message.withAudio(...)` 给用户；后续专项 harness 验证通过后才重新打开。目标发送方式仍是：
+- 因此 iOS 运行时默认继续拦截 `audioPaths`，暂不暴露 audio 给普通用户；已增加固定 WAV harness：仅在 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 时打开 iOS 语音入口，并把 16k mono PCM WAV 的 `data` chunk 剥离为 raw PCM 后送 `Message` audioBytes，用于真机专项复现/验证。目标发送方式仍是：
 - iOS audio input 的波形估算也已改为解析 WAV PCM 16-bit sample，保持和 Android 一致。
 
 ```dart
 fg.Message.withAudio(
   text: _audioPrompt(prompt),
-  audioBytes: await firstAudio.readAsBytes(),
+  audioBytes: rawPcm16Bytes,
   isUser: true,
 )
 ```
@@ -146,9 +146,9 @@ fg.Message.withAudio(
 - 与图片一致，音频属于多模态请求；如果未来重新打开 iOS audio runtime，每次音频请求先 `forceReload` 重建 flutter_gemma model/client/session，优先保证稳定。
 - 普通文字请求不做完整重启。
 
-已补基础能力：iOS 原生 `audio_input` channel 已接入文件选择/录音/播放，`audio_input_events` 已能输出录音状态和电平事件，文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
+已补基础能力：iOS 原生 `audio_input` channel 已接入文件选择/录音/播放，`audio_input_events` 已能输出录音状态和电平事件，文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验；Dart probe 会再次校验并只取 raw PCM bytes。
 
-待补：固定 WAV 的 `Message.withAudio(...)` 真机专项验证。验证前 UI 继续关闭 iOS 语音理解入口，避免影响文字/图片稳定。
+待补：使用 `GEMMA_IOS_AUDIO_PROBE=true` 在真机跑固定 WAV / 录音专项验证。验证前默认 UI 继续关闭 iOS 语音理解入口，避免影响文字/图片稳定。
 
 ## Live 语音通话方案探索
 
