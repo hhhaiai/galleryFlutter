@@ -1773,6 +1773,25 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 - `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
 - live SkillHub API smoke：`skill-vetter` 的 files API 期望 hash 与下载 `SKILL.md` 实际 SHA-256 一致，bytes=4561。
 
+### 16.18 iOS 图片识别 Markdown 不分段修复（2026-05-04）
+
+用户反馈：iOS 图片识别输出看起来是 Markdown，但不分段、不换行，内容粘成一行。
+
+根因：
+
+- 不是 `_visionPrompt(...)` 要求“不换行”或限制 Markdown；当前图片 prompt 只要求看图、回答语言，并没有禁止分段。
+- 真正问题在 UI streaming append：`_appendAssistantText(...)` 对每个 token/chunk 都执行 `trimRight()`。
+- iOS `flutter_gemma` 的流式输出经常把 `\n` 放在 chunk 尾部，甚至单独发 `\n\n` chunk；逐 chunk `trimRight()` 会把这些换行全部吞掉，MarkdownBody 收到的最终文本自然就无法渲染标题/列表/段落。
+
+已完成：
+
+- `lib/src/features/gemma_home/gemma_home_screen.dart`：移除 streaming token 的 `trimRight()`，只剥离 `[[skill_image:...]]` 协议标记，保留模型原始空白和换行。
+- 不新增“必须 Markdown / 必须几段 / 必须换行”的提示词限制，继续让 Gemma 自然输出；如果模型输出换行，UI 会忠实渲染。
+
+待验证：
+
+- iOS 真机重新跑图片识别，确认标题、列表、段落换行不再被吞。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：

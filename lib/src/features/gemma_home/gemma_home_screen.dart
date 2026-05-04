@@ -252,7 +252,11 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         .map((match) => match.group(1)?.trim() ?? '')
         .where((path) => path.isNotEmpty)
         .toList(growable: false);
-    final cleanToken = token.replaceAll(skillImagePattern, '').trimRight();
+    // Preserve model-emitted whitespace exactly. iOS flutter_gemma often emits
+    // Markdown line breaks at chunk boundaries; trimming every streaming chunk
+    // collapses paragraphs/headings/lists into one line before MarkdownBody can
+    // render them.
+    final cleanToken = token.replaceAll(skillImagePattern, '');
     setState(() {
       final last = _messages.removeLast();
       _messages.add(

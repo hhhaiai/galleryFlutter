@@ -65,6 +65,7 @@
 - [x] SkillHub.cn `SKILL.md` 完整性校验：导入前读取 `/api/v1/skills/{slug}/files` 的 `sha256`，下载后按原始 bytes 校验，不匹配或缺失 hash 直接拒绝；本地保存 `sourceSha256` / `sha256Verified` 并在 Hub 列表展示短 hash
 - [x] Android Skills 工具桥接第一阶段：Skills runtime 启用 `ToolProvider` / constrained decoding；支持 `loadSkill` 返回内置/线上 skill instructions；支持 `run_intent(send_email)` 拉起邮件 Intent；已把 Gallery built-in skill assets 打包进 Android 并用本地 headless WebView 执行 bundled `run_js`，image 结果保存到 cache 后附着到 assistant 气泡
 - [x] iOS/Dart Skills tool loop 第一阶段：Skills 模式下为 `flutter_gemma` 注册 `loadSkill` / `runJs` / `runIntent` tools；`loadSkill` 会把 Dart skill instructions 作为 tool response 回传模型继续生成，`runJs` / `runIntent` 仍明确返回 `pending_bridge`
+- [x] iOS 图片/文本流式 Markdown 换行修复：Home 追加 assistant token 时不再对每个 streaming chunk 执行 `trimRight()`，避免 iOS flutter_gemma 在 chunk 边界输出的 `\\n` 被吞掉，导致标题/列表/段落全部粘成一行；不新增“必须分段/必须 Markdown”的提示词限制
 - [x] 按功能整理 Skills Hub 代码：Hub UI 抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入/持久化抽到 `lib/src/features/skills/skill_repository.dart`，Home 只保留状态编排和发送 Gemma 请求
 - [x] 增加 `tool/check_prompt_and_skills.dart`：绕开当前 macOS native asset 测试阻断，直接验证 Prompt Lab 插值和 Skills prompt 注入
 - [x] 恢复 Flutter test 本地闸口：新增 `tool/flutter_test_short_builddir.sh`，用项目内临时 Flutter config 把 tester build root 指向 `/tmp/gla_ft`，绕开 `flutter_gemma` macOS dylib headerpad 不足导致的长 install_name 重写失败；不修改用户全局 Flutter config
