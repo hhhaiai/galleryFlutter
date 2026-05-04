@@ -23,20 +23,20 @@ final promptLabTemplates = <PromptTemplate>[
     label: 'Rewrite tone',
     description: '改写语气。',
     buildPrompt: (input) =>
-        'Rewrite the following text using a formal tone: \$input',
+        'Rewrite the following text using a formal tone:\n\n$input',
     examples: ['Hey team, meeting tomorrow @ 10. Be there!'],
   ),
   PromptTemplate(
     label: 'Summarize text',
     description: '摘要文本。',
     buildPrompt: (input) =>
-        'Please summarize the following in key bullet points: \$input',
+        'Please summarize the following in key bullet points:\n\n$input',
     examples: ['把一段新闻或产品介绍总结成要点。'],
   ),
   PromptTemplate(
     label: 'Code snippet',
     description: '生成代码片段。',
-    buildPrompt: (input) => 'Write a JavaScript code snippet to \$input',
+    buildPrompt: (input) => 'Write a JavaScript code snippet to:\n\n$input',
     examples: ['Create an alert box that says "Hello, World!"'],
   ),
 ];

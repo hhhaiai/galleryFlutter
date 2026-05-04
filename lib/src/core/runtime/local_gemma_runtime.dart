@@ -13,6 +13,7 @@ class GemmaRequest {
     this.imagePaths = const [],
     this.audioPaths = const [],
     this.enabledSkillNames = const [],
+    this.enabledSkillDetails = const [],
   });
 
   final String prompt;
@@ -20,6 +21,7 @@ class GemmaRequest {
   final List<String> imagePaths;
   final List<String> audioPaths;
   final List<String> enabledSkillNames;
+  final List<Map<String, String>> enabledSkillDetails;
 }
 
 abstract interface class LocalGemmaRuntime {

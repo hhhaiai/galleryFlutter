@@ -24,6 +24,13 @@
 - Windows
 - Linux
 
+根本原则 / 项目边界：
+
+- 本项目的根因和核心价值是：**把 Gemma 作为本地大模型，作为文字对话、图片识别、语音理解、Prompt Lab、Agent Skills 等所有能力的基础。**
+- 所有能力优先验证“Gemma 本地模型是否能直接承担该能力”。如果某项能力最终必须改用其它模型、云端模型或完全独立的非 Gemma 方案作为主要能力来源，那么该方案不属于本项目的核心验证目标。
+- 对于 audio 等当前不稳定能力，可以做输入格式归一化、固定样本 harness、runtime 接口验证、或临时 UI 降级；但不能把“换成其它方案”当作本项目的最终成功路径。若确认必须依赖其它方案，应该停止在本项目内继续深测该方向，另开项目或作为外部集成方案评估。
+- 可接受的临时降级仅限于保护文字/图片稳定体验、辅助定位 Gemma runtime 问题，不能替代最终“Gemma 本地模型承载能力”的目标。
+
 应用显示名称：
 
 ```text
@@ -558,9 +565,11 @@ LlmChatModelHelper.runInference(...)
 - 请求：`GemmaRequest(prompt: ...)`
 - 运行时：`LocalGemmaRuntime.generate(...)`
 
-待实现：
+当前状态：
 
-- Android MethodChannel 真调用 LiteRT-LM `Conversation.generateResponseAsync` 或等效 API。
+- Android 已通过 MethodChannel 接入 LiteRT-LM `Engine` / `Conversation`，并通过 EventChannel 流式回传 token。
+- iOS 文字对话当前走 Dart 侧 `flutter_gemma` `.litertlm` FFI 路径，不走 `IOSGemmaRuntime.swift` 的 MediaPipe 原生占位 channel。
+- 后续 audio / skills 改动必须先跑文字对话 smoke test，避免破坏当前已可用闭环。
 
 ### 9.2 图片理解
 
@@ -586,7 +595,7 @@ runInference(images: List<Bitmap>)
 - Prompt 策略：`_visionPrompt()` 会把默认图片描述请求转换为明确视觉问答指令；用户带文字时转换为「请根据图片内容回答：...」，避免模型进入无图普通聊天。
 - 真机验证：Android 与 iOS 均已完成真实图片发送、模型识别与回复验证；iOS 连续多次图片识别已测试成功。当前优先保证识别稳定性，接受 iOS 图片请求略慢。
 
-### 9.3 声音理解
+### 9.3 声音理解 / 语音消息 / Live 语音通话
 
 来源：
 
@@ -596,17 +605,54 @@ EngineConfig.audioBackend = Backend.CPU()
 runInference(audioClips: List<ByteArray>)
 ```
 
-当前 Flutter 抽取：
+当前实现方案已整理到：
+
+```text
+docs/audio_voice_live_design.md
+```
+
+当前 Flutter 抽取与第一阶段实现：
 
 - 入口：`GemmaTaskId.askAudio`
 - 请求字段：`GemmaRequest.audioPaths`
-- UI 目前仅保留入口和提示，尚未接音频选择/录音。
+- 新增 `lib/src/features/gemma_home/audio_input_service.dart`，通过 `com.example.gemma_local_app/audio_input` MethodChannel 统一调用原生音频能力。
+- UI：点击 composer「语音」按钮弹出 bottom sheet，包含「实时录音 / 停止录音」「选择语音文件」「Live 语音通话探索」。
+- 发送前：输入框上方显示 `_AttachedAudioStrip`，包含语音波形、播放按钮、时长、删除按钮。
+- 发送后：`_ChatMessage.audioAttachments` 保存语音消息；用户消息气泡显示 `_VoiceMessageGrid` / `_VoiceMessageCard`，不再只显示 `[语音 × 1]`；点击卡片可播放。
+- 默认语音 prompt：如果用户只发语音不写文字，默认使用「请识别并总结这段语音内容。」
+
+Android 第一阶段：
+
+- 添加 `RECORD_AUDIO` 权限。
+- `MainActivity.kt` 新增 `AndroidAudioInput`：系统音频文件选择、`AudioRecord` 录音并封装成 16k / mono / 16-bit PCM WAV、`MediaPlayer` 播放。
+- Runtime 初始化对齐 Gallery：`audioBackend = if (supportAudio) Backend.CPU() else null`。
+- Android 音频请求的主 backend 已修正为与 Gallery 一致的多模态优先路径：audio/image 请求优先走 GPU 主 backend，纯文字仍保持 CPU 首轮轻量初始化。
+- Runtime generate 读取 `audioPaths.take(1)`，加入 `Content.AudioBytes(audioBytes)`；内容顺序为图片、音频、文本。
+- 对 audio-only 请求，若 LiteRT-LM native compiled model 调用报 `Status Code: 12/13`，Dart 侧会自动补一次 CPU fallback，再降级回文字模式。
+- 选择语音文件时，若拿到 m4a/mp3 等压缩音频，Android 原生侧会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一落成 16k mono 16-bit PCM WAV；若本身是 WAV，则保留/按需规整成 Gemma 可用格式。
+- 注意：录音链路已是 16k mono PCM WAV；文件选择链路的核心格式归一化已补齐，但仍需继续做多来源真机验证。
+
+iOS 第一阶段当前事实：
+
+- 添加 `NSMicrophoneUsageDescription`。
+- iOS 自有 `audio_input` 原生 channel（`UIDocumentPickerViewController`、`AVAudioRecorder`、`AVAudioPlayer`）已接入；`audio_input_events` 已能输出录音状态和电平事件。录音目标格式为 16k / mono / 16-bit PCM WAV，单段上限 30 秒；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
+- `flutter_gemma` API 层存在 `Message.withAudio(...)` / `supportAudio` 等能力，但当前真机验证显示 `Gemma-4-E2B-it` iOS 音频链路会触发 `Failed to start streaming (code: 13)`。
+- 因此 `platform_gemma_runtime.dart` 当前遇到 `audioPaths` 会显式抛出稳定性提示；`gemma_home_screen.dart` 在 iOS 端也暂时关闭语音文件、实时录音和 Live 语音入口，避免影响文字/图片稳定。
+- 下一步不是直接重新打开 iOS 音频，而是先做固定 WAV harness，验证是否还能稳定复现 `Message.withAudio` code 13；若确认 Gemma iOS audio runtime 当前不可用，则暂停本项目内 iOS audio 深测，而不是改用非 Gemma 方案作为成功路径。
+
+Live 语音通话探索：
+
+- Phase 1 当前实现：开始 Live 后每 4 秒切一段，把片段串行送 `GemmaRequest.audioPaths`，AI 先文字回复；输入区显示 Live 状态条，可直接停止。
+- Phase 2 再做原生 PCM streaming + VAD：Android `AudioRecord`，iOS `AVAudioEngine`，实时波形和分段队列。
+- Phase 3 再接 TTS，形成完整语音对话和打断策略。
 
 待实现：
 
-- Flutter 侧音频选择或录音。
-- MethodChannel 传音频路径或 bytes。
-- Android 原生转换为 ByteArray。
+- Android：继续补强多来源音频（系统录音、微信导出、浏览器下载、第三方 App 分享）的真机验证与异常兼容处理。
+- Android：真机验证语音文件、实时录音、点击播放、Gemma 语音理解。
+- iOS：用固定 WAV 做 `flutter_gemma Message.withAudio` 专项 harness；若仍 code 13，记录 Gemma iOS audio blocker 并暂停本项目内 iOS audio 深测。
+- iOS：在上述验证完成前，UI 继续隐藏/拦截 iOS 语音理解入口，不影响文字/图片。
+- Live：先做 Phase 1 分段通话，再探索 PCM/VAD 真流式。
 
 ### 9.4 Prompt Lab
 
@@ -863,6 +909,14 @@ POST_NOTIFICATIONS
 - [x] Xcode/Swift toolchain 已从 Xcode 15.0.1 升级到 Xcode 26.4.1 / Swift 6.3.1，`ios/Podfile` 已启用 `MediaPipeTasksGenAI 0.10.35`，`pod install` 与 `flutter build ios --no-codesign` 均可成功链接。
 - [x] iOS 真实文字对话 runtime 已接入：`IOSGemmaRuntime.swift` 使用 `LlmInference.Options(modelPath:)` 初始化模型，创建 `LlmInference.Session`，`generate` 调用 `session.addQueryChunk(inputText:)` 与 `session.generateResponseAsync()`，并把 partial token 通过 `com.example.gemma_local_app/runtime_events` 流式返回 Flutter。
 - [x] 图片入口已升级为真实附件流程：点击图片弹出「拍照 / 从相册选择」，拍照或选择后缩略图附着到输入框，可删除，可附带文字一起发送；Android 参考 Gallery 以 1024x1024 采样 + EXIF 旋转后通过 `Content.ImageBytes` 接入 LiteRT-LM，iOS 通过 `flutter_gemma` 的 `Message.withImage` 接入。Android 与 iOS 真机图片识别均已测试成功；iOS 连续图片识别为保证稳定性，每次图片请求完整重建 vision runtime/model client。
+- [x] 语音消息第一阶段已接入：新增 `audio_input_service.dart` 与 `com.example.gemma_local_app/audio_input` MethodChannel；Android 支持系统音频文件选择、`MediaRecorder` 实时录音、`MediaPlayer` 点击播放，发送后显示微信式语音波形卡片；runtime 已初步把 `audioPaths` 加入 `Content.AudioBytes`，并启用 Gallery 同款 `audioBackend = Backend.CPU()`。iOS runtime 已通过 `flutter_gemma` 的 `Message.withAudio(...)` 打开音频请求路径并添加麦克风权限文案。Live 语音通话架构、阶段方案和方案对比已记录到 `docs/audio_voice_live_design.md`。
+- [x] Android 音频 runtime 已按 Gallery 工作基线补齐：音频请求不再错误地退回 CPU 主 backend，而是优先按多模态路径使用 GPU 主 backend + `audioBackend = Backend.CPU()`；若出现 LiteRT-LM `Status Code: 12/13 / Failed to invoke the compiled model`，Dart 侧会对 audio-only 请求自动补一次 CPU fallback，再回退到文字模式，减少不同 Android 设备上的 compiled model 调用失败。
+- [x] Android 音频文件选择链路补强：系统 picker 对 m4a/mp3 等压缩音频会先经过 `MediaExtractor + MediaCodec` 解码为 PCM，再统一转成 16k mono 16-bit WAV；WAV 文件则保留/按需规整成 Gemma 可用格式，减少“选中了文件但 LiteRT-LM 只认 WAV”导致的失败。
+- [x] iOS 录音链路已对齐运行时输入：`IOSAudioInput.swift` 录音输出已从 AAC/m4a 改为 16k / mono / 16-bit PCM WAV，并限制单段 30 秒，避免 iOS 应用内录音在 `flutter_gemma` 音频输入前就因容器格式不匹配而失败。
+- [x] iOS 真机现状已重新确认：安装/启动链路可以打通，但 `flutter_gemma` 的 `.litertlm` iOS FFI 音频链在 `Gemma-4-E2B-it` 上会触发 `Failed to start streaming (code: 13)`；为保证整体稳定性，当前已在 Flutter 层显式关闭 iOS 语音输入 / Live，并给出清晰提示，不再让用户直接撞到 code 13。
+- [x] Live 语音通话 Phase 1 已接入首个闭环：composer 里的「Live 语音通话」现在可直接开启/停止；运行时按 4 秒切一段，自动执行“录音 -> 音频理解 -> 文字回复 -> 继续监听”，并在输入区显示当前 Live 状态条，作为后续 VAD/真流式方案前的可用探索版。
+- [x] Live Phase 1 细节补强：修复停止 Live 时递归调用 stop 的状态问题；对近似静音片段做跳过，避免持续把空白环境声发送给模型。
+- [x] Live UX 已改为“前台持续通话、后台隐式切段”：Android 侧 runtime 初始化已改为可复用同一 audio conversation，避免每段都回到 text-only runtime 再重建；Flutter 侧 Live 使用全屏通话态覆盖层、持续时长、统一 AI 回复预览与“正在听/正在回应”状态，把 4 秒后台切段对用户隐藏起来，尽量让用户感知成“正在和 AI 持续语音对话”。
 
 ## 12.5 Google AI Edge GitHub 参考与用户体验设计（2026-05-02）
 
@@ -1185,6 +1239,7 @@ No issues found! (ran in 2.1s)
 ```bash
 dart format lib test
 flutter analyze
+dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart
 flutter test
 ```
 
@@ -1254,44 +1309,271 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 
 如保留 docs 目录，也要同步更新相关 docs。
 
-## 16. 推荐下一步执行计划
+## 16. 2026-05-04 起推荐推进队列
 
-下一次继续开发时，建议直接从 P0 开始：
+当前总体原则：**Gemma 本地模型是本项目所有能力的基础；文字对话和图片识别已经是移动端高质量体验的主闭环；audio / skills 的推进不能破坏这两条链路。** 每推进一项都要先记录事实、再小步验证。若某方向确认必须改用非 Gemma 方案作为主要能力来源，则不再作为本项目内的核心验证目标继续深测。
 
-1. 阅读原工程 LiteRT-LM Gradle 配置。
-2. 把 LiteRT-LM 依赖最小迁移到 Flutter Android 工程。
-3. 在 Android `MainActivity` 或独立 Kotlin 类中实现 MethodChannel。
-4. Dart `MethodChannelGemmaRuntime.initialize()` 传入模型本地路径和参数。
-5. Android 创建 `Engine` 和 `Conversation`。
-6. 先做最小文本 generate，一次性返回完整文本。
-7. 跑 Android emulator/真机验证。
-8. 再升级 EventChannel 流式 token。
-9. 最后接图片、音频、Skills。
+### 16.1 P0：状态对齐与回归保护
 
-P0 最小验收标准：
+1. 统一文档事实：
+   - `CLAUDE.md` 作为进展和待办主文件。
+   - `docs/` 作为具体实现方案文件。
+   - 如果代码事实和文档冲突，以当前代码与真机验证结果为准，随后修正文档。
+2. 修正已过期条目：
+   - Android `Engine` / `Conversation` 已接入，不再列为未实现。
+   - iOS `audio_input` channel 已有文件选择/录音/播放骨架，但音频理解 runtime 当前主动关闭。
+   - iOS audio 当前真实 blocker 是 `flutter_gemma + Gemma-4-E2B-it` 音频请求触发 `Failed to start streaming (code: 13)`。
+3. 建立回归基线：
+   - Android：文字首轮、连续多轮、图片识别、图片后继续文字。
+   - iOS：文字首轮、连续多轮、图片连续识别、图片后继续文字。
+   - 每次 audio / skills 改动后至少运行 `flutter analyze`，并优先做移动端文字/图片 smoke test。
 
-- 在侧边 Models 下载 Gemma-4-E2B-it。
-- 下载完成后主页面输入文字。
-- Android 原生 LiteRT-LM 使用本地 `.litertlm` 文件返回真实模型输出。
-- `flutter analyze` 和 `flutter test` 通过。
-- Android Profile/Release 真机可启动。
+### 16.2 P0：iOS audio 基础能力先补齐，不直接冒险打开 runtime
 
-## 17. 当前 Git/文件状态说明
+1. `IOSAudioInput.swift`：
+   - 文件选择后统一转换为 16k / mono / 16-bit PCM WAV。
+   - 录音继续保持 16k / mono / 16-bit PCM WAV，单段上限 30 秒。
+   - 增加 `com.example.gemma_local_app/audio_input_events`，输出 recording started/stopped/cancelled 和录音电平。
+   - 增加 WAV header / 时长 / 文件大小校验，避免把不可用音频送进 runtime。
+2. `platform_gemma_runtime.dart`：
+   - 当前继续拦截 iOS `audioPaths`。
+   - 后续增加一个固定 WAV harness，只在专项验证通过后再考虑打开 `Message.withAudio(...)`。
+3. 如果 `Message.withAudio(...)` 仍触发 code 13：
+   - 先记录为 Gemma iOS audio runtime blocker，并暂停把 iOS audio 作为本项目核心能力继续深测。
+   - 独立 iOS ASR -> Gemma 文本对话只能作为外部降级/另项目方案评估，不能算作本项目的 audio 能力成功路径。
+   - UI 文案必须说明这是非 Gemma audio modality 的降级能力，不能误导为 Gemma 原生语音理解。
 
-当前 `gemma_local_app/` 是新建目录，在父仓库中显示为 untracked：
+### 16.3 P0：Android audio 专项验证
+
+1. 对齐 Google AI Edge Gallery：
+   - `MAX_AUDIO_CLIP_COUNT = 1`。
+   - `MAX_AUDIO_CLIP_DURATION_SEC = 30`。
+   - `SAMPLE_RATE = 16000`。
+   - `EngineConfig.audioBackend = Backend.CPU()`。
+   - 内容顺序为 `Content.ImageBytes`、`Content.AudioBytes`、`Content.Text`。
+2. 真机覆盖：
+   - 应用内录音。
+   - 标准 wav。
+   - m4a。
+   - mp3。
+   - 微信/浏览器/第三方 App 导出的音频。
+3. 若出现 `Status Code: 12/13`：
+   - 记录 backend、header、采样率、声道、时长、bytes。
+   - 与 Gallery `ChatMessageAudioClip.genByteArrayForWav()` 输出做 byte-level 对比。
+   - 必要时只保留 raw PCM，在发送前按 Gallery 方式加 WAV header。
+
+### 16.4 P1：Live 语音通话
+
+1. Android 先稳定：
+   - 静音切段。
+   - 队列背压。
+   - 停止/中断后的状态恢复。
+   - 片段失败重试和“重新发送语音”。
+2. iOS 等 Gemma audio runtime 路径验证稳定后再打开；非 Gemma ASR 不能作为本项目 Live 语音成功路径。
+3. TTS 放到后续阶段，不阻塞“语音输入可用”。
+
+### 16.5 P1：Skills / Agent Chat
+
+1. 从 `/Users/sanbo/Desktop/gallery/Android/src/app/src/main/assets/skills/*/SKILL.md` 整理内置 skills 到 Flutter assets 或 App Support。
+2. 做 Skills Hub：
+   - 内置 skills。
+   - 启用/禁用。
+   - 本地导入。
+   - URL 导入预留。
+   - secret/API key 管理。
+   - 第三方 skill 安全提示。
+3. Android runtime 接 Gallery 同款工具机制：
+   - `ToolProvider` / `ToolSet`。
+   - `load_skill`。
+   - `run_intent`。
+   - 后续再接 JS skill。
+4. iOS / Flutter 侧处理 `FunctionCallResponse`：
+   - 解析 function call。
+   - 分发到 Dart/platform tool executor。
+   - 把 tool result 回传模型或展示给用户。
+
+### 16.6 当前执行顺序
+
+本轮开始按以下顺序推进：
+
+1. 更新 `CLAUDE.md` 与 `docs/` 中过期状态。
+2. 给 iOS audio input 补格式归一化和 event channel，但保持 iOS audio runtime 关闭。
+3. 跑 `flutter analyze`。
+4. 再进入 Android audio 多来源真机验证与修正。
+5. 最后做 Skills 工具桥接。
+
+### 16.7 本轮推进记录（2026-05-04）
+
+已完成：
+
+1. 更新 `CLAUDE.md`、`docs/progress.md`、`docs/audio_voice_live_design.md`、`docs/feature_mapping.md`，对齐当前真实状态：
+   - Android `Engine` / `Conversation` 已接入。
+   - Android audio runtime 已按 Gallery 路线重新接入，但待多来源真机验证。
+   - iOS audio runtime 因 `Failed to start streaming (code: 13)` 继续关闭。
+   - Skills 当前仍是 prompt 占位，尚未接 Gallery `load_skill` / `run_intent` 工具桥接。
+2. 推进 iOS audio input 基础能力：
+   - `IOSAudioInput.swift` 注册 `com.example.gemma_local_app/audio_input_events`。
+   - 录音开始/停止/取消会发 recording event。
+   - 录音中按约 120ms 输出电平 event，供后续 Live/VAD 使用。
+   - 文件选择音频会通过 `AVAudioFile` + `AVAudioConverter` 转成 16k / mono / 16-bit PCM WAV。
+   - 录音和文件选择结果会做 RIFF/WAVE、PCM、采样率、声道、bit depth、30 秒上限校验。
+3. 验证：
+   - `flutter analyze`：通过。
+   - `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+   - `flutter test --no-pub`：未通过，失败点是 macOS native asset `libGemmaModelConstraintProvider.dylib` 执行 `install_name_tool` 时 load command 空间不足；这是当前测试宿主/Native Assets 链路问题，不是本轮 iOS Swift 编译错误。后续需要单独处理 macOS native asset relink/headerpad 或改用移动端 smoke test 作为本轮主验收。
+
+仍未打开：
+
+- iOS `Message.withAudio(...)` runtime 仍保持关闭；下一步必须先做固定 WAV harness。若仍确认 code 13，则记录为 Gemma iOS audio blocker 并暂停本项目内深测，不用非 Gemma ASR 方案替代验收。
+
+### 16.8 本轮质量复查与补强（2026-05-04）
+
+本轮按用户要求重点复查：文字对话、图片对话、Android audio。结论：文字/图片主链路保持可编译；Android audio 还缺真机设备验证，但静态链路和构建已补强。
+
+已完成：
+
+1. 文字/Skills prompt 质量补强：
+   - 发现 Android `generate` 调用虽然把 `systemPrompt` / `enabledSkillNames` 传给 MethodChannel，但 Kotlin `generate(...)` 当前没有消费这些字段；这会导致 Android Skills/system 指令实际不进入模型上下文。
+   - 已在 Dart `MethodChannelGemmaRuntime` 侧统一构造 contextual prompt：system instructions、enabled skills 与用户请求一起进入 Android prompt，避免 Android 文字/Skills 质量被空转。
+   - iOS 文字路径同步复用同一 contextual prompt 逻辑，保持平台一致。
+2. 图片对话质量补强：
+   - Android 现在也会像 iOS 一样，对图片请求使用明确视觉指令：要求以图片为主要证据、按系统语言回答、默认图片 prompt 时描述主要物体/场景/文字/细节。
+   - 图片 + 音频同时存在时，prompt 会明确要求同时利用 image/audio 作为证据，避免模型只按普通文本聊天。
+3. Android audio 质量补强：
+   - 音频请求进入 Android runtime 前会补明确 audio prompt：要求识别语音/声音/数字/姓名/关键信息；不清楚时说明不确定点。
+   - Android 录音达到 30 秒上限时，原生 event 会带 `reason=maxDuration`；Flutter 收到后自动调用 `stopRecording()` 并把录音附件回填到输入框，避免原生已停止但 UI 仍显示录音中、且录音文件没有附着的问题。
+   - Android 系统音频选择补 `FLAG_GRANT_READ_URI_PERMISSION`；对返回 UNKNOWN_LENGTH 的 DocumentProvider 音频，先复制到 cache 临时文件再交给 `MediaExtractor`，避免部分云盘/文件管理器 URI 因负 length 不能解码。
+4. 多模态/Live 边界补强：
+   - 纯图片、纯音频、图片+音频三种无文字输入分别使用不同默认 prompt；图片+音频不会再误用“请描述这张图片”而忽略音频。
+   - Live 语音每段推理增加错误隔离：单段 PlatformException 不再直接杀掉后台 processor；如果 audio runtime 不可用则停止 Live 并给出明确错误，避免后台循环持续失败。
+
+验证记录：
+
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- 第二轮补强后再次运行 `flutter analyze`、`flutter build apk --debug`、`cd android && ./gradlew :app:lintDebug`、`flutter build ios --no-codesign`：均通过。
+- `flutter test --no-pub`：仍未通过，失败点仍是 macOS native asset `libGemmaModelConstraintProvider.dylib` 的 `install_name_tool` load command/headerpad 问题；与本轮 Dart/Kotlin 补强无关。
+- `adb devices`：当前无 Android 设备连接，因此 Android audio 的模型真实理解仍需要接真机/模拟器后覆盖录音、wav、m4a、mp3、多来源导出音频。
+
+继续待做：
+
+1. Android 真机专项：安装 debug/release 包，下载或复用模型后逐项验证文字、图片、录音、wav/m4a/mp3 audio。
+2. 若 Android audio 出现 LiteRT-LM `Status Code: 12/13`，记录 backend、WAV header、采样率、声道、bit depth、时长、bytes，并与 Gallery `ChatMessageAudioClip.genByteArrayForWav()` 做 byte-level 对比。
+3. iOS audio runtime 仍不打开；只能继续固定 WAV harness 验证 Gemma 原生 audio，不能用非 Gemma ASR 当作本项目成功路径。
+
+### 16.9 第三轮复查补强（2026-05-04）
+
+继续按“文字对话 / 图片对话 / Android audio / Skills 诚实边界”复查后，又补了三个质量缺口：
+
+1. Prompt Lab：
+   - 发现 `Rewrite tone`、`Summarize text`、`Code snippet` 模板把 `\$input` 字面量发给 Gemma，没有真实插入用户输入。
+   - 已修复为真正插入用户文本，并新增 `test/prompt_and_skills_test.dart` 覆盖模板不能包含字面量 `\$input`。
+2. Skills prompt：
+   - 发现当前只传 `enabledSkillNames`，Gemma 实际只知道技能名，不知道 Gallery skill 的说明/工具调用意图。
+   - 已把内置 skills 对齐 `/Users/sanbo/Desktop/gallery/Android/src/app/src/main/assets/skills/*/SKILL.md` 的名称、说明和 `run_js` / `run_intent` 调用要求。
+   - 新增 `buildAgentSkillsSystemPrompt(...)`，发送请求时把选中 skills 的 description/instructions 注入 system prompt。
+   - 重要边界：当前 Flutter app 的原生 `ToolProvider` dispatch 尚未接通，所以 prompt 明确要求 Gemma 不得伪装已经执行 `run_js` / `run_intent`；只能输出预期 tool call payload，并说明等待原生 Skills 桥接。这样保证本地 Gemma 仍是能力基础，同时不产生假执行结果。
+3. 语音波形 / Live 静音判断：
+   - Android 与 iOS 的语音卡片波形估算此前直接统计整个 WAV 文件字节，RIFF/WAVE header 会污染音量估算。
+   - 已改为解析 WAV `data` chunk 的 16-bit PCM sample 后再分桶估算振幅；这会让静音检测、Live 切段和 UI 波形更接近真实音量。
+
+第三轮验证：
+
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- `git diff --check`：通过。
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过，用来绕开当前 macOS native asset hook，直接验证 Prompt Lab 插值和 Skills prompt 内容。
+- `flutter test --no-pub test/prompt_and_skills_test.dart`：仍被 macOS native asset `libGemmaModelConstraintProvider.dylib` 的 `install_name_tool` headerpad/load command 问题阻断；这不是新增测试逻辑失败。后续需要单独修 macOS native asset relink/headerpad，或继续用移动端 build/smoke 作为当前主验收。
+- Android AVD 33 本轮尝试启动用于复测录音，但 emulator 进程在 adb online 前退出，`adb devices` 无 Android 设备；因此本轮无法新增 Android 设备 smoke，Android audio 的 Gemma 真实理解仍待真机/可用 emulator + 模型文件验证。
+
+### 16.10 Skills Hub / 线上 Skills 第一阶段（2026-05-04）
+
+根据用户补充“Skills 最好支持 Skills Hub，类似 `https://skillhub.cn/`，希望支持线上 skills”，本轮继续推进 Skills Hub 第一阶段。核心原则仍然不变：Gemma 是本地大模型基础；线上 skill 只是给 Gemma 提供可加载 instructions / tool schema / 本地工具执行入口，不能变成云端模型替代。
+
+已完成：
+
+1. Flutter Skills Hub UI：
+   - 点击 composer 的 `Skills` 按钮不再只是简单 toggle，而是打开 `Skills Hub` bottom sheet。
+   - Hub 中可统一启用/关闭 Skills 模式。
+   - 可查看内置 skills 与线上导入 skills。
+   - 每个 skill 可单独启用/禁用。
+   - 线上 skill 可删除。
+2. SkillHub.cn / 线上入口：
+   - Hub 面板提供 `https://skillhub.cn/` 链接复制，作为线上 skills 社区入口。
+   - 当前未新增 `url_launcher` 依赖，因此先不直接拉起外部浏览器；用户可复制链接或粘贴具体 Skill URL。
+3. 线上 Skill 导入：
+   - 新增 `lib/src/features/skills/skill_repository.dart`。
+   - 支持粘贴：
+     - 直接 `SKILL.md` URL。
+     - GitHub `blob/.../SKILL.md` URL，会自动转换 raw。
+     - GitHub raw URL。
+     - 包含 `SKILL.md` 链接的 HTML 页面，会尝试提取第一个 `SKILL.md` 链接再下载。
+   - 下载大小限制 512KB。
+   - 解析 `--- name / description ---` front matter。
+   - 校验 skill name：`[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}`。
+   - 线上 skills 持久化到 Application Support 的 `online_skills.json`。
+4. Runtime 请求结构：
+   - `GemmaRequest` 新增 `enabledSkillDetails`，把 name / description / instructions / sourceUrl 送入 runtime。
+   - Dart system prompt 继续注入选中 skill 的详细 instructions，保证 iOS 与 Android 至少都能让 Gemma 读到线上 skill 内容。
+5. Android ToolProvider 第一阶段：
+   - Android Skills 模式初始化时启用 `ConversationConfig.tools = listOf(tool(GemmaSkillToolSet(...)))`。
+   - Skills 模式启用 constrained decoding：`ExperimentalFlags.enableConversationConstrainedDecoding = true`。
+   - `loadSkill(skillName)`：可返回内置/线上 skill 的完整 instructions。
+   - `runJs(skillName, scriptName, data)`：当前 JS/WebView sandbox 尚未接通，返回 `pending_bridge`，明确告诉模型不要声称已执行。
+   - `runIntent(intent, parameters)`：第一阶段接 `send_email`，通过 Android `ACTION_SENDTO mailto:` 拉起邮件 App。
+
+验证：
+
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- `git diff --check`：通过。
+
+仍待做：
+
+1. Skills Hub 深化：
+   - 如果 SkillHub.cn 提供稳定 API，再接目录浏览、搜索、分页、评分/来源信息。
+   - 增加来源信任提示、hash/签名校验、更新检查。
+2. `run_js` 真执行：
+   - 参考 Gallery `CallJsAgentAction` / local webview sandbox。
+   - 支持 JS skill 输出 result / image / webview。
+   - 支持 secret/API key 本地保存与授权弹窗。
+3. iOS / Dart tool dispatch：
+   - 解析 `flutter_gemma FunctionCallResponse`。
+   - 分发到 Dart/platform tool executor。
+   - 把 tool result 回传模型或至少在 UI 中结构化展示。
+4. 真机验证：
+   - Android：Skills Hub 导入线上 skill、loadSkill 调用、send_email intent、run_js pending_bridge 行为。
+   - iOS：线上 skill prompt 注入与 FunctionCallResponse 展示。
+
+## 17. 本地整理与提交边界（2026-05-04）
+
+当前工程已经是独立 Git 仓库：
 
 ```text
-?? gemma_local_app/
+repo: /Users/sanbo/Desktop/gallery/gemma_local_app
+branch: main
+remote: https://github.com/hhhaiai/galleryFlutter.git
 ```
 
-父目录还存在其它未跟踪文件：
+本轮按功能整理后的提交边界：
 
-```text
-?? ai-edge-gallery.apk
-?? model_download_urls_android_1_0_11.json
-```
+1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
+2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，保持 16k mono 16-bit PCM WAV 输入；iOS 只补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭。
+3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；Android ToolProvider 第一阶段只声明已实际支持的 `loadSkill` / `run_intent(send_email)`，`run_js` 仍返回 `pending_bridge`，不伪装已执行。
+4. 验证辅助：`tool/check_prompt_and_skills.dart` 作为当前 macOS native asset 问题下的轻量 smoke gate；Flutter 原生测试仍需后续修复 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 
-不要误删这些用户文件。
+提交到 GitHub 时必须继续使用 Lore Commit Protocol，并在 commit message 中明确记录：
+
+- `Constraint: Gemma-4-E2B-it remains the local foundation for text, image, audio, Prompt Lab, and Skills.`
+- `Rejected: Replace iOS audio with non-Gemma ASR | violates this project's core validation boundary.`
+- `Not-tested: flutter test --no-pub is blocked by macOS native asset install_name_tool/headerpad issue.`
 
 ## 18. 快速命令
 
@@ -1348,4 +1630,3 @@ flutter build ios --release
    - 重要决策
 4. 运行验证命令。
 5. 最终回复用户时说明改动路径和验证结果。
-

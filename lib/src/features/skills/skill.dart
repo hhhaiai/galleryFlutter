@@ -5,6 +5,8 @@ class GemmaSkill {
     required this.instructions,
     this.selected = true,
     this.requireSecret = false,
+    this.sourceUrl,
+    this.online = false,
   });
 
   final String name;
@@ -12,14 +14,25 @@ class GemmaSkill {
   final String instructions;
   final bool selected;
   final bool requireSecret;
+  final String? sourceUrl;
+  final bool online;
+
+  Map<String, String> toRuntimeMap() => {
+    'name': name,
+    'description': description,
+    'instructions': instructions,
+    if (sourceUrl != null && sourceUrl!.isNotEmpty) 'sourceUrl': sourceUrl!,
+    'online': online.toString(),
+  };
 }
 
 const agentSkillsSystemPrompt = '''
 You are an AI assistant that helps users by answering questions and completing tasks using skills.
 For every new request:
-1. Find the most relevant skill from the enabled skill list.
-2. If a relevant skill exists, load and follow its instructions.
-3. Output only the final result when successful.
+1. Find the most relevant skill from the enabled skill list below.
+2. Follow that skill's instructions exactly.
+3. Current bridge status: native ToolProvider dispatch is not connected yet in this Flutter app. If a skill asks for `run_js` or `run_intent`, do not pretend that it already executed. Instead, output the exact intended tool call payload and clearly say that execution is waiting for the native Skills bridge.
+4. Pure text skills can be completed directly by the local Gemma model.
 ''';
 
 const builtInSkills = <GemmaSkill>[
@@ -27,23 +40,65 @@ const builtInSkills = <GemmaSkill>[
     name: 'calculate-hash',
     description: '计算文本哈希。',
     instructions:
-        'When asked to calculate a hash, identify algorithm and input, then return the hash.',
+        'Gallery skill source: Call the `run_js` tool with script name `index.html` and data JSON containing `text`, the text to calculate hash for.',
   ),
   GemmaSkill(
     name: 'query-wikipedia',
     description: '查询 Wikipedia 并总结。',
     instructions:
-        'Search Wikipedia for the requested topic and summarize the relevant facts.',
+        'Gallery skill source: Call the `run_js` tool using `index.html` and data JSON containing `topic` and `lang`. Extract only the primary entity/person/event as topic. Reply in the same language as the user.',
   ),
   GemmaSkill(
     name: 'qr-code',
     description: '生成 QR code。',
-    instructions: 'Create a QR code for the requested text or URL.',
+    instructions:
+        'Gallery skill source: Call the `run_js` tool with data JSON containing `url`, the URL or text to encode as a QR code.',
   ),
   GemmaSkill(
     name: 'send-email',
     description: '发送邮件。',
     instructions:
-        'Collect recipient, subject, and body, then ask the platform email adapter to send it.',
+        'Gallery skill source: Call the `run_intent` tool with intent `send_email` and parameters JSON containing `extra_email`, `extra_subject`, and `extra_text`.',
+  ),
+  GemmaSkill(
+    name: 'text-spinner',
+    description: '让文本在头顶旋转展示。',
+    instructions:
+        'Gallery skill source: Call the `run_js` tool with data JSON containing `label`, the text string to spin.',
+  ),
+  GemmaSkill(
+    name: 'interactive-map',
+    description: '展示指定地点的交互地图。',
+    instructions:
+        'Gallery skill source: Call the `run_js` tool with data JSON containing `location`, the location to show on the map.',
+  ),
+  GemmaSkill(
+    name: 'mood-tracker',
+    description: '本地记录、查询和分析每日心情。',
+    instructions:
+        'Gallery skill source: Call the `run_js` tool with data JSON. Supported actions include `log_mood`, `get_mood`, `get_history`, `delete_mood`, `export_data`, and `wipe_data`. Extract date, score, comment, and days from the user request when needed.',
+  ),
+  GemmaSkill(
+    name: 'kitchen-adventure',
+    description: '以厨房电器世界为背景的文字冒险 DM。',
+    instructions:
+        'Pure text skill. When the user starts kitchen adventure, act as the Head Chef DM. Use kitchen-scale world building, serious-whimsical tone, never write the player action, and format each turn with location, situation, and "What do you do?".',
   ),
 ];
+
+String buildAgentSkillsSystemPrompt(Iterable<GemmaSkill> skills) {
+  final selectedSkills = skills.where((skill) => skill.selected).toList();
+  final buffer = StringBuffer(agentSkillsSystemPrompt.trim());
+  if (selectedSkills.isEmpty) {
+    buffer.writeln('\n\nEnabled skills: none.');
+    return buffer.toString();
+  }
+  buffer.writeln('\n\nEnabled skills:');
+  for (final skill in selectedSkills) {
+    buffer
+      ..writeln('- ${skill.name}')
+      ..writeln('  Description: ${skill.description}')
+      ..writeln('  Instructions: ${skill.instructions}');
+  }
+  return buffer.toString();
+}

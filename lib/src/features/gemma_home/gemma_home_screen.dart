@@ -1,5 +1,6 @@
 import 'dart:async';
-import 'dart:io' show File;
+import 'dart:collection';
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +15,8 @@ import '../models/model_download_service.dart';
 import '../models/models_drawer.dart';
 import '../prompt_lab/prompt_templates.dart';
 import '../skills/skill.dart';
+import '../skills/skill_repository.dart';
+import '../skills/skills_hub_sheet.dart';
 
 class GemmaHomeScreen extends StatefulWidget {
   const GemmaHomeScreen({super.key});
@@ -27,15 +30,21 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _downloadController = ModelDownloadController();
   final _imagePicker = ImagePicker();
   final _audioInput = AudioInputService();
+  final _skillRepository = SkillRepository();
   final _inputController = TextEditingController();
   final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
+  StreamSubscription<AudioInputEvent>? _audioEventSubscription;
 
   ModelDownloadStatus _downloadStatus = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
   );
   PromptTemplate _template = promptLabTemplates.first;
+  List<GemmaSkill> _onlineSkills = const [];
+  late final Set<String> _enabledSkillNames = {
+    for (final skill in builtInSkills) skill.name,
+  };
   final List<_ChatMessage> _messages = [
     const _ChatMessage(
       role: _ChatRole.assistant,
@@ -46,9 +55,31 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
   final List<XFile> _attachedImages = [];
   final List<AudioAttachment> _attachedAudios = [];
+  static const _liveMinSegmentDuration = Duration(milliseconds: 1600);
+  static const _liveMaxSegmentDuration = Duration(seconds: 7);
+  static const _liveSilenceHold = Duration(milliseconds: 850);
+  static const _liveSpeechThreshold = 0.16;
+  static const _liveUiTick = Duration(seconds: 1);
   bool _recording = false;
+  bool _autoStoppingRecording = false;
   bool _running = false;
   bool _stopRequested = false;
+  bool _liveCallActive = false;
+  bool _liveCaptureRunning = false;
+  bool _liveProcessorRunning = false;
+  bool _liveSegmentProcessing = false;
+  String _liveStatusText = '';
+  String _liveAssistantPreview = '';
+  String _liveDraftPreview = '';
+  String _liveHeardContext = '';
+  Duration _liveElapsed = Duration.zero;
+  Completer<void>? _liveStopSignal;
+  Completer<void>? _liveSegmentCutSignal;
+  Timer? _liveUiTimer;
+  final Queue<AudioAttachment> _livePendingSegments = Queue<AudioAttachment>();
+  double _liveMicLevel = 0;
+  bool _liveSpeechDetectedInSegment = false;
+  int _liveLastSpeechElapsedMs = 0;
 
   @override
   void initState() {
@@ -56,14 +87,20 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _downloadSubscription = _downloadController.statusStream.listen((status) {
       if (mounted) setState(() => _downloadStatus = status);
     });
+    _audioEventSubscription = _audioInput.events.listen(_handleAudioInputEvent);
     _downloadController.refreshStatus(gemma4E2bIt).then((status) {
       if (mounted) setState(() => _downloadStatus = status);
     });
+    _loadOnlineSkills();
   }
 
   @override
   void dispose() {
+    _liveStopSignal?.complete();
+    _liveSegmentCutSignal?.complete();
+    _liveUiTimer?.cancel();
     _downloadSubscription?.cancel();
+    _audioEventSubscription?.cancel();
     _inputController.dispose();
     _inputFocusNode.dispose();
     _scrollController.dispose();
@@ -76,7 +113,32 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     await _downloadController.download(gemma4E2bIt);
   }
 
+  Future<void> _loadOnlineSkills() async {
+    try {
+      final skills = await _skillRepository.loadOnlineSkills();
+      if (!mounted) return;
+      setState(() {
+        _onlineSkills = skills;
+        for (final skill in skills) {
+          _enabledSkillNames.add(skill.name);
+        }
+      });
+    } catch (error) {
+      _showSnackBar('线上 Skills 加载失败：$error');
+    }
+  }
+
+  List<GemmaSkill> get _allSkills => [...builtInSkills, ..._onlineSkills];
+
+  List<GemmaSkill> get _selectedSkills => _allSkills
+      .where((skill) => _enabledSkillNames.contains(skill.name))
+      .toList(growable: false);
+
   Future<void> _send() async {
+    if (_liveCallActive) {
+      _showSnackBar('Live 语音通话进行中，请先停止后再手动发送。');
+      return;
+    }
     final rawInput = _inputController.text.trim();
     final imagePaths = _attachedImages.map((image) => image.path).toList();
     final audioAttachments = List<AudioAttachment>.of(_attachedAudios);
@@ -88,7 +150,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _stopRequested = false;
 
     final promptInput = rawInput.isEmpty
-        ? (imagePaths.isNotEmpty ? '请描述这张图片。' : '请识别并总结这段语音内容。')
+        ? _defaultComposerPromptFor(
+            hasImages: imagePaths.isNotEmpty,
+            hasAudios: audioPaths.isNotEmpty,
+          )
         : rawInput;
     final prompt = _enabledModes.contains(_ComposerMode.promptLab)
         ? _template.buildPrompt(promptInput)
@@ -98,6 +163,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       imagePaths.length,
       audioAttachments.length,
     );
+    if (!_downloadStatus.isDownloaded) {
+      _showSnackBar('请先从左侧菜单进入「Models」下载 ${gemma4E2bIt.name}。下载完成后再发送。');
+      return;
+    }
     _inputController.clear();
     setState(() {
       _attachedImages.clear();
@@ -106,6 +175,32 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       if (audioPaths.isEmpty) _enabledModes.remove(_ComposerMode.voice);
     });
 
+    await _runRequest(
+      prompt: prompt,
+      userText: userText,
+      imagePaths: imagePaths,
+      audioAttachments: audioAttachments,
+      systemPrompt: _enabledModes.contains(_ComposerMode.skills)
+          ? buildAgentSkillsSystemPrompt(_selectedSkills)
+          : null,
+      enabledSkillNames: _enabledModes.contains(_ComposerMode.skills)
+          ? _selectedSkills.map((skill) => skill.name).toList()
+          : const [],
+      enabledSkillDetails: _enabledModes.contains(_ComposerMode.skills)
+          ? _selectedSkills.map((skill) => skill.toRuntimeMap()).toList()
+          : const [],
+    );
+  }
+
+  Future<void> _runRequest({
+    required String prompt,
+    required String userText,
+    List<String> imagePaths = const [],
+    List<AudioAttachment> audioAttachments = const [],
+    String? systemPrompt,
+    List<String> enabledSkillNames = const [],
+    List<Map<String, String>> enabledSkillDetails = const [],
+  }) async {
     setState(() {
       _messages.add(
         _ChatMessage(
@@ -126,30 +221,16 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
     _scrollToBottom();
 
-    if (!_downloadStatus.isDownloaded) {
-      _appendAssistantText(
-        '请先从左侧菜单进入「Models」下载 ${gemma4E2bIt.name}。下载完成后我会使用本地模型回答。',
-        done: true,
-      );
-      return;
-    }
-
     try {
       await _runtime.initialize(gemma4E2bIt);
       await for (final token in _runtime.generate(
         GemmaRequest(
           prompt: prompt,
-          systemPrompt: _enabledModes.contains(_ComposerMode.skills)
-              ? agentSkillsSystemPrompt
-              : null,
+          systemPrompt: systemPrompt,
           imagePaths: imagePaths,
-          audioPaths: audioPaths,
-          enabledSkillNames: _enabledModes.contains(_ComposerMode.skills)
-              ? builtInSkills
-                    .where((skill) => skill.selected)
-                    .map((skill) => skill.name)
-                    .toList()
-              : const [],
+          audioPaths: audioAttachments.map((audio) => audio.path).toList(),
+          enabledSkillNames: enabledSkillNames,
+          enabledSkillDetails: enabledSkillDetails,
         ),
       )) {
         if (_stopRequested) break;
@@ -176,10 +257,11 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   void _stopGeneration() {
+    if (_liveCallActive) {
+      unawaited(_stopLiveVoiceCall(showToast: true));
+    }
     if (!_running || _stopRequested) return;
-    _stopRequested = true;
-    _runtime.stop();
-    _finishAssistantMessage(stopped: true);
+    _stopCurrentGeneration();
   }
 
   void _finishAssistantMessage({bool stopped = false}) {
@@ -194,6 +276,45 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       _stopRequested = false;
     });
     _scrollToBottom();
+  }
+
+  void _handleAudioInputEvent(AudioInputEvent event) {
+    if (!mounted) return;
+    if (event.type == 'recording') {
+      if (event.state == 'started') {
+        setState(() => _liveMicLevel = 0);
+      } else if (event.state == 'stopped' || event.state == 'cancelled') {
+        setState(() => _liveMicLevel = 0);
+        if (event.state == 'stopped' &&
+            event.reason == 'maxDuration' &&
+            _recording &&
+            !_liveCallActive) {
+          unawaited(_completeAutoStoppedRecording());
+        }
+      } else if (event.state == 'failed') {
+        setState(() {
+          _liveMicLevel = 0;
+          _recording = false;
+        });
+        _showSnackBar('录音失败，请重试。');
+      }
+      return;
+    }
+    if (event.type != 'level' || !_liveCallActive || !_recording) return;
+    final amplitude = event.amplitude.clamp(0, 1).toDouble();
+    setState(() => _liveMicLevel = amplitude);
+    if (amplitude >= _liveSpeechThreshold) {
+      _liveSpeechDetectedInSegment = true;
+      _liveLastSpeechElapsedMs = event.elapsedMs;
+      return;
+    }
+    if (!_liveSpeechDetectedInSegment) return;
+    final elapsed = Duration(milliseconds: event.elapsedMs);
+    final silentForMs = event.elapsedMs - _liveLastSpeechElapsedMs;
+    if (elapsed >= _liveMinSegmentDuration &&
+        silentForMs >= _liveSilenceHold.inMilliseconds) {
+      _completeLiveSegmentCut();
+    }
   }
 
   void _scrollToBottom() {
@@ -212,23 +333,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     int imageCount,
     int audioCount,
   ) {
-    final badges = <String>[
-      if (imageCount > 0) '图片 × $imageCount',
-      if (audioCount > 0) '语音 × $audioCount',
-      ..._enabledModes
-          .where(
-            (mode) =>
-                mode != _ComposerMode.text &&
-                mode != _ComposerMode.image &&
-                mode != _ComposerMode.voice,
-          )
-          .map((mode) => mode.label),
-    ].join(' · ');
     final text = rawInput.isEmpty
-        ? (imageCount > 0 ? '请描述这张图片。' : '请识别并总结这段语音内容。')
+        ? _defaultComposerPromptFor(
+            hasImages: imageCount > 0,
+            hasAudios: audioCount > 0,
+          )
         : rawInput;
-    if (badges.isEmpty) return text;
-    return '$text\n\n[$badges]';
+    return text;
   }
 
   Future<void> _showImageSourceSheet() async {
@@ -293,6 +404,29 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     });
   }
 
+  Future<void> _completeAutoStoppedRecording() async {
+    if (_autoStoppingRecording || !_recording || _liveCallActive) return;
+    _autoStoppingRecording = true;
+    try {
+      final audio = await _audioInput.stopRecording();
+      if (!mounted) return;
+      setState(() => _recording = false);
+      if (audio == null) return;
+      setState(() {
+        _attachedAudios
+          ..clear()
+          ..add(audio);
+        _enabledModes.add(_ComposerMode.voice);
+      });
+      _showSnackBar('已达到 30 秒上限，录音已自动附加到输入框。');
+    } on PlatformException catch (error) {
+      if (mounted) setState(() => _recording = false);
+      _showSnackBar('录音自动停止失败：${error.message ?? error.code}');
+    } finally {
+      _autoStoppingRecording = false;
+    }
+  }
+
   Future<void> _showAudioSourceSheet() async {
     if (_running) return;
     final action = await showModalBottomSheet<_AudioAction>(
@@ -318,9 +452,15 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             ),
             ListTile(
               leading: const Icon(Icons.phone_in_talk_outlined),
-              title: const Text('Live 语音通话探索'),
-              subtitle: const Text('实时连续听写 + 本地模型文字回复，先记录方案后分阶段接入'),
-              onTap: () => Navigator.pop(context, _AudioAction.liveCallInfo),
+              title: Text(_liveCallActive ? '停止 Live 语音通话' : '开启 Live 语音通话'),
+              subtitle: Text(
+                _liveCallActive
+                    ? (_liveStatusText.isEmpty
+                          ? '停止当前 Live 录音与回复循环'
+                          : _liveStatusText)
+                    : '实时连续录音切段 + 本地模型文字回复（Phase 1）',
+              ),
+              onTap: () => Navigator.pop(context, _AudioAction.liveCallToggle),
             ),
           ],
         ),
@@ -332,17 +472,22 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         await _toggleRecording();
       case _AudioAction.pickFile:
         await _pickAudioFile();
-      case _AudioAction.liveCallInfo:
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Live 语音通话会按“分段实时录音 → 音频理解 → 文字回复”方案继续实现。'),
-          ),
-        );
+      case _AudioAction.liveCallToggle:
+        await _toggleLiveVoiceCall();
     }
   }
 
   Future<void> _pickAudioFile() async {
+    if (Platform.isIOS) {
+      _showSnackBar(
+        'iOS 语音理解当前为稳定性已暂时关闭；本项目会继续验证 Gemma 原生 audio，不用非 Gemma ASR 方案替代验收。',
+      );
+      return;
+    }
+    if (_liveCallActive) {
+      _showSnackBar('Live 语音通话进行中，请先停止 Live 再选择语音文件。');
+      return;
+    }
     try {
       final audio = await _audioInput.pickAudioFile();
       if (audio == null || !mounted) return;
@@ -358,6 +503,16 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _toggleRecording() async {
+    if (Platform.isIOS) {
+      _showSnackBar(
+        'iOS 实时录音当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 会触发 code 13。',
+      );
+      return;
+    }
+    if (_liveCallActive) {
+      _showSnackBar('Live 语音通话进行中，请先停止 Live。');
+      return;
+    }
     try {
       if (!_recording) {
         await _audioInput.startRecording();
@@ -385,6 +540,508 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     }
   }
 
+  Future<void> _toggleLiveVoiceCall() async {
+    if (Platform.isIOS) {
+      _showSnackBar(
+        'iOS Live 语音通话当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 音频链路会触发 code 13。',
+      );
+      return;
+    }
+    if (_liveCallActive) {
+      await _stopLiveVoiceCall(showToast: true);
+      return;
+    }
+    if (_running || _recording) {
+      _showSnackBar('当前正在生成或录音，请先结束当前操作后再开启 Live。');
+      return;
+    }
+    if (!_downloadStatus.isDownloaded) {
+      _showSnackBar('请先下载 ${gemma4E2bIt.name}，再开启 Live 语音通话。');
+      return;
+    }
+    final supported = await _audioInput.isSupported;
+    if (!supported) {
+      _showSnackBar('当前平台暂不支持 Live 语音通话。');
+      return;
+    }
+    _liveStopSignal?.complete();
+    _liveStopSignal = Completer<void>();
+    _liveSegmentCutSignal?.complete();
+    _liveSegmentCutSignal = null;
+    _liveUiTimer?.cancel();
+    setState(() {
+      _liveCallActive = true;
+      _liveCaptureRunning = false;
+      _liveProcessorRunning = false;
+      _liveSegmentProcessing = false;
+      _liveStatusText = '已接通，正在准备麦克风…';
+      _liveAssistantPreview = '';
+      _liveDraftPreview = '';
+      _liveHeardContext = '';
+      _liveElapsed = Duration.zero;
+      _enabledModes.add(_ComposerMode.voice);
+      _attachedAudios.clear();
+    });
+    _livePendingSegments.clear();
+    _liveUiTimer = Timer.periodic(_liveUiTick, (_) {
+      if (!mounted || !_liveCallActive) return;
+      setState(() {
+        _liveElapsed += _liveUiTick;
+      });
+    });
+    _showSnackBar('Live 语音通话已开启：每 4 秒切一段，先语音理解，再返回文字。');
+    unawaited(_runLiveVoiceLoop());
+  }
+
+  Future<void> _showSkillsHubSheet() {
+    return showSkillsHubSheet(
+      context: context,
+      repository: _skillRepository,
+      onlineSkills: _onlineSkills,
+      enabledSkillNames: _enabledSkillNames,
+      skillsModeEnabled: _enabledModes.contains(_ComposerMode.skills),
+      onSkillsModeChanged: (enabled) {
+        if (!mounted) return;
+        setState(() {
+          if (enabled) {
+            _enabledModes.add(_ComposerMode.skills);
+          } else {
+            _enabledModes.remove(_ComposerMode.skills);
+          }
+        });
+      },
+      onOnlineSkillsChanged: (skills) {
+        if (!mounted) return;
+        setState(() => _onlineSkills = skills);
+      },
+      onEnabledSkillNamesChanged: (names) {
+        if (!mounted) return;
+        setState(() {
+          _enabledSkillNames
+            ..clear()
+            ..addAll(names);
+        });
+      },
+      onMessage: _showSnackBar,
+    );
+  }
+
+  void _resetLiveSegmentationTracking() {
+    _liveSpeechDetectedInSegment = false;
+    _liveLastSpeechElapsedMs = 0;
+    _liveSegmentCutSignal?.complete();
+    _liveSegmentCutSignal = Completer<void>();
+  }
+
+  void _completeLiveSegmentCut() {
+    if (_liveSegmentCutSignal == null || _liveSegmentCutSignal!.isCompleted) {
+      return;
+    }
+    _liveSegmentCutSignal!.complete();
+  }
+
+  Future<void> _runLiveVoiceLoop() async {
+    if (_liveCaptureRunning) return;
+    _liveCaptureRunning = true;
+    try {
+      while (mounted && _liveCallActive) {
+        _resetLiveSegmentationTracking();
+        await _audioInput.startRecording();
+        if (!mounted) return;
+        setState(() {
+          _recording = true;
+          _liveStatusText = _liveSegmentProcessing
+              ? '我在持续听，同时整理回复…'
+              : '正在持续聆听…';
+        });
+        await Future.any([
+          Future<void>.delayed(_liveMaxSegmentDuration),
+          _liveSegmentCutSignal?.future ?? Future<void>.value(),
+          _liveStopSignal?.future ?? Future<void>.value(),
+        ]);
+        if (!_liveCallActive) {
+          await _audioInput.cancelRecording();
+          if (mounted) setState(() => _recording = false);
+          break;
+        }
+        final audio = await _audioInput.stopRecording();
+        if (!mounted) return;
+        setState(() {
+          _recording = false;
+        });
+        if (audio == null) {
+          setState(() {
+            _liveStatusText = '这次没有收到有效音频，继续聆听…';
+          });
+          continue;
+        }
+        if (_isLikelySilent(audio)) {
+          setState(() {
+            _liveStatusText = '这次主要是环境声，继续聆听…';
+          });
+          continue;
+        }
+        _livePendingSegments.add(audio);
+        unawaited(_runLiveProcessorLoop());
+      }
+    } on PlatformException catch (error) {
+      _showSnackBar('Live 语音通话失败：${error.message ?? error.code}');
+    } catch (error) {
+      _showSnackBar('Live 语音通话失败：$error');
+    } finally {
+      _liveCaptureRunning = false;
+      if (mounted) {
+        setState(() {
+          _liveCallActive = false;
+          _liveCaptureRunning = false;
+          _liveProcessorRunning = false;
+          _liveSegmentProcessing = false;
+          _recording = false;
+          _liveStatusText = '';
+          _liveDraftPreview = '';
+          _liveHeardContext = '';
+          _liveElapsed = Duration.zero;
+        });
+      }
+      _livePendingSegments.clear();
+      _liveUiTimer?.cancel();
+      _liveUiTimer = null;
+      _liveStopSignal = null;
+    }
+  }
+
+  Future<void> _runLiveProcessorLoop() async {
+    if (_liveProcessorRunning) return;
+    _liveProcessorRunning = true;
+    try {
+      while (mounted && (_liveCallActive || _livePendingSegments.isNotEmpty)) {
+        if (_livePendingSegments.isEmpty) {
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+          continue;
+        }
+        final audio = _livePendingSegments.removeFirst();
+        if (mounted) {
+          setState(() {
+            _liveSegmentProcessing = true;
+            _liveStatusText = _recording ? '我在持续听，同时整理回复…' : '正在理解你刚才的话…';
+          });
+        }
+        final delta = await _runLiveSegmentSafely(audio);
+        if (!mounted) return;
+        if (!_liveCallActive) break;
+        setState(() {
+          _liveSegmentProcessing = false;
+          _liveStatusText = _recording
+              ? '正在持续聆听…'
+              : (delta.isEmpty ? '我在继续听，你可以接着说…' : '我在继续听，你可以接着说…');
+        });
+      }
+    } finally {
+      _liveProcessorRunning = false;
+      if (mounted && !_liveCallActive) {
+        setState(() {
+          _liveSegmentProcessing = false;
+          _liveDraftPreview = '';
+        });
+      }
+    }
+  }
+
+  Future<void> _stopLiveVoiceCall({bool showToast = false}) async {
+    if (!_liveCallActive && !_recording && !_liveSegmentProcessing) return;
+    _liveCallActive = false;
+    _liveStopSignal?.complete();
+    _livePendingSegments.clear();
+    if (_recording) {
+      try {
+        await _audioInput.cancelRecording();
+      } catch (_) {}
+    }
+    if (_running) {
+      _stopCurrentGeneration();
+    }
+    if (mounted) {
+      setState(() {
+        _recording = false;
+        _liveCaptureRunning = false;
+        _liveProcessorRunning = false;
+        _liveSegmentProcessing = false;
+        _liveStatusText = '';
+        _liveDraftPreview = '';
+        _liveHeardContext = '';
+        _liveElapsed = Duration.zero;
+      });
+    }
+    _liveUiTimer?.cancel();
+    _liveUiTimer = null;
+    if (showToast) {
+      _showSnackBar('Live 语音通话已停止。');
+    }
+  }
+
+  Future<String> _runLiveSegment(AudioAttachment audio) async {
+    if (!_downloadStatus.isDownloaded) {
+      return '';
+    }
+    final previousPreview = _liveAssistantPreview;
+    final heard = await _collectRuntimeResponse(
+      GemmaRequest(
+        prompt: _buildLiveUnderstandingPrompt(),
+        audioPaths: [audio.path],
+      ),
+      onToken: (partial) {
+        if (!mounted) return;
+        setState(() {
+          _liveStatusText = '正在听懂你刚才说的话…';
+          _liveDraftPreview = partial;
+        });
+      },
+    );
+    final cleanedHeard = _sanitizeLiveDelta(heard);
+    if (cleanedHeard.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _liveDraftPreview = '';
+        });
+      }
+      return '';
+    }
+
+    _liveHeardContext = _appendLiveContext(
+      _liveHeardContext,
+      cleanedHeard,
+      900,
+    );
+    final reply = await _collectRuntimeResponse(
+      GemmaRequest(prompt: _buildLiveReplyPrompt(cleanedHeard)),
+      onToken: (partial) {
+        if (!mounted) return;
+        setState(() {
+          _liveStatusText = '我在根据你刚才的话持续回应…';
+          _liveDraftPreview = _composeLivePreview(previousPreview, partial);
+        });
+      },
+    );
+    final delta = _sanitizeLiveDelta(reply);
+    if (mounted) {
+      setState(() {
+        _liveAssistantPreview = delta.isEmpty
+            ? previousPreview
+            : _mergeLiveAssistantPreview(previousPreview, delta);
+        _liveDraftPreview = '';
+      });
+    }
+    return delta;
+  }
+
+  Future<String> _runLiveSegmentSafely(AudioAttachment audio) async {
+    try {
+      return await _runLiveSegment(audio);
+    } on RuntimeUnavailableException catch (error) {
+      if (!mounted) return '';
+      setState(() {
+        _liveSegmentProcessing = false;
+        _liveDraftPreview = '';
+        _liveStatusText = 'Live 语音理解暂不可用，已停止。';
+      });
+      _showSnackBar('Live 语音理解失败：${error.message}');
+      await _stopLiveVoiceCall();
+      return '';
+    } on PlatformException catch (error) {
+      if (!mounted) return '';
+      setState(() {
+        _liveSegmentProcessing = false;
+        _liveDraftPreview = '';
+        _liveStatusText = _recording
+            ? '上一段语音处理失败，我还在继续听…'
+            : '上一段语音处理失败，请继续说或稍后重试。';
+      });
+      _showSnackBar('Live 语音片段处理失败：${error.message ?? error.code}');
+      return '';
+    } catch (error) {
+      if (!mounted) return '';
+      setState(() {
+        _liveSegmentProcessing = false;
+        _liveDraftPreview = '';
+        _liveStatusText = _recording
+            ? '上一段语音处理失败，我还在继续听…'
+            : '上一段语音处理失败，请继续说或稍后重试。';
+      });
+      _showSnackBar('Live 语音片段处理失败：$error');
+      return '';
+    }
+  }
+
+  Future<String> _collectRuntimeResponse(
+    GemmaRequest request, {
+    void Function(String partial)? onToken,
+  }) async {
+    _running = true;
+    _stopRequested = false;
+    final buffer = StringBuffer();
+    try {
+      await _runtime.initialize(gemma4E2bIt);
+      await for (final token in _runtime.generate(request)) {
+        if (_stopRequested || !_liveCallActive) break;
+        buffer.write(token);
+        onToken?.call(buffer.toString());
+      }
+    } finally {
+      _running = false;
+      _stopRequested = false;
+    }
+    return buffer.toString();
+  }
+
+  String _buildLiveUnderstandingPrompt() {
+    return 'Extract only the useful information from this audio clip.\n'
+        'Requirements:\n'
+        '1. Recover the user facts, questions, requests, goals, times, places, numbers, and key terms as accurately as possible.\n'
+        '2. If part of the audio is unclear, explicitly say which part is uncertain.\n'
+        '3. Do not comfort, do not answer, do not give suggestions, and do not say that you are listening. Only perform understanding.\n'
+        '4. Output 1 to 3 concise sentences in $_preferredReplyLanguageName.';
+  }
+
+  String _buildLiveReplyPrompt(String heard) {
+    final custom = _inputController.text.trim();
+    final base = custom.isEmpty
+        ? 'You are in a continuous live voice conversation with the user. Reply naturally based on what the user just said.'
+        : custom;
+    final previousReply = _liveAssistantPreview.trim();
+    final previousContext = previousReply.isEmpty
+        ? '（暂无）'
+        : _tailText(previousReply, 220);
+    final heardContext = _liveHeardContext.trim().isEmpty
+        ? heard
+        : _tailText(_liveHeardContext, 400);
+    return '$base\n\n'
+        'This is a continuous phone-style conversation.\n'
+        'Confirmed user context so far: $heardContext\n'
+        'Newest understood content: $heard\n'
+        'Your previous reply content: $previousContext\n\n'
+        'Requirements:\n'
+        '1. Respond to the newest understood content, not with generic emotional validation.\n'
+        '2. If the user asked a question, answer it directly. If the user described a situation, provide a concrete judgment, summary, or next action.\n'
+        '3. If part of the content is unclear, say what you understood, what remains unclear, and ask one concrete clarification question.\n'
+        '4. Output only the new reply you want to say now. Do not repeat your previous reply.\n'
+        '5. Keep the response short, direct, specific, and in $_preferredReplyLanguageName.\n'
+        '6. If there is no new valid content, return an empty string.';
+  }
+
+  bool _isLikelySilent(AudioAttachment audio) {
+    if (audio.waveform.isEmpty) return false;
+    final average =
+        audio.waveform.reduce((a, b) => a + b) / audio.waveform.length;
+    return average < 0.12;
+  }
+
+  void _stopCurrentGeneration() {
+    if (!_running || _stopRequested) return;
+    _stopRequested = true;
+    _runtime.stop();
+    if (!_liveCallActive) {
+      _finishAssistantMessage(stopped: true);
+    }
+  }
+
+  String _sanitizeLiveDelta(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return '';
+    if (trimmed == '""' || trimmed == "''") return '';
+    return trimmed;
+  }
+
+  String _mergeLiveAssistantPreview(String previous, String delta) {
+    if (previous.isEmpty) return delta;
+    if (previous.endsWith(delta)) return previous;
+    final normalizedPrevious = previous.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final normalizedDelta = delta.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalizedPrevious.endsWith(normalizedDelta)) return previous;
+    return '$previous\n$delta';
+  }
+
+  String _appendLiveContext(String previous, String delta, int maxChars) {
+    final merged = previous.trim().isEmpty ? delta.trim() : '$previous\n$delta';
+    return _tailText(merged, maxChars);
+  }
+
+  String _composeLivePreview(String previous, String currentSegment) {
+    final trimmed = currentSegment.trimLeft();
+    if (trimmed.isEmpty) return previous;
+    if (previous.isEmpty) return trimmed;
+    return '$previous\n$trimmed';
+  }
+
+  String _tailText(String text, int maxChars) {
+    if (text.length <= maxChars) return text;
+    return text.substring(text.length - maxChars);
+  }
+
+  String get _preferredReplyLanguageName {
+    final code = WidgetsBinding.instance.platformDispatcher.locale.languageCode
+        .toLowerCase();
+    switch (code) {
+      case 'zh':
+        return 'Simplified Chinese';
+      case 'ja':
+        return 'Japanese';
+      case 'ko':
+        return 'Korean';
+      case 'fr':
+        return 'French';
+      case 'de':
+        return 'German';
+      case 'es':
+        return 'Spanish';
+      case 'pt':
+        return 'Portuguese';
+      case 'ru':
+        return 'Russian';
+      case 'ar':
+        return 'Arabic';
+      case 'hi':
+        return 'Hindi';
+      default:
+        return 'English';
+    }
+  }
+
+  bool get _prefersChineseUi =>
+      WidgetsBinding.instance.platformDispatcher.locale.languageCode
+          .toLowerCase() ==
+      'zh';
+
+  String get _defaultImageComposerPrompt =>
+      _prefersChineseUi ? '请描述这张图片。' : 'Describe this image.';
+
+  String get _defaultAudioComposerPrompt => _prefersChineseUi
+      ? '请识别并总结这段语音内容。'
+      : 'Listen to this audio and summarize it.';
+
+  String get _defaultMediaComposerPrompt => _prefersChineseUi
+      ? '请结合图片和语音内容，识别关键信息并回答。'
+      : 'Use both the image and audio to identify the key information and answer.';
+
+  String _defaultComposerPromptFor({
+    required bool hasImages,
+    required bool hasAudios,
+  }) {
+    if (hasImages && hasAudios) return _defaultMediaComposerPrompt;
+    if (hasImages) return _defaultImageComposerPrompt;
+    return _defaultAudioComposerPrompt;
+  }
+
+  String get _liveElapsedLabel {
+    final totalSeconds = _liveElapsed.inSeconds.clamp(0, 60 * 60 - 1);
+    final minutes = totalSeconds ~/ 60;
+    final seconds = totalSeconds % 60;
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  String get _liveCurrentPreview => _liveDraftPreview.trim().isNotEmpty
+      ? _liveDraftPreview
+      : _liveAssistantPreview;
+
   void _showSnackBar(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(
@@ -400,6 +1057,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     }
     if (mode == _ComposerMode.voice) {
       _showAudioSourceSheet();
+      return;
+    }
+    if (mode == _ComposerMode.skills) {
+      _showSkillsHubSheet();
       return;
     }
     setState(() {
@@ -431,40 +1092,60 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         onDelete: () => _downloadController.delete(gemma4E2bIt),
         onRefresh: () => _downloadController.refreshStatus(gemma4E2bIt),
       ),
-      body: Column(
+      body: Stack(
         children: [
-          _CapabilityRail(
-            enabledModes: _enabledModes,
-            template: _template,
-            onToggleMode: _toggleMode,
-            onTemplateChanged: (template) =>
-                setState(() => _template = template),
+          Column(
+            children: [
+              _CapabilityRail(
+                enabledModes: _enabledModes,
+                template: _template,
+                onToggleMode: _toggleMode,
+                onTemplateChanged: (template) =>
+                    setState(() => _template = template),
+              ),
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+                  child: _ChatTranscript(
+                    controller: _scrollController,
+                    messages: _messages,
+                  ),
+                ),
+              ),
+              _Composer(
+                controller: _inputController,
+                focusNode: _inputFocusNode,
+                enabledModes: _enabledModes,
+                attachedImages: _attachedImages,
+                attachedAudios: _attachedAudios,
+                recording: _recording,
+                liveCallActive: _liveCallActive,
+                liveElapsedLabel: _liveElapsedLabel,
+                liveMicLevel: _liveMicLevel,
+                liveStatusText: _liveStatusText,
+                liveAssistantPreview: _liveCurrentPreview,
+                running: _running || _liveCallActive,
+                onToggleMode: _toggleMode,
+                onRemoveImage: _removeAttachedImage,
+                onRemoveAudio: _removeAttachedAudio,
+                onPlayAudio: (audio) => _audioInput.play(audio.path),
+                onSend: _send,
+                onStop: _stopGeneration,
+              ),
+            ],
           ),
-          Expanded(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
-              child: _ChatTranscript(
-                controller: _scrollController,
-                messages: _messages,
+          if (_liveCallActive)
+            Positioned.fill(
+              child: _LiveCallOverlay(
+                elapsedLabel: _liveElapsedLabel,
+                micLevel: _liveMicLevel,
+                statusText: _liveStatusText,
+                assistantPreview: _liveCurrentPreview,
+                processing: _liveSegmentProcessing,
+                onStop: _stopGeneration,
               ),
             ),
-          ),
-          _Composer(
-            controller: _inputController,
-            focusNode: _inputFocusNode,
-            enabledModes: _enabledModes,
-            attachedImages: _attachedImages,
-            attachedAudios: _attachedAudios,
-            recording: _recording,
-            running: _running,
-            onToggleMode: _toggleMode,
-            onRemoveImage: _removeAttachedImage,
-            onRemoveAudio: _removeAttachedAudio,
-            onPlayAudio: (audio) => _audioInput.play(audio.path),
-            onSend: _send,
-            onStop: _stopGeneration,
-          ),
         ],
       ),
     );
@@ -1026,6 +1707,11 @@ class _Composer extends StatelessWidget {
     required this.attachedImages,
     required this.attachedAudios,
     required this.recording,
+    required this.liveCallActive,
+    required this.liveElapsedLabel,
+    required this.liveMicLevel,
+    required this.liveStatusText,
+    required this.liveAssistantPreview,
     required this.running,
     required this.onToggleMode,
     required this.onRemoveImage,
@@ -1041,6 +1727,11 @@ class _Composer extends StatelessWidget {
   final List<XFile> attachedImages;
   final List<AudioAttachment> attachedAudios;
   final bool recording;
+  final bool liveCallActive;
+  final String liveElapsedLabel;
+  final double liveMicLevel;
+  final String liveStatusText;
+  final String liveAssistantPreview;
   final bool running;
   final ValueChanged<_ComposerMode> onToggleMode;
   final ValueChanged<XFile> onRemoveImage;
@@ -1079,6 +1770,15 @@ class _Composer extends StatelessWidget {
                     audios: attachedAudios,
                     onRemoveAudio: onRemoveAudio,
                     onPlayAudio: onPlayAudio,
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                if (liveCallActive) ...[
+                  _LiveVoiceBanner(
+                    elapsedLabel: liveElapsedLabel,
+                    micLevel: liveMicLevel,
+                    statusText: liveStatusText,
+                    assistantPreview: liveAssistantPreview,
                   ),
                   const SizedBox(height: 8),
                 ],
@@ -1294,6 +1994,229 @@ class _RecordingBanner extends StatelessWidget {
   }
 }
 
+class _LiveVoiceBanner extends StatelessWidget {
+  const _LiveVoiceBanner({
+    required this.elapsedLabel,
+    required this.micLevel,
+    required this.statusText,
+    required this.assistantPreview,
+  });
+
+  final String elapsedLabel;
+  final double micLevel;
+  final String statusText;
+  final String assistantPreview;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.phone_in_talk_outlined, color: colorScheme.primary),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  statusText.isEmpty ? 'Live 语音通话进行中…' : statusText,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: colorScheme.onPrimaryContainer,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                elapsedLabel,
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: colorScheme.onPrimaryContainer,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          if (assistantPreview.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              assistantPreview,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: colorScheme.onPrimaryContainer.withValues(alpha: 0.9),
+                height: 1.35,
+              ),
+            ),
+          ],
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: micLevel.clamp(0, 1),
+              minHeight: 5,
+              backgroundColor: colorScheme.onPrimaryContainer.withValues(
+                alpha: 0.12,
+              ),
+              valueColor: AlwaysStoppedAnimation<Color>(colorScheme.primary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LiveCallOverlay extends StatelessWidget {
+  const _LiveCallOverlay({
+    required this.elapsedLabel,
+    required this.micLevel,
+    required this.statusText,
+    required this.assistantPreview,
+    required this.processing,
+    required this.onStop,
+  });
+
+  final String elapsedLabel;
+  final double micLevel;
+  final String statusText;
+  final String assistantPreview;
+  final bool processing;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final titleStyle = Theme.of(context).textTheme.headlineSmall;
+    final bodyStyle = Theme.of(context).textTheme.bodyLarge;
+    return Material(
+      color: Colors.black.withValues(alpha: 0.72),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: onStop,
+                    icon: const Icon(Icons.close_rounded),
+                    label: const Text('结束通话'),
+                  ),
+                  const Spacer(),
+                  Text(
+                    elapsedLabel,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              Container(
+                width: 112,
+                height: 112,
+                decoration: BoxDecoration(
+                  color: processing
+                      ? colorScheme.tertiaryContainer
+                      : colorScheme.primaryContainer,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  processing
+                      ? Icons.graphic_eq_rounded
+                      : Icons.mic_none_rounded,
+                  size: 54,
+                  color: processing
+                      ? colorScheme.onTertiaryContainer
+                      : colorScheme.onPrimaryContainer,
+                ),
+              ),
+              const SizedBox(height: 18),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: SizedBox(
+                  width: 220,
+                  child: LinearProgressIndicator(
+                    value: micLevel.clamp(0, 1),
+                    minHeight: 8,
+                    backgroundColor: Colors.white.withValues(alpha: 0.12),
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      processing ? colorScheme.tertiary : colorScheme.primary,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                '正在与 Gemma 持续语音对话',
+                style: titleStyle?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w800,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                statusText.isEmpty ? '我在持续听你说话…' : statusText,
+                style: bodyStyle?.copyWith(
+                  color: Colors.white.withValues(alpha: 0.92),
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 28),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.12),
+                    ),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Text(
+                      assistantPreview.trim().isEmpty
+                          ? 'AI 的连续回复会显示在这里。你可以正常持续说话，不需要感知后台切段。'
+                          : assistantPreview,
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Colors.white,
+                        height: 1.5,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: onStop,
+                icon: const Icon(Icons.call_end_rounded),
+                label: const Text('挂断'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: colorScheme.error,
+                  foregroundColor: colorScheme.onError,
+                  minimumSize: const Size(double.infinity, 56),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ComposerIcon extends StatelessWidget {
   const _ComposerIcon({
     required this.mode,
@@ -1343,7 +2266,7 @@ class _ModelStatusChip extends StatelessWidget {
   }
 }
 
-enum _AudioAction { record, pickFile, liveCallInfo }
+enum _AudioAction { record, pickFile, liveCallToggle }
 
 enum _ComposerMode {
   text('文字', Icons.chat_bubble_outline),

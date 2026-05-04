@@ -5,6 +5,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate {
   private let modelDownloadManager = IOSModelDownloadManager()
   private let gemmaRuntime = IOSGemmaRuntime()
+  private let audioInput = IOSAudioInput()
   private var didRegisterFlutterChannels = false
 
   override func application(
@@ -23,6 +24,7 @@ import UIKit
     didRegisterFlutterChannels = true
     modelDownloadManager.register(with: messenger)
     gemmaRuntime.register(with: messenger)
+    audioInput.register(with: messenger)
   }
 
   override func application(

@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io' show File, Platform;
-import 'dart:typed_data';
+import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/flutter_gemma.dart' as fg;
@@ -28,16 +28,22 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   StreamSubscription<dynamic>? _eventSubscription;
   GemmaModelConfig? _config;
   bool _initialized = false;
+  bool _androidSupportImage = false;
+  bool _androidSupportAudio = false;
+  bool _androidSupportSkills = false;
+  String _androidAccelerator = GemmaAccelerator.cpu.id;
+  List<String> _androidEnabledSkillNames = const [];
   fg.InferenceModel? _flutterGemmaModel;
   fg.InferenceChat? _flutterGemmaChat;
 
   @override
   Future<void> initialize(GemmaModelConfig config) async {
+    final previousConfig = _config;
     _config = config;
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
-    final modelPath = await _resolveModelPath(config);
     if (Platform.isIOS) {
+      final modelPath = await _resolveModelPath(config);
       await _initializeFlutterGemma(config, modelPath);
       _initialized = true;
       return;
@@ -47,6 +53,12 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       _handleRuntimeEvent,
       onError: (Object error) => _activeGenerationController?.addError(error),
     );
+
+    if (_initialized &&
+        previousConfig?.modelId == config.modelId &&
+        previousConfig?.commitHash == config.commitHash) {
+      return;
+    }
 
     // Keep Android initial runtime text-only. Google Gallery enables image/audio
     // per task/session; enabling multimodal backends globally made Android stay
@@ -63,6 +75,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     GemmaModelConfig config, {
     required bool supportImage,
     required bool supportAudio,
+    bool supportSkills = false,
+    String? systemPrompt,
+    List<String> enabledSkillNames = const [],
+    List<Map<String, String>> enabledSkillDetails = const [],
+    String? acceleratorOverride,
   }) async {
     final modelPath = await _resolveModelPath(config);
     await _methodChannel.invokeMethod<void>('initialize', {
@@ -73,8 +90,29 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       'maxTokens': 1024,
       'supportImage': supportImage,
       'supportAudio': supportAudio,
-      'accelerator': supportImage ? 'gpu' : 'cpu',
+      'supportSkills': supportSkills,
+      'systemPrompt': systemPrompt,
+      'enabledSkillNames': enabledSkillNames,
+      'enabledSkills': enabledSkillDetails,
+      'accelerator':
+          acceleratorOverride ??
+          _selectAndroidAccelerator(
+            config,
+            supportImage: supportImage,
+            supportAudio: supportAudio,
+          ),
     });
+    _androidSupportImage = supportImage;
+    _androidSupportAudio = supportAudio;
+    _androidSupportSkills = supportSkills;
+    _androidEnabledSkillNames = List<String>.of(enabledSkillNames);
+    _androidAccelerator =
+        acceleratorOverride ??
+        _selectAndroidAccelerator(
+          config,
+          supportImage: supportImage,
+          supportAudio: supportAudio,
+        );
   }
 
   Future<void> _initializeFlutterGemma(
@@ -143,36 +181,106 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       return;
     }
 
+    yield* _generateWithAndroidRuntime(request);
+  }
+
+  Stream<String> _generateWithAndroidRuntime(GemmaRequest request) async* {
     final config = _config ?? gemma4E2bIt;
     final needsImageRuntime = request.imagePaths.isNotEmpty;
     final needsAudioRuntime = request.audioPaths.isNotEmpty;
-    try {
-      await _initializeAndroidRuntime(
-        config,
-        supportImage: needsImageRuntime,
-        supportAudio: needsAudioRuntime,
-      );
-    } on PlatformException catch (error) {
-      if (!needsImageRuntime && !needsAudioRuntime) rethrow;
-      await _initializeAndroidRuntime(
-        config,
-        supportImage: false,
-        supportAudio: false,
-      );
-      throw RuntimeUnavailableException(
-        needsAudioRuntime
-            ? '当前设备 audio backend 初始化失败，已回退到文字模式。音频理解需要 LiteRT-LM CPU audio backend。原始错误：${error.message ?? error.code}'
-            : '当前设备 GPU/vision 初始化失败，已回退到文字模式。图片理解需要支持 LiteRT-LM GPU vision 的设备。原始错误：${error.message ?? error.code}',
-      );
+    final needsSkillsRuntime =
+        request.systemPrompt?.trim().isNotEmpty == true ||
+        request.enabledSkillNames.isNotEmpty;
+    final accelerators = _candidateAndroidAccelerators(
+      config,
+      supportImage: needsImageRuntime,
+      supportAudio: needsAudioRuntime,
+    );
+    RuntimeUnavailableException? lastRuntimeError;
+
+    for (var index = 0; index < accelerators.length; index += 1) {
+      final accelerator = accelerators[index];
+      final isLastAttempt = index == accelerators.length - 1;
+      try {
+        final shouldReuseExistingRuntime =
+            !needsImageRuntime &&
+            !needsAudioRuntime &&
+            !needsSkillsRuntime &&
+            _androidRuntimeMatches(
+              supportImage: false,
+              supportAudio: false,
+              supportSkills: false,
+              enabledSkillNames: const [],
+              accelerator: accelerator,
+            );
+        if (!shouldReuseExistingRuntime) {
+          await _initializeAndroidRuntime(
+            config,
+            supportImage: needsImageRuntime,
+            supportAudio: needsAudioRuntime,
+            supportSkills: needsSkillsRuntime,
+            systemPrompt: needsSkillsRuntime ? request.systemPrompt : null,
+            enabledSkillNames: needsSkillsRuntime
+                ? request.enabledSkillNames
+                : const [],
+            enabledSkillDetails: needsSkillsRuntime
+                ? request.enabledSkillDetails
+                : const [],
+            acceleratorOverride: accelerator,
+          );
+        }
+      } on PlatformException catch (error) {
+        if (!needsImageRuntime && !needsAudioRuntime) rethrow;
+        if (!isLastAttempt) continue;
+        await _restoreAndroidTextRuntime(config);
+        throw RuntimeUnavailableException(
+          needsAudioRuntime
+              ? '当前设备 audio runtime 初始化失败。已尝试 ${accelerators.join(' / ')} backend，仍无法启用音频理解；已回退到文字模式。原始错误：${error.message ?? error.code}'
+              : '当前设备 GPU/vision 初始化失败，已回退到文字模式。图片理解需要支持 LiteRT-LM GPU vision 的设备。原始错误：${error.message ?? error.code}',
+        );
+      }
+
+      try {
+        yield* _invokeAndroidGenerate(
+          request,
+          includeSystemContext: !needsSkillsRuntime,
+        );
+        return;
+      } on RuntimeUnavailableException catch (error) {
+        lastRuntimeError = error;
+        final shouldRetryAudio =
+            needsAudioRuntime &&
+            !needsImageRuntime &&
+            !isLastAttempt &&
+            _isCompiledModelInvocationError(error.message);
+        if (!shouldRetryAudio) {
+          await _restoreAndroidTextRuntime(config);
+          rethrow;
+        }
+        continue;
+      }
     }
 
+    await _restoreAndroidTextRuntime(config);
+    throw lastRuntimeError ??
+        const RuntimeUnavailableException('Android 音频/多模态推理失败。');
+  }
+
+  Stream<String> _invokeAndroidGenerate(
+    GemmaRequest request, {
+    required bool includeSystemContext,
+  }) async* {
     final generationController = StreamController<String>();
+    final prompt = _androidPromptForRequest(
+      request,
+      includeSystemContext: includeSystemContext,
+    );
     await _activeGenerationController?.close();
     _activeGenerationController = generationController;
     try {
       try {
         await _methodChannel.invokeMethod<void>('generate', {
-          'prompt': request.prompt,
+          'prompt': prompt,
           'systemPrompt': request.systemPrompt,
           'imagePaths': request.imagePaths,
           'audioPaths': request.audioPaths,
@@ -211,25 +319,22 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   Stream<String> _generateWithFlutterGemma(GemmaRequest request) async* {
+    if (request.audioPaths.isNotEmpty) {
+      throw const RuntimeUnavailableException(
+        'iOS 当前的 flutter_gemma + Gemma-4-E2B-it 音频理解链路会触发 Failed to start streaming (code: 13)。为保证稳定性，iOS 端暂时关闭语音输入 / Live 语音通话；本项目不会用非 Gemma ASR 方案替代 Gemma 原生 audio 能力验收。',
+      );
+    }
     final model = _flutterGemmaModel;
     if (model == null) {
       throw const RuntimeUnavailableException('iOS flutter_gemma model 尚未初始化。');
     }
-    var prompt = request.prompt;
-    if (request.systemPrompt != null &&
-        request.systemPrompt!.trim().isNotEmpty) {
-      prompt = '[System: ${request.systemPrompt}]\n\n$prompt';
-    }
-    if (request.enabledSkillNames.isNotEmpty) {
-      prompt =
-          'Enabled skills: ${request.enabledSkillNames.join(', ')}\n\n$prompt';
-    }
+    final prompt = _contextualPrompt(request);
 
     // iOS .litertlm FFI multimodal sessions are not reliably reusable. Rebuild
-    // per image/audio request so text/image/audio modalities stay isolated.
-    final isAudioRequest = request.audioPaths.isNotEmpty;
+    // per image request so text/image modalities stay isolated. Audio is
+    // currently disabled on iOS for stability with Gemma-4-E2B-it.
     final isImageRequest = request.imagePaths.isNotEmpty;
-    if (isImageRequest || isAudioRequest) {
+    if (isImageRequest) {
       final config = _config ?? gemma4E2bIt;
       final modelPath = await _resolveModelPath(config);
       await _initializeFlutterGemma(
@@ -237,7 +342,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         modelPath,
         forceReload: true,
         supportImage: isImageRequest,
-        supportAudio: isAudioRequest,
+        supportAudio: false,
       );
     } else {
       await _flutterGemmaChat?.session.close();
@@ -254,29 +359,14 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       topK: _config?.topK ?? gemma4E2bIt.topK,
       topP: _config?.topP ?? gemma4E2bIt.topP,
       supportImage: _config?.supportImage ?? gemma4E2bIt.supportImage,
-      supportAudio:
-          isAudioRequest && (_config?.supportAudio ?? gemma4E2bIt.supportAudio),
+      supportAudio: false,
       modelType: fg.ModelType.gemma4,
       isThinking: false,
     );
     _flutterGemmaChat = chat;
 
     try {
-      if (request.audioPaths.isNotEmpty) {
-        final firstAudio = File(request.audioPaths.first);
-        if (!await firstAudio.exists()) {
-          throw RuntimeUnavailableException(
-            '音频文件不存在：${request.audioPaths.first}',
-          );
-        }
-        await chat.addQueryChunk(
-          fg.Message.withAudio(
-            text: _audioPrompt(prompt),
-            audioBytes: _extractMono16BitPcm(await firstAudio.readAsBytes()),
-            isUser: true,
-          ),
-        );
-      } else if (request.imagePaths.isNotEmpty) {
+      if (request.imagePaths.isNotEmpty) {
         final firstImage = File(request.imagePaths.first);
         if (!await firstImage.exists()) {
           throw RuntimeUnavailableException(
@@ -312,113 +402,179 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
   String _visionPrompt(String prompt) {
     final trimmed = prompt.trim();
-    if (trimmed.isEmpty || trimmed == '请描述这张图片。') {
-      return '请直接观察并描述这张图片中的主要对象、场景、文字和可见细节。不要回答无关内容。';
+    if (_isDefaultVisionPrompt(trimmed)) {
+      return 'Look at the image and describe the main objects, scene, visible text, and important details. Respond in $_preferredReplyLanguageName.';
     }
-    return '请根据图片内容回答：$trimmed';
+    return 'Use the image as primary evidence and answer the user request. Respond in $_preferredReplyLanguageName. User request: $trimmed';
   }
 
   String _audioPrompt(String prompt) {
     final trimmed = prompt.trim();
-    if (trimmed.isEmpty || trimmed == '请听这段声音并说明内容。') {
-      return '请直接听这段音频，说明你听到的主要内容、声音类型、语言或环境线索。不要回答无关内容。';
+    if (_isDefaultAudioPrompt(trimmed)) {
+      return 'Listen to the attached audio clip and accurately identify the useful speech, sounds, requests, numbers, names, and key details. Then summarize or answer in $_preferredReplyLanguageName.';
     }
-    return '请根据音频内容回答：$trimmed';
+    return 'Use the attached audio clip as primary evidence and answer the user request. If the audio is unclear, say exactly what is uncertain. Respond in $_preferredReplyLanguageName. User request: $trimmed';
   }
 
-  Uint8List _extractMono16BitPcm(Uint8List wavBytes) {
-    if (wavBytes.length < 44 ||
-        String.fromCharCodes(wavBytes.sublist(0, 4)) != 'RIFF') {
-      throw const RuntimeUnavailableException(
-        'Gemma 音频理解需要 16k mono PCM WAV；请使用应用内录音或选择 WAV 文件。',
-      );
-    }
-    final data = ByteData.sublistView(wavBytes);
-    if (String.fromCharCodes(wavBytes.sublist(8, 12)) != 'WAVE') {
-      throw const RuntimeUnavailableException('无效 WAV 文件。');
-    }
-    var offset = 12;
-    var channels = 1;
-    var sampleRate = 16000;
-    var bitsPerSample = 16;
-    var dataOffset = -1;
-    var dataSize = 0;
-    while (offset + 8 <= wavBytes.length) {
-      final chunkId = String.fromCharCodes(
-        wavBytes.sublist(offset, offset + 4),
-      );
-      final chunkSize = data.getUint32(offset + 4, Endian.little);
-      final chunkDataOffset = offset + 8;
-      if (chunkDataOffset + chunkSize > wavBytes.length) break;
-      if (chunkId == 'fmt ') {
-        final audioFormat = data.getUint16(chunkDataOffset, Endian.little);
-        if (audioFormat != 1) {
-          throw const RuntimeUnavailableException('Gemma 音频只支持 PCM WAV。');
-        }
-        channels = data.getUint16(chunkDataOffset + 2, Endian.little);
-        sampleRate = data.getUint32(chunkDataOffset + 4, Endian.little);
-        bitsPerSample = data.getUint16(chunkDataOffset + 14, Endian.little);
-      } else if (chunkId == 'data') {
-        dataOffset = chunkDataOffset;
-        dataSize = chunkSize;
-        break;
-      }
-      offset = chunkDataOffset + chunkSize + (chunkSize.isOdd ? 1 : 0);
-    }
-    if (dataOffset < 0 || dataSize <= 0) {
-      throw const RuntimeUnavailableException('WAV data chunk 不存在。');
-    }
-    final samples = <int>[];
-    if (bitsPerSample == 16) {
-      for (var i = dataOffset; i + 1 < dataOffset + dataSize; i += 2) {
-        samples.add(data.getInt16(i, Endian.little));
-      }
-    } else if (bitsPerSample == 8) {
-      for (var i = dataOffset; i < dataOffset + dataSize; i += 1) {
-        samples.add(((wavBytes[i] & 0xFF) - 128) * 256);
-      }
-    } else {
-      throw const RuntimeUnavailableException('Gemma 音频只支持 8/16-bit PCM WAV。');
-    }
-    final mono = <int>[];
-    if (channels <= 1) {
-      mono.addAll(samples);
-    } else {
-      for (var i = 0; i + channels <= samples.length; i += channels) {
-        var sum = 0;
-        for (var c = 0; c < channels; c += 1) {
-          sum += samples[i + c];
-        }
-        mono.add((sum / channels).round());
-      }
-    }
-    final normalized = sampleRate == 16000
-        ? mono
-        : _resampleMono(mono, sampleRate, 16000);
-    final maxSamples = 16000 * 30;
-    final trimmed = normalized.length > maxSamples
-        ? normalized.sublist(0, maxSamples)
-        : normalized;
-    final out = ByteData(trimmed.length * 2);
-    for (var i = 0; i < trimmed.length; i += 1) {
-      out.setInt16(i * 2, trimmed[i].clamp(-32768, 32767), Endian.little);
-    }
-    return out.buffer.asUint8List();
+  String _imageAndAudioPrompt(String prompt) {
+    final trimmed = prompt.trim();
+    final request = trimmed.isEmpty
+        ? 'Describe and summarize the attached media.'
+        : trimmed;
+    return 'Use the attached image and audio clip as primary evidence. First understand the visual and audio content, then answer the user request. If any part is unclear, say what is uncertain. Respond in $_preferredReplyLanguageName. User request: $request';
   }
 
-  List<int> _resampleMono(List<int> input, int originalRate, int targetRate) {
-    if (originalRate <= 0 || originalRate == targetRate || input.isEmpty) {
-      return input;
+  String _androidPromptForRequest(
+    GemmaRequest request, {
+    required bool includeSystemContext,
+  }) {
+    final prompt = includeSystemContext
+        ? _contextualPrompt(request)
+        : request.prompt.trim();
+    final hasImage = request.imagePaths.isNotEmpty;
+    final hasAudio = request.audioPaths.isNotEmpty;
+    if (hasImage && hasAudio) return _imageAndAudioPrompt(prompt);
+    if (hasImage) return _visionPrompt(prompt);
+    if (hasAudio) return _audioPrompt(prompt);
+    return prompt;
+  }
+
+  String _contextualPrompt(GemmaRequest request) {
+    final prompt = request.prompt.trim();
+    final prefix = StringBuffer();
+    final systemPrompt = request.systemPrompt?.trim();
+    if (systemPrompt != null && systemPrompt.isNotEmpty) {
+      prefix.writeln('System instructions:');
+      prefix.writeln(systemPrompt);
+      prefix.writeln();
     }
-    final ratio = targetRate / originalRate;
-    final outputLength = (input.length * ratio).round().clamp(1, 1 << 31);
-    return List<int>.generate(outputLength, (index) {
-      final pos = index / ratio;
-      final left = pos.floor().clamp(0, input.length - 1);
-      final right = (left + 1).clamp(0, input.length - 1);
-      final fraction = pos - left;
-      return (input[left] * (1 - fraction) + input[right] * fraction).round();
-    });
+    if (request.enabledSkillNames.isNotEmpty) {
+      prefix.writeln('Enabled skills: ${request.enabledSkillNames.join(', ')}');
+      prefix.writeln();
+    }
+    final context = prefix.toString().trim();
+    if (context.isEmpty) return prompt;
+    if (prompt.isEmpty) return context;
+    return '$context\n\nUser request:\n$prompt';
+  }
+
+  bool _isDefaultVisionPrompt(String prompt) {
+    return prompt.isEmpty ||
+        prompt == '请描述这张图片。' ||
+        prompt == 'Describe this image.';
+  }
+
+  bool _isDefaultAudioPrompt(String prompt) {
+    return prompt.isEmpty ||
+        prompt == '请识别并总结这段语音内容。' ||
+        prompt == 'Listen to this audio and summarize it.';
+  }
+
+  String get _preferredReplyLanguageName {
+    final code = PlatformDispatcher.instance.locale.languageCode.toLowerCase();
+    switch (code) {
+      case 'zh':
+        return 'Simplified Chinese';
+      case 'ja':
+        return 'Japanese';
+      case 'ko':
+        return 'Korean';
+      case 'fr':
+        return 'French';
+      case 'de':
+        return 'German';
+      case 'es':
+        return 'Spanish';
+      case 'pt':
+        return 'Portuguese';
+      case 'ru':
+        return 'Russian';
+      case 'ar':
+        return 'Arabic';
+      case 'hi':
+        return 'Hindi';
+      default:
+        return 'English';
+    }
+  }
+
+  Future<void> _restoreAndroidTextRuntime(GemmaModelConfig config) async {
+    try {
+      if (!_androidRuntimeMatches(
+        supportImage: false,
+        supportAudio: false,
+        supportSkills: false,
+        enabledSkillNames: const [],
+        accelerator: GemmaAccelerator.cpu.id,
+      )) {
+        await _initializeAndroidRuntime(
+          config,
+          supportImage: false,
+          supportAudio: false,
+          supportSkills: false,
+        );
+      }
+    } catch (_) {}
+  }
+
+  bool _androidRuntimeMatches({
+    required bool supportImage,
+    required bool supportAudio,
+    required bool supportSkills,
+    required List<String> enabledSkillNames,
+    required String accelerator,
+  }) {
+    return _initialized &&
+        _androidSupportImage == supportImage &&
+        _androidSupportAudio == supportAudio &&
+        _androidSupportSkills == supportSkills &&
+        _sameStringList(_androidEnabledSkillNames, enabledSkillNames) &&
+        _androidAccelerator == accelerator;
+  }
+
+  bool _sameStringList(List<String> left, List<String> right) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index += 1) {
+      if (left[index] != right[index]) return false;
+    }
+    return true;
+  }
+
+  List<String> _candidateAndroidAccelerators(
+    GemmaModelConfig config, {
+    required bool supportImage,
+    required bool supportAudio,
+  }) {
+    final primary = _selectAndroidAccelerator(
+      config,
+      supportImage: supportImage,
+      supportAudio: supportAudio,
+    );
+    if (supportAudio && !supportImage && primary != 'cpu') {
+      return [primary, 'cpu'];
+    }
+    return [primary];
+  }
+
+  String _selectAndroidAccelerator(
+    GemmaModelConfig config, {
+    required bool supportImage,
+    required bool supportAudio,
+  }) {
+    final wantsMultimodal = supportImage || supportAudio;
+    if (!wantsMultimodal) return 'cpu';
+    final supportsGpu = config.accelerators.contains(GemmaAccelerator.gpu);
+    if (supportsGpu) return GemmaAccelerator.gpu.id;
+    return config.accelerators.isNotEmpty
+        ? config.accelerators.first.id
+        : GemmaAccelerator.cpu.id;
+  }
+
+  bool _isCompiledModelInvocationError(String message) {
+    final normalized = message.toLowerCase();
+    return normalized.contains('failed to invoke the compiled model') ||
+        normalized.contains('status code: 13') ||
+        normalized.contains('status code: 12');
   }
 
   @override
@@ -445,6 +601,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       _flutterGemmaModel = null;
     } else if (Platform.isAndroid) {
       await _methodChannel.invokeMethod<void>('dispose');
+      _androidSupportImage = false;
+      _androidSupportAudio = false;
+      _androidSupportSkills = false;
+      _androidEnabledSkillNames = const [];
+      _androidAccelerator = GemmaAccelerator.cpu.id;
     }
     _initialized = false;
   }

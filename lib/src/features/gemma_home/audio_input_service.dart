@@ -44,12 +44,55 @@ class AudioAttachment {
   }
 }
 
+class AudioInputEvent {
+  const AudioInputEvent({
+    required this.type,
+    this.state,
+    this.reason,
+    this.amplitude = 0,
+    this.elapsedMs = 0,
+  });
+
+  final String type;
+  final String? state;
+  final String? reason;
+  final double amplitude;
+  final int elapsedMs;
+
+  static AudioInputEvent fromMap(Map<dynamic, dynamic> map) {
+    return AudioInputEvent(
+      type: map['type']?.toString() ?? '',
+      state: map['state']?.toString(),
+      reason: map['reason']?.toString(),
+      amplitude: map['amplitude'] is num
+          ? (map['amplitude'] as num).toDouble()
+          : 0,
+      elapsedMs: map['elapsedMs'] is num
+          ? (map['elapsedMs'] as num).toInt()
+          : 0,
+    );
+  }
+}
+
 class AudioInputService {
   static const _channel = MethodChannel(
     'com.example.gemma_local_app/audio_input',
   );
+  static const _eventChannel = EventChannel(
+    'com.example.gemma_local_app/audio_input_events',
+  );
 
   Future<bool> get isSupported async => Platform.isAndroid || Platform.isIOS;
+
+  Stream<AudioInputEvent> get events => _eventChannel
+      .receiveBroadcastStream()
+      .map((event) {
+        if (event is Map<dynamic, dynamic>) {
+          return AudioInputEvent.fromMap(event);
+        }
+        return const AudioInputEvent(type: '');
+      })
+      .where((event) => event.type.isNotEmpty);
 
   Future<AudioAttachment?> pickAudioFile() async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
