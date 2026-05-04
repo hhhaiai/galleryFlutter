@@ -91,7 +91,8 @@
 - 保留 Skill 数据结构、系统提示词、内置 skill 清单，并对齐 Gallery `assets/skills/*/SKILL.md` 的名称/说明/工具调用意图。
 - Skills Hub：点击 composer 的 `Skills` 会打开 Hub 面板；支持启用/禁用内置 skills；支持从线上 `SKILL.md`、GitHub raw/blob URL、或包含 `SKILL.md` 链接的页面导入线上 skill；线上 skill 持久化到 Application Support 的 `online_skills.json`。
 - SkillHub.cn：UI 中提供 `https://skillhub.cn/` 线上社区入口链接复制，并接入 `https://api.skillhub.cn/api/skills` 公开目录；支持关键词搜索、显示 owner/category/version/downloads/stars/API-key 标记，并从 `/api/v1/skills/{slug}/file?path=SKILL.md` 导入 `SKILL.md`。
-- SkillHub 安全边界：当前只导入远端 `SKILL.md` instructions 给本地 Gemma；不下载、不校验、不执行远端 `scripts/` / `assets/`，需要 API key 的 skill 只展示提示，不自动索取或保存密钥。
+- SkillHub 完整性校验：导入前会读取 `/api/v1/skills/{slug}/files` 中 `SKILL.md` 的 `sha256`，下载后按原始 bytes 校验；不匹配、缺失或格式非法会拒绝导入。本地保存 `sourceSha256` / `sha256Verified`，Hub 已导入列表展示短 hash。
+- SkillHub 安全边界：当前只导入远端 `SKILL.md` instructions 给本地 Gemma；不下载、不执行远端 `scripts/` / `assets/`，需要 API key 的 skill 只展示提示，不自动索取或保存密钥。
 - Android runtime：Skills 模式会启用 Gallery 同款 `ToolProvider` 方向的原生工具集，`ConversationConfig.tools = listOf(tool(GemmaSkillToolSet(...)))`，并打开 constrained decoding；已接 `loadSkill`、`runJs`、`runIntent` 三个工具形态。
 - 当前工具执行边界：`loadSkill` 能返回内置/线上 skill instructions；`run_intent(send_email)` 会拉起 Android 邮件 Intent；Android 已内置 Gallery `assets/skills/*` 并通过本地 headless WebView 执行 bundled built-in `run_js`；image 输出会保存到 cache 并附着到 assistant 气泡展示，webview 输出目前以结构化文字提示，线上/custom skill 的 JS 文件下载与执行仍待深化。
 - iOS/Flutter 侧已把 Skills 模式下的 `loadSkill` / `runJs` / `runIntent` 作为 `flutter_gemma` tools 注册；`loadSkill` 可从 Dart enabledSkillDetails 返回 instructions 并回传模型继续生成，`runJs` / `runIntent` 仍返回诚实 `pending_bridge`，避免伪装已执行。

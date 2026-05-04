@@ -1742,6 +1742,37 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 
 - `tool/flutter_test_short_builddir.sh`：通过，5 个测试全部通过。
 
+### 16.17 SkillHub.cn SKILL.md sha256 校验（2026-05-04）
+
+继续推进线上 skills，但仍保持 Gemma/local-first 和不执行远端代码的边界。
+
+已完成：
+
+1. `SkillRepository.importSkillHubSkill(...)` 导入前读取 `/api/v1/skills/{slug}/files`：
+   - 必须找到 `SKILL.md`。
+   - 必须存在合法 64 位 hex `sha256`。
+   - `size` 超过 512KB 继续拒绝。
+2. 下载 `/api/v1/skills/{slug}/file?path=SKILL.md` 后按原始 `bodyBytes` 计算 SHA-256：
+   - 与 files API 的 `sha256` 不一致时直接抛 `SkillImportException`，不会保存到本地。
+   - 校验通过后才解析 YAML front matter / instructions。
+3. 本地线上 skill 元数据补齐：
+   - `GemmaSkill` 新增 `sourceSha256` / `sha256Verified`。
+   - `online_skills.json` 持久化 hash 与 verified 状态。
+   - Hub 已导入列表显示短 hash，例如 `sha256 已验证：xxxx…yyyy`。
+4. 继续保持安全边界：
+   - 当前只校验并导入 `SKILL.md` instructions 给本地 Gemma。
+   - 仍不下载、不执行远端 `scripts/assets`，更不会把远端 skill 当成已执行工具结果。
+
+验证：
+
+- `tool/flutter_test_short_builddir.sh test/skill_repository_test.dart`：通过，覆盖搜索解析、只下载 SKILL.md、sha256 mismatch 拒绝。
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过，6 个测试全部通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- live SkillHub API smoke：`skill-vetter` 的 files API 期望 hash 与下载 `SKILL.md` 实际 SHA-256 一致，bytes=4561。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
@@ -1756,7 +1787,7 @@ remote: https://github.com/hhhaiai/galleryFlutter.git
 
 1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
 2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，UI/播放保留 16k mono 16-bit PCM WAV，送模型前剥离为 raw PCM；iOS 只默认补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭，仅 `GEMMA_IOS_AUDIO_PROBE=true` 可打开固定 WAV harness。
-3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入与 SkillHub.cn 公开目录搜索/导入。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
+3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入、SkillHub.cn 公开目录搜索/导入、`SKILL.md` sha256 校验与本地 hash 元数据展示。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
 4. 验证辅助：`tool/check_prompt_and_skills.dart` 可快速验证 Prompt/Skills；`tool/flutter_test_short_builddir.sh` 已恢复 Flutter test 本地闸口。裸 `flutter test --no-pub` 仍需后续上游/根治 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 
 提交到 GitHub 时必须继续使用 Lore Commit Protocol，并在 commit message 中明确记录：

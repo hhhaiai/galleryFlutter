@@ -292,6 +292,10 @@ class _SkillsHubSheetState extends State<_SkillsHubSheet> {
                       skill.description,
                       if (skill.online && skill.sourceUrl != null)
                         '来源：${skill.sourceUrl}',
+                      if (skill.online && skill.sourceSha256 != null)
+                        skill.sha256Verified
+                            ? 'sha256 已验证：${_shortHash(skill.sourceSha256!)}'
+                            : 'sha256：${_shortHash(skill.sourceSha256!)}',
                     ].join('\n'),
                   ),
                   controlAffinity: ListTileControlAffinity.leading,
@@ -465,4 +469,9 @@ String _compactCount(int value) {
   if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(1)}M';
   if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}K';
   return value.toString();
+}
+
+String _shortHash(String hash) {
+  if (hash.length <= 16) return hash;
+  return '${hash.substring(0, 12)}…${hash.substring(hash.length - 4)}';
 }

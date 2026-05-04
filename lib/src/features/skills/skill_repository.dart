@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
@@ -16,6 +17,7 @@ class SkillRepository {
   static const _storageFileName = 'online_skills.json';
   static const _maxSkillBytes = 512 * 1024;
   static const _skillHubPageSize = 20;
+  static final _sha256Pattern = RegExp(r'^[a-f0-9]{64}$');
 
   final http.Client _client;
   final Uri _skillHubApiBase;
@@ -55,6 +57,7 @@ class SkillRepository {
   Future<GemmaSkill> importOnlineSkill(String inputUrl) async {
     final normalized = _normalizeSkillUrl(inputUrl);
     final response = await _get(normalized);
+    var bodyBytes = response.bodyBytes;
     var body = response.body;
     var sourceUrl = normalized.toString();
 
@@ -66,14 +69,20 @@ class SkillRepository {
         );
       }
       final linkedResponse = await _get(linkedSkill);
+      bodyBytes = linkedResponse.bodyBytes;
       body = linkedResponse.body;
       sourceUrl = linkedSkill.toString();
     }
 
-    if (utf8.encode(body).length > _maxSkillBytes) {
+    if (bodyBytes.length > _maxSkillBytes) {
       throw const SkillImportException('Skill 文件超过 512KB，上线导入已拒绝。');
     }
-    return _parseSkillMarkdown(body, sourceUrl: sourceUrl);
+    return _parseSkillMarkdown(
+      body,
+      sourceUrl: sourceUrl,
+      sourceSha256: _sha256Hex(bodyBytes),
+      sha256Verified: false,
+    );
   }
 
   Future<SkillHubSearchResult> searchSkillHub({
@@ -131,6 +140,12 @@ class SkillRepository {
     }
     final skillPath = skillFile['path']?.toString() ?? 'SKILL.md';
     final size = _intFromJson(skillFile['size']);
+    final expectedSha256 = _sha256FromJson(skillFile['sha256']);
+    if (expectedSha256 == null) {
+      throw SkillImportException(
+        'SkillHub skill `$normalizedSlug` 的 SKILL.md 缺少 sha256，已拒绝导入。',
+      );
+    }
     if (size > _maxSkillBytes) {
       throw const SkillImportException('Skill 文件超过 512KB，上线导入已拒绝。');
     }
@@ -139,11 +154,23 @@ class SkillRepository {
       'path': skillPath,
     });
     final response = await _get(skillUri);
+    final bodyBytes = response.bodyBytes;
     final body = response.body;
-    if (utf8.encode(body).length > _maxSkillBytes) {
+    if (bodyBytes.length > _maxSkillBytes) {
       throw const SkillImportException('Skill 文件超过 512KB，上线导入已拒绝。');
     }
-    return _parseSkillMarkdown(body, sourceUrl: skillUri.toString());
+    final actualSha256 = _sha256Hex(bodyBytes);
+    if (actualSha256 != expectedSha256) {
+      throw SkillImportException(
+        'SkillHub skill `$normalizedSlug` 的 SKILL.md sha256 校验失败，已拒绝导入。',
+      );
+    }
+    return _parseSkillMarkdown(
+      body,
+      sourceUrl: skillUri.toString(),
+      sourceSha256: actualSha256,
+      sha256Verified: true,
+    );
   }
 
   Future<File> _storageFile() async {
@@ -245,6 +272,17 @@ class SkillRepository {
     return normalized;
   }
 
+  String? _sha256FromJson(Object? value) {
+    final normalized = value?.toString().trim().toLowerCase() ?? '';
+    if (normalized.isEmpty) return null;
+    if (!_sha256Pattern.hasMatch(normalized)) {
+      throw SkillImportException('SkillHub SKILL.md sha256 元数据不合法：$normalized');
+    }
+    return normalized;
+  }
+
+  String _sha256Hex(List<int> bytes) => crypto.sha256.convert(bytes).toString();
+
   bool _looksLikeHtml(http.Response response, String body) {
     final contentType = response.headers['content-type']?.toLowerCase() ?? '';
     final prefix = body.trimLeft().toLowerCase();
@@ -263,7 +301,12 @@ class SkillRepository {
     return base.resolve(match.group(1)!);
   }
 
-  GemmaSkill _parseSkillMarkdown(String markdown, {required String sourceUrl}) {
+  GemmaSkill _parseSkillMarkdown(
+    String markdown, {
+    required String sourceUrl,
+    String? sourceSha256,
+    bool sha256Verified = false,
+  }) {
     final normalized = markdown.replaceAll('\r\n', '\n');
     final frontMatterMatch = RegExp(
       r'^---\s*\n([\s\S]*?)\n---\s*\n?',
@@ -301,6 +344,8 @@ class SkillRepository {
       description: description,
       instructions: body.length > 20000 ? body.substring(0, 20000) : body,
       sourceUrl: sourceUrl,
+      sourceSha256: sourceSha256,
+      sha256Verified: sha256Verified,
       online: true,
     );
   }
@@ -310,6 +355,8 @@ class SkillRepository {
     'description': skill.description,
     'instructions': skill.instructions,
     'sourceUrl': skill.sourceUrl,
+    'sourceSha256': skill.sourceSha256,
+    'sha256Verified': skill.sha256Verified,
     'online': skill.online,
   };
 
@@ -318,6 +365,8 @@ class SkillRepository {
     description: json['description']?.toString() ?? '',
     instructions: json['instructions']?.toString() ?? '',
     sourceUrl: json['sourceUrl']?.toString(),
+    sourceSha256: json['sourceSha256']?.toString(),
+    sha256Verified: json['sha256Verified'] == true,
     online: json['online'] == true,
   );
 }

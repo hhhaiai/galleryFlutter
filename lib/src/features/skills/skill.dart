@@ -6,6 +6,8 @@ class GemmaSkill {
     this.selected = true,
     this.requireSecret = false,
     this.sourceUrl,
+    this.sourceSha256,
+    this.sha256Verified = false,
     this.online = false,
   });
 
@@ -15,6 +17,8 @@ class GemmaSkill {
   final bool selected;
   final bool requireSecret;
   final String? sourceUrl;
+  final String? sourceSha256;
+  final bool sha256Verified;
   final bool online;
 
   Map<String, String> toRuntimeMap() => {
@@ -22,6 +26,9 @@ class GemmaSkill {
     'description': description,
     'instructions': instructions,
     if (sourceUrl != null && sourceUrl!.isNotEmpty) 'sourceUrl': sourceUrl!,
+    if (sourceSha256 != null && sourceSha256!.isNotEmpty)
+      'sourceSha256': sourceSha256!,
+    'sha256Verified': sha256Verified.toString(),
     'online': online.toString(),
   };
 }

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gemma_local_app/src/features/skills/skill_repository.dart';
 import 'package:http/http.dart' as http;
@@ -61,6 +62,17 @@ void main() {
 
   test('SkillHub import downloads only SKILL.md instructions', () async {
     final requestedPaths = <String>[];
+    const skillMarkdown = '''
+---
+name: skill-vetter
+description: Vet skills before installing them.
+---
+
+Use local Gemma to review the skill instructions and report risk honestly.
+''';
+    final skillSha256 = crypto.sha256
+        .convert(utf8.encode(skillMarkdown))
+        .toString();
     final repository = SkillRepository(
       skillHubApiBase: Uri.parse('https://api.example.test'),
       client: MockClient((request) async {
@@ -71,7 +83,7 @@ void main() {
               'count': 2,
               'version': '1.0.0',
               'files': [
-                {'path': 'SKILL.md', 'sha256': 'abc', 'size': 90},
+                {'path': 'SKILL.md', 'sha256': skillSha256, 'size': 90},
                 {'path': 'scripts/index.js', 'sha256': 'def', 'size': 1200},
               ],
             }),
@@ -82,14 +94,7 @@ void main() {
         if (request.url.path.endsWith('/file')) {
           expect(request.url.queryParameters['path'], 'SKILL.md');
           return http.Response(
-            '''
----
-name: skill-vetter
-description: Vet skills before installing them.
----
-
-Use local Gemma to review the skill instructions and report risk honestly.
-''',
+            skillMarkdown,
             200,
             headers: {'content-type': 'text/markdown'},
           );
@@ -104,6 +109,8 @@ Use local Gemma to review the skill instructions and report risk honestly.
     expect(skill.description, 'Vet skills before installing them.');
     expect(skill.instructions, contains('Use local Gemma'));
     expect(skill.online, isTrue);
+    expect(skill.sourceSha256, skillSha256);
+    expect(skill.sha256Verified, isTrue);
     expect(skill.sourceUrl, contains('/api/v1/skills/skill-vetter/file'));
     expect(requestedPaths, contains('/api/v1/skills/skill-vetter/files?'));
     expect(
@@ -113,6 +120,53 @@ Use local Gemma to review the skill instructions and report risk honestly.
     expect(
       requestedPaths.any((path) => path.contains('scripts/index.js')),
       isFalse,
+    );
+  });
+
+  test('SkillHub import rejects SKILL.md sha256 mismatch', () async {
+    final repository = SkillRepository(
+      skillHubApiBase: Uri.parse('https://api.example.test'),
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/files')) {
+          return http.Response(
+            jsonEncode({
+              'files': [
+                {
+                  'path': 'SKILL.md',
+                  'sha256':
+                      '0000000000000000000000000000000000000000000000000000000000000000',
+                  'size': 90,
+                },
+              ],
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response(
+          '''
+---
+name: skill-vetter
+description: Vet skills before installing them.
+---
+
+Use local Gemma to review the skill instructions and report risk honestly.
+''',
+          200,
+          headers: {'content-type': 'text/markdown'},
+        );
+      }),
+    );
+
+    expect(
+      () => repository.importSkillHubSkill('skill-vetter'),
+      throwsA(
+        isA<SkillImportException>().having(
+          (error) => error.message,
+          'message',
+          contains('sha256 校验失败'),
+        ),
+      ),
     );
   });
 }
