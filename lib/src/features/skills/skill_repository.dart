@@ -170,6 +170,7 @@ class SkillRepository {
       sourceUrl: skillUri.toString(),
       sourceSha256: actualSha256,
       sha256Verified: true,
+      fallbackName: normalizedSlug,
     );
   }
 
@@ -264,6 +265,26 @@ class SkillRepository {
     return uri;
   }
 
+  /// Convert an arbitrary display name into a valid GemmaSkill.name identifier.
+  /// Allowed: [a-zA-Z0-9._-], first char must be alphanumeric, length 2-64.
+  static String _sanitizeSkillName(String raw) {
+    var s = raw.trim();
+    // Replace any character that is not alphanumeric, dot, underscore, or hyphen
+    // with a single hyphen.
+    s = s.replaceAll(RegExp(r'[^a-zA-Z0-9._-]+'), '-');
+    // Collapse consecutive hyphens.
+    s = s.replaceAll(RegExp(r'-{2,}'), '-');
+    // Strip leading/trailing hyphens and dots.
+    s = s.replaceAll(RegExp(r'^[-.]+|[-.]+$'), '');
+    // Truncate to 64 characters.
+    if (s.length > 64) s = s.substring(0, 64);
+    // Strip trailing hyphens/dots after truncation.
+    s = s.replaceAll(RegExp(r'[-.]+$'), '');
+    // Ensure at least 2 characters.
+    if (s.length < 2) s = 'online-skill';
+    return s;
+  }
+
   String _normalizeSkillHubSlug(String slug) {
     final normalized = slug.trim();
     if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{1,127}$').hasMatch(normalized)) {
@@ -306,6 +327,7 @@ class SkillRepository {
     required String sourceUrl,
     String? sourceSha256,
     bool sha256Verified = false,
+    String? fallbackName,
   }) {
     final normalized = markdown.replaceAll('\r\n', '\n');
     final frontMatterMatch = RegExp(
@@ -324,16 +346,14 @@ class SkillRepository {
       meta[key] = value.replaceAll(RegExp(r'''^["']|["']$'''), '');
     }
     final uri = Uri.tryParse(sourceUrl);
-    final fallbackName = uri == null || uri.pathSegments.isEmpty
+    final urlFallbackName = uri == null || uri.pathSegments.isEmpty
         ? 'online-skill'
         : uri.pathSegments.reversed.firstWhere(
             (segment) => segment.toLowerCase() != 'skill.md',
             orElse: () => 'online-skill',
           );
-    final name = (meta['name'] ?? fallbackName).trim();
-    if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$').hasMatch(name)) {
-      throw SkillImportException('Skill name 不合法：$name');
-    }
+    final rawName = (meta['name'] ?? fallbackName ?? urlFallbackName).trim();
+    final name = _sanitizeSkillName(rawName);
     final description = (meta['description'] ?? 'Online skill from $sourceUrl')
         .trim();
     if (body.isEmpty) {

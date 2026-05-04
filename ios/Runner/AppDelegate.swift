@@ -12,11 +12,16 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Do NOT call super.application(...). FlutterAppDelegate's super calls
+    // GeneratedPluginRegistrant which registers background_downloader, and
+    // BackgroundDownloaderPlugin.register(with:) crashes with
+    // swift_getObjectType SIGSEGV on this iOS 18 device.
+    // SafePluginRegistrant registers the plugins we actually need.
     SafePluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
       registerFlutterChannels(with: controller.binaryMessenger)
     }
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    return true
   }
 
   func registerFlutterChannels(with messenger: FlutterBinaryMessenger) {
