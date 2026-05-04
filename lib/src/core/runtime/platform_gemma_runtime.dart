@@ -601,7 +601,72 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         ' 当前 format=$audioFormat channels=$channels sampleRate=$sampleRate bits=$bitsPerSample dataSize=$dataSize。',
       );
     }
-    return Uint8List.sublistView(bytes, dataOffset, dataOffset + dataSize);
+    final rawPcm = Uint8List.sublistView(
+      bytes,
+      dataOffset,
+      dataOffset + dataSize,
+    );
+    // Match Gallery's genByteArrayForWav(): Content.AudioBytes receives
+    // complete WAV bytes (44-byte RIFF header + normalized PCM), not raw PCM.
+    return _buildWavBytes(rawPcm, sampleRate);
+  }
+
+  static Uint8List _buildWavBytes(Uint8List pcmData, int sampleRate) {
+    final pcmSize = pcmData.length;
+    final fileSize = pcmSize + 44;
+    const channels = 1;
+    const bitsPerSample = 16;
+    final byteRate = sampleRate * channels * bitsPerSample ~/ 8;
+    final header = Uint8List(44);
+    // RIFF header
+    header[0] = 0x52;
+    header[1] = 0x49;
+    header[2] = 0x46;
+    header[3] = 0x46; // RIFF
+    header[4] = fileSize & 0xff;
+    header[5] = (fileSize >> 8) & 0xff;
+    header[6] = (fileSize >> 16) & 0xff;
+    header[7] = (fileSize >> 24) & 0xff;
+    header[8] = 0x57;
+    header[9] = 0x41;
+    header[10] = 0x56;
+    header[11] = 0x45; // WAVE
+    // fmt sub-chunk
+    header[12] = 0x66;
+    header[13] = 0x6d;
+    header[14] = 0x74;
+    header[15] = 0x20; // fmt
+    header[16] = 16;
+    header[17] = 0;
+    header[18] = 0;
+    header[19] = 0;
+    header[20] = 1;
+    header[21] = 0; // PCM
+    header[22] = channels;
+    header[23] = 0;
+    header[24] = sampleRate & 0xff;
+    header[25] = (sampleRate >> 8) & 0xff;
+    header[26] = (sampleRate >> 16) & 0xff;
+    header[27] = (sampleRate >> 24) & 0xff;
+    header[28] = byteRate & 0xff;
+    header[29] = (byteRate >> 8) & 0xff;
+    header[30] = (byteRate >> 16) & 0xff;
+    header[31] = (byteRate >> 24) & 0xff;
+    header[32] = channels * bitsPerSample ~/ 8;
+    header[33] = 0;
+    header[34] = bitsPerSample;
+    header[35] = 0;
+    // data sub-chunk
+    header[36] = 0x64;
+    header[37] = 0x61;
+    header[38] = 0x74;
+    header[39] = 0x61; // data
+    header[40] = pcmSize & 0xff;
+    header[41] = (pcmSize >> 8) & 0xff;
+    header[42] = (pcmSize >> 16) & 0xff;
+    header[43] = (pcmSize >> 24) & 0xff;
+
+    return Uint8List.fromList([...header, ...pcmData]);
   }
 
   Future<Uint8List> _readGalleryStyleVisionImageBytes(File imageFile) async {

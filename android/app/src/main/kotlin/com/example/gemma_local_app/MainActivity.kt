@@ -1462,10 +1462,49 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     if (bytes.size < 44 || bytes.copyOfRange(0, 4).toString(Charsets.US_ASCII) != "RIFF") {
       throw IllegalArgumentException("Gemma audio requires a WAV file. Please record in-app or pick a WAV file.")
     }
-    // Match Google AI Edge Gallery's Ask Audio data path: UI/playback keeps a
-    // WAV file on disk, but Content.AudioBytes must receive raw 16k / mono /
-    // 16-bit little-endian PCM bytes without a RIFF/WAVE header.
-    return extractMono16BitPcm(bytes, MAX_AUDIO_SECONDS)
+    // Match Google AI Edge Gallery's Ask Audio data path: Content.AudioBytes
+    // receives complete WAV bytes (44-byte RIFF header + normalized PCM).
+    // Gallery's genByteArrayForWav() prepends a header to raw PCM; here we
+    // normalize the input WAV and rebuild a clean 16k/mono/16-bit WAV.
+    val rawPcm = extractMono16BitPcm(bytes, MAX_AUDIO_SECONDS)
+    return buildWavBytes(rawPcm, SAMPLE_RATE)
+  }
+
+  /** Build a complete 16-bit mono WAV from raw PCM samples. */
+  private fun buildWavBytes(pcmData: ByteArray, sampleRate: Int): ByteArray {
+    val header = ByteArray(44)
+    val pcmSize = pcmData.size
+    val fileSize = pcmSize + 44
+    val channels = 1
+    val bitsPerSample: Short = 16
+    val byteRate = sampleRate * channels * bitsPerSample / 8
+
+    // RIFF header
+    header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte()
+    header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+    header[4] = (fileSize and 0xff).toByte(); header[5] = (fileSize shr 8 and 0xff).toByte()
+    header[6] = (fileSize shr 16 and 0xff).toByte(); header[7] = (fileSize shr 24 and 0xff).toByte()
+    header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte()
+    header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+    // fmt sub-chunk
+    header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte()
+    header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+    header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
+    header[20] = 1; header[21] = 0 // PCM format
+    header[22] = channels.toByte(); header[23] = 0
+    header[24] = (sampleRate and 0xff).toByte(); header[25] = (sampleRate shr 8 and 0xff).toByte()
+    header[26] = (sampleRate shr 16 and 0xff).toByte(); header[27] = (sampleRate shr 24 and 0xff).toByte()
+    header[28] = (byteRate and 0xff).toByte(); header[29] = (byteRate shr 8 and 0xff).toByte()
+    header[30] = (byteRate shr 16 and 0xff).toByte(); header[31] = (byteRate shr 24 and 0xff).toByte()
+    header[32] = (channels * bitsPerSample / 8).toByte(); header[33] = 0
+    header[34] = bitsPerSample.toByte(); header[35] = (bitsPerSample.toInt() shr 8 and 0xff).toByte()
+    // data sub-chunk
+    header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte()
+    header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+    header[40] = (pcmSize and 0xff).toByte(); header[41] = (pcmSize shr 8 and 0xff).toByte()
+    header[42] = (pcmSize shr 16 and 0xff).toByte(); header[43] = (pcmSize shr 24 and 0xff).toByte()
+
+    return header + pcmData
   }
 
   private fun extractMono16BitPcm(wavBytes: ByteArray, maxSeconds: Int): ByteArray {
