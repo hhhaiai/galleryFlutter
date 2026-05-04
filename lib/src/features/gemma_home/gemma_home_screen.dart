@@ -246,10 +246,23 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   void _appendAssistantText(String token, {bool done = false}) {
     if (!mounted) return;
+    final skillImagePattern = RegExp(r'\[\[skill_image:(.*?)\]\]');
+    final skillImagePaths = skillImagePattern
+        .allMatches(token)
+        .map((match) => match.group(1)?.trim() ?? '')
+        .where((path) => path.isNotEmpty)
+        .toList(growable: false);
+    final cleanToken = token.replaceAll(skillImagePattern, '').trimRight();
     setState(() {
       final last = _messages.removeLast();
       _messages.add(
-        last.copyWith(text: '${last.text}$token', streaming: !done),
+        last.copyWith(
+          text: '${last.text}$cleanToken',
+          imagePaths: skillImagePaths.isEmpty
+              ? last.imagePaths
+              : [...last.imagePaths, ...skillImagePaths],
+          streaming: !done,
+        ),
       );
       if (done) _running = false;
     });

@@ -1566,7 +1566,7 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 2. `GemmaSkillToolSet.runJs(...)`：
    - 对 enabled skill 做校验。
    - bundled built-in asset 存在时真实执行 JS。
-   - 解析 JSON 结果：`error` -> failed；`result` -> succeeded；`image` / `webview` 目前返回诚实文字说明 UI 展示桥接仍待接入，不伪装 Flutter 已显示。
+   - 解析 JSON 结果：`error` -> failed；`result` -> succeeded；`image` 会保存到 Android cache 并通过 runtime event 附着到 assistant 气泡；`webview` 目前返回诚实文字说明 UI 展示桥接仍待接入，不伪装 Flutter 已显示。
 3. Android manifest 增加 `INTERNET`，让 query-wikipedia / qr-code 这类需要网络资源的 bundled JS 能按原 Gallery 语义请求网络。
 4. Dart Skills system prompt 同步更新：Android 支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，iOS/Dart tool-result dispatch 仍明确标为在建。
 
@@ -1581,7 +1581,7 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 仍待做：
 
 1. Android 真机用本地模型触发 `calculate-hash` / `query-wikipedia` / `qr-code` / `mood-tracker`，验证 ToolProvider 是否会稳定调用 `runJs` 并把结果回到 Gemma。
-2. Flutter UI 展示 JS result image/webview，而不是只把 display pending 文案回给模型。
+2. Flutter UI 继续深化 JS result 展示：Android image 已可附着到 assistant 气泡；webview 仍需原生/Flutter 展示。
 3. 线上/custom skill 不能只保存 `SKILL.md`；要继续下载/校验 sibling `scripts/` 与 `assets/`，再纳入 sandbox 执行。
 4. Secret/API key 授权弹窗和本地保存仍未接。
 
@@ -1610,6 +1610,36 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 1. iOS 真机触发 Skills 模式下的 `loadSkill` function call，验证 tool response 能稳定回到 Gemma 并生成最终答复。
 2. iOS/Dart 真正执行 `run_js` / `run_intent`，或把这些明确保留为 Android-only capability。
 3. Flutter UI 结构化展示 tool call / tool result，而不是只追加 `[tool:name] status` 文本。
+
+### 16.13 Android Skills image result 展示闭环（2026-05-04）
+
+继续补齐 `run_js` 的用户可见结果质量，避免 QR code 等 skill 只把 image 结果变成文字。
+
+已完成：
+
+1. Android `GemmaSkillToolSet.runJs(...)` 解析 JS 返回的 `image.base64`：
+   - 支持 `data:image/png/jpeg/webp;base64,...` 和裸 base64。
+   - 保存到 `context.cacheDir/skill_<name>_<timestamp>.<ext>`。
+   - tool response 中保留 `image_path`，同时通过 runtime `EventChannel` 发送 `tool_result` event。
+2. Dart runtime `platform_gemma_runtime.dart` 处理 `tool_result` event：
+   - 将 skill result 文本追加到 streaming assistant。
+   - 使用内部 marker `[[skill_image:<path>]]` 把 Android cache 图片路径送到 UI。
+3. Home UI `_appendAssistantText(...)` 会移除 marker，并把图片路径加入当前 assistant message 的 `imagePaths`，复用现有图片缩略图/全屏预览组件展示结果图。
+4. `webview_url` 当前仍以文字展示，不伪装已经嵌入渲染。
+
+验证：
+
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+- `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+
+仍待做：
+
+1. Android 真机触发 `qr-code` skill，确认 WebView 产出的 PNG 能真实显示在 assistant 气泡。
+2. Webview result 的 Flutter/Android 展示卡片。
+3. image cache 清理策略，避免长期积累。
 
 ## 17. 本地整理与提交边界（2026-05-04）
 

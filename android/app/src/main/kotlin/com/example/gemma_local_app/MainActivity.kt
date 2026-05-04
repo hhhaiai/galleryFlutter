@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -873,6 +874,7 @@ private class GemmaSkillToolSet(
   private val context: Activity,
   enabledSkillNames: List<String>,
   enabledSkillDetails: List<GemmaBuiltinSkill>,
+  private val onToolResult: (Map<String, Any?>) -> Unit = {},
 ) : ToolSet {
   private val enabledSkills: List<GemmaBuiltinSkill> =
     if (enabledSkillDetails.isNotEmpty()) {
@@ -962,22 +964,64 @@ private class GemmaSkillToolSet(
     val image = json.optJSONObject("image")
     val webview = json.optJSONObject("webview")
     val displayNotes = mutableListOf<String>()
-    if (image != null) {
-      displayNotes.add("JS skill produced image output; Flutter image-result display is pending.")
+    val imagePath = image
+      ?.optString("base64")
+      ?.takeIf { it.isNotBlank() && it != "null" }
+      ?.let { saveSkillImage(skillName, it) }
+    if (imagePath != null) {
+      displayNotes.add("JS skill produced image output; the generated image is attached below.")
     }
+    val webviewUrl = webview?.optString("url")?.takeIf { it.isNotBlank() && it != "null" }
     if (webview != null) {
-      displayNotes.add("JS skill produced webview output: ${webview}; Flutter webview-result display is pending.")
+      displayNotes.add(
+        if (webviewUrl != null) {
+          "JS skill produced webview output: $webviewUrl. Flutter embedded webview rendering is pending."
+        } else {
+          "JS skill produced webview output; Flutter embedded webview rendering is pending."
+        }
+      )
     }
     val normalizedResult = listOfNotNull(resultText, displayNotes.takeIf { it.isNotEmpty() }?.joinToString(" "))
       .joinToString("\n")
       .ifBlank { json.toString() }
+    if (imagePath != null || webviewUrl != null) {
+      onToolResult(
+        buildMap<String, Any?> {
+          put("skill_name", skillName)
+          put("script_name", scriptName.ifBlank { "index.html" })
+          put("status", "succeeded")
+          put("result", resultText ?: "")
+          if (imagePath != null) put("image_path", imagePath)
+          if (webviewUrl != null) put("webview_url", webviewUrl)
+          put("webview", webview?.toString())
+        }
+      )
+    }
     return mapOf(
       "skill_name" to skillName,
       "script_name" to scriptName.ifBlank { "index.html" },
       "data" to data,
       "status" to "succeeded",
       "result" to normalizedResult,
+      *listOfNotNull(
+        imagePath?.let { "image_path" to it },
+        webviewUrl?.let { "webview_url" to it },
+      ).toTypedArray(),
     )
+  }
+
+  private fun saveSkillImage(skillName: String, base64Value: String): String {
+    val payload = base64Value.substringAfter(",", base64Value).trim()
+    val extension = when {
+      base64Value.startsWith("data:image/jpeg") -> "jpg"
+      base64Value.startsWith("data:image/jpg") -> "jpg"
+      base64Value.startsWith("data:image/webp") -> "webp"
+      else -> "png"
+    }
+    val safeSkillName = skillName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    val file = File(context.cacheDir, "skill_${safeSkillName}_${System.currentTimeMillis()}.$extension")
+    file.writeBytes(Base64.decode(payload, Base64.DEFAULT))
+    return file.absolutePath
   }
 
   @Tool(description = "Run an Android intent. It is used by skills to perform platform actions.")
@@ -1193,6 +1237,11 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
                 context = activity,
                 enabledSkillNames = args.enabledSkillNames,
                 enabledSkillDetails = args.enabledSkills,
+                onToolResult = { toolResult ->
+                  runOnMainThread {
+                    eventSink?.success(mapOf("type" to "tool_result") + toolResult)
+                  }
+                },
               )
             )
           )

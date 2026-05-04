@@ -756,6 +756,29 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     return supportPath;
   }
 
+  String _formatToolResultEvent(Map<dynamic, dynamic> event) {
+    final skillName = event['skill_name']?.toString() ?? 'skill';
+    final status = event['status']?.toString() ?? 'done';
+    final result = event['result']?.toString().trim() ?? '';
+    final imagePath = event['image_path']?.toString().trim() ?? '';
+    final webviewUrl = event['webview_url']?.toString().trim() ?? '';
+    final buffer = StringBuffer('\n\n**Skill result: $skillName** ($status)');
+    if (result.isNotEmpty) {
+      buffer.writeln();
+      buffer.writeln(result);
+    }
+    if (webviewUrl.isNotEmpty) {
+      buffer.writeln();
+      buffer.writeln('Webview output: `$webviewUrl`');
+    }
+    if (imagePath.isNotEmpty) {
+      buffer.writeln();
+      buffer.writeln('[[skill_image:$imagePath]]');
+    }
+    buffer.writeln();
+    return buffer.toString();
+  }
+
   void _handleRuntimeEvent(dynamic event) {
     if (event is! Map) return;
     final type = event['type']?.toString();
@@ -764,6 +787,8 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         _activeGenerationController?.add(event['text']?.toString() ?? '');
       case 'done':
         _activeGenerationController?.close();
+      case 'tool_result':
+        _activeGenerationController?.add(_formatToolResultEvent(event));
       case 'error':
         _activeGenerationController?.addError(
           RuntimeUnavailableException(
