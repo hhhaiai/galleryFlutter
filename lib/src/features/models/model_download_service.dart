@@ -36,6 +36,21 @@ class ModelDownloadStatus {
 
   double get progress => totalBytes <= 0 ? 0 : receivedBytes / totalBytes;
 
+  double get clampedProgress => progress.clamp(0.0, 1.0);
+
+  Duration? get estimatedRemaining {
+    if (type != ModelDownloadStatusType.inProgress ||
+        totalBytes <= 0 ||
+        receivedBytes <= 0 ||
+        bytesPerSecond <= 0 ||
+        receivedBytes >= totalBytes) {
+      return null;
+    }
+    final seconds = ((totalBytes - receivedBytes) / bytesPerSecond).ceil();
+    if (seconds <= 0) return null;
+    return Duration(seconds: seconds);
+  }
+
   bool get isDownloaded => type == ModelDownloadStatusType.succeeded;
 
   ModelDownloadStatus copyWith({
@@ -54,6 +69,77 @@ class ModelDownloadStatus {
       errorMessage: errorMessage ?? this.errorMessage,
       localPath: localPath ?? this.localPath,
     );
+  }
+}
+
+class ModelDownloadProgressSmoother {
+  ModelDownloadProgressSmoother({
+    this.minEmitInterval = const Duration(milliseconds: 800),
+    this.speedSmoothing = 0.25,
+  }) : assert(speedSmoothing > 0 && speedSmoothing <= 1);
+
+  final Duration minEmitInterval;
+  final double speedSmoothing;
+
+  ModelDownloadStatus? _lastVisible;
+  DateTime? _lastEmitAt;
+  int? _smoothedBytesPerSecond;
+
+  ModelDownloadStatus? filter(ModelDownloadStatus status, {DateTime? now}) {
+    now ??= DateTime.now();
+    if (status.type != ModelDownloadStatusType.inProgress) {
+      _resetProgressWindow();
+      _lastVisible = status;
+      return status;
+    }
+
+    final smoothed = _smooth(status);
+    final firstProgress =
+        _lastVisible?.type != ModelDownloadStatusType.inProgress;
+    final intervalElapsed =
+        _lastEmitAt == null ||
+        !now.difference(_lastEmitAt!).isNegative &&
+            now.difference(_lastEmitAt!) >= minEmitInterval;
+    final completedBoundary =
+        smoothed.totalBytes > 0 &&
+        smoothed.receivedBytes >= smoothed.totalBytes;
+
+    if (firstProgress || intervalElapsed || completedBoundary) {
+      _lastEmitAt = now;
+      _lastVisible = smoothed;
+      return smoothed;
+    }
+    return null;
+  }
+
+  ModelDownloadStatus _smooth(ModelDownloadStatus status) {
+    final last = _lastVisible;
+    var receivedBytes = status.receivedBytes;
+    if (last != null &&
+        last.type == ModelDownloadStatusType.inProgress &&
+        last.totalBytes == status.totalBytes &&
+        receivedBytes < last.receivedBytes) {
+      receivedBytes = last.receivedBytes;
+    }
+
+    final inputBps = status.bytesPerSecond;
+    if (inputBps > 0) {
+      final previous = _smoothedBytesPerSecond;
+      _smoothedBytesPerSecond = previous == null || previous <= 0
+          ? inputBps
+          : (previous * (1 - speedSmoothing) + inputBps * speedSmoothing)
+                .round();
+    }
+
+    return status.copyWith(
+      receivedBytes: receivedBytes,
+      bytesPerSecond: _smoothedBytesPerSecond ?? inputBps,
+    );
+  }
+
+  void _resetProgressWindow() {
+    _lastEmitAt = null;
+    _smoothedBytesPerSecond = null;
   }
 }
 
@@ -82,6 +168,7 @@ class ModelDownloadController {
 
   final _DartForegroundModelDownloader _fallback;
   final _statusController = StreamController<ModelDownloadStatus>.broadcast();
+  final _progressSmoother = ModelDownloadProgressSmoother();
   StreamSubscription<dynamic>? _nativeSubscription;
   ModelDownloadStatus _status = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
@@ -220,9 +307,11 @@ class ModelDownloadController {
   }
 
   void _emit(ModelDownloadStatus status) {
-    _status = status;
+    final visibleStatus = _progressSmoother.filter(status);
+    if (visibleStatus == null) return;
+    _status = visibleStatus;
     if (!_statusController.isClosed) {
-      _statusController.add(status);
+      _statusController.add(visibleStatus);
     }
   }
 }

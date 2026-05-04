@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:io' show File, Platform;
+import 'dart:math' as math;
 import 'dart:typed_data' show ByteData, Endian, Uint8List;
-import 'dart:ui' show PlatformDispatcher;
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/flutter_gemma.dart' as fg;
@@ -47,8 +48,16 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
     if (Platform.isIOS) {
+      if (previousConfig != null &&
+          (previousConfig.modelId != config.modelId ||
+              previousConfig.commitHash != config.commitHash)) {
+        await _flutterGemmaChat?.session.close();
+        _flutterGemmaChat = null;
+        await _flutterGemmaModel?.close();
+        _flutterGemmaModel = null;
+      }
       final modelPath = await _resolveModelPath(config);
-      await _initializeFlutterGemma(config, modelPath);
+      await _prepareFlutterGemmaModel(config, modelPath);
       _initialized = true;
       return;
     }
@@ -123,34 +132,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     GemmaModelConfig config,
     String modelPath, {
     bool forceReload = false,
-    bool supportImage = true,
+    bool supportImage = false,
     bool supportAudio = false,
   }) async {
-    final file = File(modelPath);
-    if (!await file.exists()) {
-      throw RuntimeUnavailableException(
-        'iOS 模型文件不存在：$modelPath。请先在 Models 中完成下载。',
-      );
-    }
-    final bytes = await file.length();
-    if (bytes < config.sizeInBytes) {
-      throw RuntimeUnavailableException(
-        'iOS 模型文件不完整：$bytes / ${config.sizeInBytes} bytes。请删除后重新下载。',
-      );
-    }
+    await _prepareFlutterGemmaModel(config, modelPath);
 
     try {
-      await fg.FlutterGemma.initialize(maxDownloadRetries: 8);
       if (forceReload) {
         await _flutterGemmaChat?.session.close();
         _flutterGemmaChat = null;
         await _flutterGemmaModel?.close();
         _flutterGemmaModel = null;
       }
-      await fg.FlutterGemma.installModel(
-        modelType: fg.ModelType.gemma4,
-        fileType: fg.ModelFileType.litertlm,
-      ).fromFile(modelPath).install();
 
       _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
         maxTokens: 1024,
@@ -167,6 +160,34 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       throw RuntimeUnavailableException(
         'iOS LiteRT-LM/flutter_gemma 初始化失败：$error',
       );
+    }
+  }
+
+  Future<void> _prepareFlutterGemmaModel(
+    GemmaModelConfig config,
+    String modelPath,
+  ) async {
+    final file = File(modelPath);
+    if (!await file.exists()) {
+      throw RuntimeUnavailableException(
+        'iOS 模型文件不存在：$modelPath。请先在 Models 中完成下载。',
+      );
+    }
+    final bytes = await file.length();
+    if (bytes < config.sizeInBytes) {
+      throw RuntimeUnavailableException(
+        'iOS 模型文件不完整：$bytes / ${config.sizeInBytes} bytes。请删除后重新下载。',
+      );
+    }
+
+    try {
+      await fg.FlutterGemma.initialize(maxDownloadRetries: 8);
+      await fg.FlutterGemma.installModel(
+        modelType: fg.ModelType.gemma4,
+        fileType: fg.ModelFileType.litertlm,
+      ).fromFile(modelPath).install();
+    } catch (error) {
+      throw RuntimeUnavailableException('iOS Gemma 模型准备失败：$error');
     }
   }
 
@@ -328,10 +349,6 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'iOS 当前的 flutter_gemma + Gemma-4-E2B-it 音频理解链路会触发 Failed to start streaming (code: 13)。为保证稳定性，iOS 端暂时关闭语音输入 / Live 语音通话；本项目不会用非 Gemma ASR 方案替代 Gemma 原生 audio 能力验收。',
       );
     }
-    final model = _flutterGemmaModel;
-    if (model == null) {
-      throw const RuntimeUnavailableException('iOS flutter_gemma model 尚未初始化。');
-    }
     final prompt = _contextualPrompt(request);
 
     // iOS .litertlm FFI multimodal sessions are not reliably reusable. Rebuild
@@ -340,15 +357,22 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     // fixed-WAV harness only for validating Gemma native audio, not for release.
     final isImageRequest = request.imagePaths.isNotEmpty;
     final isAudioRequest = request.audioPaths.isNotEmpty;
+    final config = _config ?? gemma4E2bIt;
+    final modelPath = await _resolveModelPath(config);
     if (isImageRequest || isAudioRequest) {
-      final config = _config ?? gemma4E2bIt;
-      final modelPath = await _resolveModelPath(config);
       await _initializeFlutterGemma(
         config,
         modelPath,
         forceReload: true,
         supportImage: isImageRequest,
         supportAudio: isAudioRequest,
+      );
+    } else if (_flutterGemmaModel == null) {
+      await _initializeFlutterGemma(
+        config,
+        modelPath,
+        supportImage: false,
+        supportAudio: false,
       );
     } else {
       await _flutterGemmaChat?.session.close();
@@ -362,10 +386,15 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     }
     final tools = _iosSkillToolsFor(request);
     final chat = await currentModel.createChat(
-      temperature: _config?.temperature ?? gemma4E2bIt.temperature,
-      topK: _config?.topK ?? gemma4E2bIt.topK,
+      // Vision answers should be factual and stable. Keep text/skills creative
+      // defaults, but reduce sampling for image grounding so counts and visible
+      // entities are less likely to drift.
+      temperature: isImageRequest
+          ? 0.2
+          : (_config?.temperature ?? gemma4E2bIt.temperature),
+      topK: isImageRequest ? 1 : (_config?.topK ?? gemma4E2bIt.topK),
       topP: _config?.topP ?? gemma4E2bIt.topP,
-      supportImage: _config?.supportImage ?? gemma4E2bIt.supportImage,
+      supportImage: isImageRequest,
       supportAudio: isAudioRequest,
       modelType: fg.ModelType.gemma4,
       isThinking: false,
@@ -386,7 +415,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
               '图片文件不存在：${request.imagePaths.first}',
             );
           }
-          imageBytes = await firstImage.readAsBytes();
+          imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
         }
         if (isAudioRequest) {
           audioBytes = await _readGemmaPcm16FromWav(request.audioPaths.first);
@@ -510,6 +539,85 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     return Uint8List.sublistView(bytes, dataOffset, dataOffset + dataSize);
   }
 
+  Future<Uint8List> _readGalleryStyleVisionImageBytes(File imageFile) async {
+    // Android already normalizes in MainActivity before sending
+    // Content.ImageBytes. The iOS flutter_gemma FFI path receives raw bytes
+    // directly, so normalize here to match Gallery's vision input shape:
+    // orientation-applied, bounded dimensions, and PNG bytes. This prevents the
+    // vision encoder from seeing an oversized / orientation-tagged camera asset
+    // that differs from the preview shown to the user.
+    if (Platform.isIOS) {
+      try {
+        final bytes = await _methodChannel.invokeMethod<Uint8List>(
+          'prepareVisionImage',
+          {'imagePath': imageFile.path, 'maxDimension': 1024},
+        );
+        if (bytes != null && bytes.isNotEmpty) return bytes;
+      } on MissingPluginException {
+        // Unit-test / non-Runner harnesses may not have the iOS channel.
+      } on PlatformException catch (error) {
+        throw RuntimeUnavailableException(
+          'iOS 图片预处理失败：${error.message ?? error.code}',
+        );
+      }
+    }
+
+    final originalBytes = await imageFile.readAsBytes();
+    return _normalizeVisionImageWithFlutterCodec(originalBytes);
+  }
+
+  Future<Uint8List> _normalizeVisionImageWithFlutterCodec(
+    Uint8List originalBytes, {
+    int maxDimension = 1024,
+  }) async {
+    ui.Codec? codec;
+    ui.Image? decoded;
+    ui.Picture? picture;
+    ui.Image? normalized;
+    try {
+      codec = await ui.instantiateImageCodec(originalBytes);
+      final frame = await codec.getNextFrame();
+      decoded = frame.image;
+      final longestSide = math.max(decoded.width, decoded.height);
+      final scale = longestSide > maxDimension
+          ? maxDimension / longestSide
+          : 1.0;
+      final targetWidth = math.max(1, (decoded.width * scale).round());
+      final targetHeight = math.max(1, (decoded.height * scale).round());
+
+      final recorder = ui.PictureRecorder();
+      final canvas = ui.Canvas(recorder);
+      final paint = ui.Paint()..filterQuality = ui.FilterQuality.high;
+      canvas.drawImageRect(
+        decoded,
+        ui.Rect.fromLTWH(
+          0,
+          0,
+          decoded.width.toDouble(),
+          decoded.height.toDouble(),
+        ),
+        ui.Rect.fromLTWH(0, 0, targetWidth.toDouble(), targetHeight.toDouble()),
+        paint,
+      );
+      picture = recorder.endRecording();
+      normalized = await picture.toImage(targetWidth, targetHeight);
+      final pngBytes = await normalized.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      if (pngBytes == null || pngBytes.lengthInBytes == 0) {
+        throw const RuntimeUnavailableException('图片 PNG 编码失败，请换一张图片重试。');
+      }
+      return Uint8List.sublistView(pngBytes);
+    } catch (error) {
+      if (error is RuntimeUnavailableException) rethrow;
+      throw RuntimeUnavailableException('图片预处理失败，请换一张图片重试：$error');
+    } finally {
+      normalized?.dispose();
+      picture?.dispose();
+      decoded?.dispose();
+    }
+  }
+
   String _ascii(Uint8List bytes, int offset, int count) {
     if (offset + count > bytes.length) return '';
     return String.fromCharCodes(bytes.sublist(offset, offset + count));
@@ -613,9 +721,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   String _visionPrompt(String prompt) {
     final trimmed = prompt.trim();
     if (_isDefaultVisionPrompt(trimmed)) {
-      return 'Look at the image and describe the main objects, scene, visible text, and important details. Respond in $_preferredReplyLanguageName.';
+      return 'Look at the image carefully and describe only what is visible: main objects, people, scene, visible text, and important details. If a count or detail is uncertain, say it is uncertain instead of guessing. Respond in $_preferredReplyLanguageName.';
     }
-    return 'Use the image as primary evidence and answer the user request. Respond in $_preferredReplyLanguageName. User request: $trimmed';
+    return 'Use the image as primary evidence and answer the user request. Do not infer invisible people or objects; if a visual detail is uncertain, say it is uncertain. Respond in $_preferredReplyLanguageName. User request: $trimmed';
   }
 
   String _audioPrompt(String prompt) {
@@ -681,7 +789,8 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   String get _preferredReplyLanguageName {
-    final code = PlatformDispatcher.instance.locale.languageCode.toLowerCase();
+    final code = ui.PlatformDispatcher.instance.locale.languageCode
+        .toLowerCase();
     switch (code) {
       case 'zh':
         return 'Simplified Chinese';

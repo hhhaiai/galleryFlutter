@@ -12,7 +12,7 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
+    SafePluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
       registerFlutterChannels(with: controller.binaryMessenger)
     }

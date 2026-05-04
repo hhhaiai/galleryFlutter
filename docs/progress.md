@@ -66,6 +66,10 @@
 - [x] Android Skills 工具桥接第一阶段：Skills runtime 启用 `ToolProvider` / constrained decoding；支持 `loadSkill` 返回内置/线上 skill instructions；支持 `run_intent(send_email)` 拉起邮件 Intent；已把 Gallery built-in skill assets 打包进 Android 并用本地 headless WebView 执行 bundled `run_js`，image 结果保存到 cache 后附着到 assistant 气泡
 - [x] iOS/Dart Skills tool loop 第一阶段：Skills 模式下为 `flutter_gemma` 注册 `loadSkill` / `runJs` / `runIntent` tools；`loadSkill` 会把 Dart skill instructions 作为 tool response 回传模型继续生成，`runJs` / `runIntent` 仍明确返回 `pending_bridge`
 - [x] iOS 图片/文本流式 Markdown 换行修复：Home 追加 assistant token 时不再对每个 streaming chunk 执行 `trimRight()`，避免 iOS flutter_gemma 在 chunk 边界输出的 `\\n` 被吞掉，导致标题/列表/段落全部粘成一行；不新增“必须分段/必须 Markdown”的提示词限制
+- [x] iOS 初始化稳定性第一阶段：`initialize()` 改为只做 Gemma 文件校验/注册，不在请求前默认创建 image-capable FFI engine；文字请求按 text-only 懒加载，图片/音频 probe 请求才强制重建对应多模态 engine，减少启动/发送时双重 native load 和卡住窗口
+- [x] iOS 打开即闪退修复：真机 crash report 定位到 `background_downloader` 插件注册阶段 `BDPlugin.register(with:)`，而项目模型下载已使用自己的 Android WorkManager / iOS background URLSession；新增 iOS `SafePluginRegistrant` 排除无用且会闪退的 `background_downloader` 注册，release 真机启动不再生成新 Runner crash
+- [x] 模型下载进度稳定化：Android/iOS 原生后台下载事件统一在 Dart 层做单条 progress smoothing（节流、速度平滑、received bytes 单调保护），UI 显示百分比/速度/预计剩余时间，避免多线程/高频进度闪烁
+- [x] iOS 图片识别质量补强：对比 Android Gallery 路线后补齐 iOS vision 输入归一化，图片在送入 `flutter_gemma` FFI 前由 UIKit 按预览方向重绘、长边限制到 1024、PNG 编码；Dart 保留 `dart:ui` fallback，并对图片请求降低采样随机性，减少“两个人识别成三个人”这类由 oversized/orientation-tagged raw 图片触发的视觉漂移
 - [x] 按功能整理 Skills Hub 代码：Hub UI 抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入/持久化抽到 `lib/src/features/skills/skill_repository.dart`，Home 只保留状态编排和发送 Gemma 请求
 - [x] 增加 `tool/check_prompt_and_skills.dart`：绕开当前 macOS native asset 测试阻断，直接验证 Prompt Lab 插值和 Skills prompt 注入
 - [x] 恢复 Flutter test 本地闸口：新增 `tool/flutter_test_short_builddir.sh`，用项目内临时 Flutter config 把 tester build root 指向 `/tmp/gla_ft`，绕开 `flutter_gemma` macOS dylib headerpad 不足导致的长 install_name 重写失败；不修改用户全局 Flutter config
@@ -84,6 +88,7 @@
 - [ ] 上游/根治 macOS native asset `libGemmaModelConstraintProvider.dylib` headerpad 问题，使直接运行 `flutter test --no-pub` 也不依赖短 build-dir wrapper
 - [ ] iOS 真机模型下载后真实首轮对话验证：当前 Release 构建已通过，但 `devicectl` 安装到 iPhone 仍被签名完整性校验阻断，需要用 Xcode/签名设置修复后在设备上验证 token 输出
 - [ ] iOS 后台下载真机长时间验证：前台下载、切后台、取消、重启、断网恢复、续传后 size 校验
+- [ ] iOS 同图图片识别专项：用用户反馈的“两个人”图片在 iOS / Android 同模型下 A/B 复测，确认 iOS 归一化后人数不再漂移；若仍漂移，继续查 LiteRT-LM FFI image JSON/vision encoder 行为，不用非 Gemma 视觉模型替代
 - [ ] macOS/Windows/Linux 本地后端选型和接入
 - [ ] 真机 Release/Profile 包验证
 

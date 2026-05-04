@@ -62,7 +62,9 @@ class _ModelDownloadCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final config = gemma4E2bIt;
-    final progress = status.progress.clamp(0.0, 1.0);
+    final progress = status.clampedProgress;
+    final percent = (progress * 100).clamp(0, 100).toStringAsFixed(1);
+    final eta = _formatDuration(status.estimatedRemaining);
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -82,8 +84,9 @@ class _ModelDownloadCard extends StatelessWidget {
               LinearProgressIndicator(value: progress == 0 ? null : progress),
               const SizedBox(height: 8),
               Text(
-                '${_formatBytes(status.receivedBytes)} / ${_formatBytes(status.totalBytes)}'
-                '${status.bytesPerSecond > 0 ? ' · ${_formatBytes(status.bytesPerSecond)}/s' : ''}',
+                '$percent% · ${_formatBytes(status.receivedBytes)} / ${_formatBytes(status.totalBytes)}'
+                '${status.bytesPerSecond > 0 ? ' · ${_formatBytes(status.bytesPerSecond)}/s' : ''}'
+                '${eta == null ? '' : ' · 预计剩余 $eta'}',
               ),
             ],
             if (status.type == ModelDownloadStatusType.failed) ...[
@@ -152,5 +155,16 @@ class _ModelDownloadCard extends StatelessWidget {
       unit++;
     }
     return '${value.toStringAsFixed(unit == 0 ? 0 : 2)} ${units[unit]}';
+  }
+
+  String? _formatDuration(Duration? duration) {
+    if (duration == null) return null;
+    final totalMinutes = duration.inMinutes;
+    if (totalMinutes < 1) return '<1 分钟';
+    final hours = totalMinutes ~/ 60;
+    final minutes = totalMinutes % 60;
+    if (hours <= 0) return '$minutes 分钟';
+    if (minutes == 0) return '$hours 小时';
+    return '$hours 小时 $minutes 分钟';
   }
 }

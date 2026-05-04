@@ -383,7 +383,7 @@ class ModelDownloadWorker(
     private const val TAG = "ModelDownloadWorker"
     private const val CHANNEL_ID = "gallery_flutter_model_downloads"
     private const val NOTIFICATION_ID = 44001
-    private const val PROGRESS_INTERVAL_MS = 500L
+    private const val PROGRESS_INTERVAL_MS = 1000L
     private const val MAX_PARALLEL_DOWNLOADS = 4
     private const val TARGET_PART_SIZE_BYTES = 512L * 1024L * 1024L
     private const val MIN_PARALLEL_DOWNLOAD_BYTES = 64L * 1024L * 1024L

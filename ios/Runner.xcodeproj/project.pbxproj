@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8A4D00072EC4000000000001 /* SafePluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 8A4D00062EC4000000000002 /* SafePluginRegistrant.m */; };
 		1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */; };
 		230C48F049928C92E8510387 /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 10EAAC9FEACCC335D0F35F3B /* Pods_Runner.framework */; };
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
@@ -46,6 +47,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		8A4D00062EC4000000000001 /* SafePluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SafePluginRegistrant.h; sourceTree = "<group>"; };
+		8A4D00062EC4000000000002 /* SafePluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = SafePluginRegistrant.m; sourceTree = "<group>"; };
 		10EAAC9FEACCC335D0F35F3B /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
 		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };
@@ -166,6 +169,8 @@
 				97C147021CF9000F007C117D /* Info.plist */,
 				1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */,
 				1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */,
+				8A4D00062EC4000000000001 /* SafePluginRegistrant.h */,
+				8A4D00062EC4000000000002 /* SafePluginRegistrant.m */,
 				74858FAE1ED2DC5600515810 /* AppDelegate.swift */,
 				8A4D00002EC4000000000001 /* IOSModelDownloadManager.swift */,
 				8A4D00022EC4000000000001 /* IOSGemmaRuntime.swift */,
@@ -431,6 +436,7 @@
 				8A4D00032EC4000000000001 /* IOSGemmaRuntime.swift in Sources */,
 				8A4D00052EC4000000000001 /* IOSAudioInput.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
+				8A4D00072EC4000000000001 /* SafePluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

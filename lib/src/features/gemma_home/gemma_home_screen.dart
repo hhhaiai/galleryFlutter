@@ -2266,8 +2266,14 @@ class _ModelStatusChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final (label, color) = switch (status.type) {
       ModelDownloadStatusType.succeeded => ('已下载', Colors.green),
-      ModelDownloadStatusType.inProgress => ('下载中', Colors.blue),
-      ModelDownloadStatusType.partiallyDownloaded => ('部分下载', Colors.orange),
+      ModelDownloadStatusType.inProgress => (
+        '下载 ${(status.clampedProgress * 100).clamp(0, 100).toStringAsFixed(0)}%',
+        Colors.blue,
+      ),
+      ModelDownloadStatusType.partiallyDownloaded => (
+        '已下 ${(status.clampedProgress * 100).clamp(0, 100).toStringAsFixed(0)}%',
+        Colors.orange,
+      ),
       ModelDownloadStatusType.failed => (
         '失败',
         Theme.of(context).colorScheme.error,

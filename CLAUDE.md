@@ -1792,6 +1792,109 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 
 - iOS 真机重新跑图片识别，确认标题、列表、段落换行不再被吞。
 
+### 16.19 iOS Gemma 懒初始化稳定性（2026-05-04）
+
+继续分析 iOS “打开/发送后卡住”的路径，发现当前 `_runRequest(...)` 会先调用 `_runtime.initialize(gemma4E2bIt)`，而 iOS `initialize()` 又会立即执行 `FlutterGemma.getActiveModel(...)`，默认 `supportImage=true`、GPU backend。随后图片请求进入 `_generateWithFlutterGemma(...)` 又会 `forceReload` 再创建一次多模态 engine。
+
+这导致两个问题：
+
+1. 普通启动/发送阶段过早进入 LiteRT-LM FFI native library / engine 初始化，用户看到像“卡住”。
+2. 图片请求实际存在“先默认 image-capable init，再 media forceReload”的双重初始化，增加 iOS 卡顿/失败概率。
+
+已完成：
+
+- iOS `initialize()` 现在只做：
+  - 模型路径解析；
+  - 文件存在/size 校验；
+  - `FlutterGemma.initialize(...)` 与 `installModel(...).fromFile(...).install()` 注册 active model；
+  - 不再创建 `InferenceModel` / FFI engine。
+- `_generateWithFlutterGemma(...)` 改为按请求懒加载：
+  - 纯文字：首次请求才创建 text-only model/session。
+  - 图片：每次图片请求仍 `forceReload`，只创建 image-capable model/session。
+  - iOS audio probe：仅 `GEMMA_IOS_AUDIO_PROBE=true` 时创建 audio-capable probe session。
+- `createChat(...)` 的 `supportImage` 现在跟随本次请求，而不是无条件继承模型配置的 `supportImage=true`。
+- 如果未来切换模型配置，会先关闭旧 chat/model，避免旧模型对象被错误复用。
+
+验证：
+
+- `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过。
+- `tool/flutter_test_short_builddir.sh test/model_download_progress_smoother_test.dart`：通过。
+- `flutter build apk --debug`：通过。
+- `flutter build ios --no-codesign`：通过。
+- `flutter build ios --release`：通过并完成签名。
+- iPhone `00008120-000605C42244201E` release 安装后 `devicectl process launch --console --timeout 12`：未再生成 15:18/15:19 新 Runner crash；命令因 App 持续运行超过 timeout 退出，说明“打开即闪退”已被当前 smoke 排除。
+
+### 16.20 iOS 打开即闪退与下载进度稳定化（2026-05-04）
+
+真机闪退根因已通过 `.ips` crash report 定位：触发线程停在 `BackgroundDownloaderPlugin.register(with:) -> BDPlugin.register(with:) -> swift_getObjectType`，发生在 `GeneratedPluginRegistrant.register(with:)` 的 App 启动注册阶段，早于用户发送请求和 Gemma 推理。也就是说本轮“打开即闪退”不是 Gemma 模型推理崩溃，而是 `flutter_gemma` 传递依赖 `background_downloader 9.5.4` 的 iOS 插件注册崩溃。
+
+项目自己的模型下载并不依赖这个插件：
+
+- Android：`WorkManager + ForegroundInfo` 系统后台任务，可在 App 后台继续下载并显示系统通知。
+- iOS：`IOSModelDownloadManager` 使用 `URLSessionConfiguration.background(withIdentifier:)`，`sessionSendsLaunchEvents = true`，并通过 `AppDelegate.handleEventsForBackgroundURLSession` 接系统回调；App 退后台后由 iOS 系统托管继续/调度下载。
+- iOS 限制：系统后台下载会被电量、网络、温控、锁屏等策略调度，不保证一直满速，但任务可保留、恢复、完成后唤醒 App。
+
+已完成：
+
+- 新增 `SafePluginRegistrant`，启动时注册本项目实际需要的 `flutter_gemma`、`image_picker_ios`、`large_file_handler`、`shared_preferences_foundation`，明确排除会在当前设备/toolchain 下闪退且本项目不使用的 `background_downloader` 插件注册路径。
+- 保留 `GeneratedPluginRegistrant.m` 文件用于 Flutter 生成兼容，但 AppDelegate 改为调用 `SafePluginRegistrant.register(with:)`。
+- 下载进度统一做“单条聚合状态”：Dart 层新增 `ModelDownloadProgressSmoother`，对 native 高频/并发 progress 做 800ms 节流、速度指数平滑、received bytes 单调保护。
+- UI 显示百分比、已下载/总大小、平滑速度与预计剩余时间；顶部状态 chip 显示下载百分比，不再只显示闪动的“下载中”。
+- Android worker 进度发布间隔从 500ms 放宽到 1000ms，继续只向 Flutter 汇总单条进度，不展示多分片/多线程细节。
+
+验证：
+
+- Crash 证据：`.omx/logs/ios-crash-after-release/Runner-2026-05-04-150609.ips` 的触发栈为 `swift_getObjectType -> static BDPlugin.register(with:) -> static BackgroundDownloaderPlugin.register(with:) -> GeneratedPluginRegistrant.registerWithRegistry -> AppDelegate.application`。
+- `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过。
+- `tool/flutter_test_short_builddir.sh test/model_download_progress_smoother_test.dart`：通过。
+- `flutter build apk --debug`：通过。
+- `flutter build ios --release`：通过。
+- iPhone release 安装并启动：未再生成 15:18/15:19 后的新 Runner crash；`--console --timeout 12` 因 App 持续运行超时退出。
+
+注意：本轮验证没有改用任何非 Gemma 模型或云端 ASR；Gemma-4-E2B-it 仍是文字、图片、audio probe、Prompt Lab、Skills 的本地能力基础。
+
+### 16.21 iOS 图片识别人数漂移修复（2026-05-04）
+
+用户反馈：同一张图片里明明是两个人，但 iOS 图片识别经常回答成三个人。这个问题不能靠硬编码“人数答案”或换其它视觉模型解决；本项目仍必须让 `Gemma-4-E2B-it` 承担本地图片理解。
+
+根因排查：
+
+- Android 路线已经参考 Gallery 做了图片输入归一化：读取 EXIF orientation、按 1024 目标采样、旋转/翻转后重新编码为 PNG，再作为 `Content.ImageBytes` 送入 LiteRT-LM。
+- iOS `flutter_gemma` FFI 路线此前直接读取 `image_picker` 的 raw 文件 bytes 送给 LiteRT-LM JSON blob。相册/相机图片可能仍携带 orientation metadata，尺寸也可能明显大于 Gallery 参考输入；模型看到的 vision tensor 与用户预览不完全一致时，容易出现人物数、物体数这类视觉 grounding 漂移。
+- 本轮还发现当前未提交代码已经调用 `_readGalleryStyleVisionImageBytes(...)`，但函数定义缺失，`flutter analyze` 直接失败；这说明 iOS 图片质量补强处于半完成状态，必须补完整而不是继续叠 prompt。
+
+已完成：
+
+- `ios/Runner/IOSGemmaRuntime.swift` 新增 `prepareVisionImage` channel 方法：
+  - 使用 `UIImage(contentsOfFile:)` 读取 iOS 图片；
+  - 通过 `UIGraphicsImageRenderer` 按显示方向重绘，归一化 orientation；
+  - 长边限制到 1024，保持原始宽高比，不裁切人物；
+  - 输出 PNG bytes 给 Dart/`flutter_gemma` FFI。
+- `lib/src/core/runtime/platform_gemma_runtime.dart` 补齐 `_readGalleryStyleVisionImageBytes(...)`：
+  - iOS 优先调用 native UIKit 归一化；
+  - 缺少 channel 的测试/兜底环境使用 `dart:ui` codec 按同样长边 1024 + PNG 编码处理；
+  - 图片请求仍每次重建 image-capable session，并使用较低随机采样，减少 visible count 随机漂移。
+- Prompt 只保留“基于可见证据、无法确定就说明不确定”的通用视觉 grounding 指令，不加入固定人数或硬编码答案。
+
+验证：
+
+- 先验证到真实缺口：`flutter analyze` 失败于 `_readGalleryStyleVisionImageBytes` 未定义。
+- 修复后 `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过，8 个测试全部通过。
+- `flutter build ios --no-codesign`：通过，Swift/UIKit 归一化代码已完成 Xcode 编译。
+- `flutter build ios --release`：通过并完成签名。
+- `xcrun devicectl device install app --device 00008120-000605C42244201E build/ios/iphoneos/Runner.app`：安装成功，未使用 `flutter install`，避免主动卸载容器。
+- `xcrun devicectl device process launch --device 00008120-000605C42244201E --terminate-existing --console --timeout 12 com.example.gemmaLocalApp`：App 持续运行到 12 秒 timeout，未立刻退出。
+- `idevicecrashreport -u 00008120-000605C42244201E -k -e -f Runner .omx/logs/ios-crash-post-vision-fix`：只拉到 15:06 及更早旧 crash，15:32 安装/启动后没有新 Runner crash。
+- `flutter build apk --debug`：通过，确认 Android 参考路径未被本轮破坏。
+
+仍需真机专项：
+
+- 用用户反馈的“两个人”原图在 iOS 上重新跑图片识别，和 Android 同图输出做 A/B。
+- 如果归一化后仍把两个人回答成三个人，下一步继续查 `flutter_gemma` FFI 的 image JSON / LiteRT-LM vision encoder 行为；不能换成非 Gemma/cloud vision 作为本项目验收路径。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
