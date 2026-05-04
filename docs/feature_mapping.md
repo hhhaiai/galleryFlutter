@@ -93,4 +93,4 @@
 - SkillHub.cn：UI 中提供 `https://skillhub.cn/` 线上社区入口链接复制；当前不新增 `url_launcher` 依赖，先支持粘贴具体 Skill URL 导入。
 - Android runtime：Skills 模式会启用 Gallery 同款 `ToolProvider` 方向的原生工具集，`ConversationConfig.tools = listOf(tool(GemmaSkillToolSet(...)))`，并打开 constrained decoding；已接 `loadSkill`、`runJs`、`runIntent` 三个工具形态。
 - 当前工具执行边界：`loadSkill` 能返回内置/线上 skill instructions；`run_intent(send_email)` 会拉起 Android 邮件 Intent；Android 已内置 Gallery `assets/skills/*` 并通过本地 headless WebView 执行 bundled built-in `run_js`；image/webview 输出目前会以文字说明“UI 展示待接入”，线上/custom skill 的 JS 文件下载与执行仍待深化。
-- iOS/Flutter 侧目前只会展示 `FunctionCallResponse` 文本，尚未做 function call 分发和 tool result 回传。
+- iOS/Flutter 侧已把 Skills 模式下的 `loadSkill` / `runJs` / `runIntent` 作为 `flutter_gemma` tools 注册；`loadSkill` 可从 Dart enabledSkillDetails 返回 instructions 并回传模型继续生成，`runJs` / `runIntent` 仍返回诚实 `pending_bridge`，避免伪装已执行。

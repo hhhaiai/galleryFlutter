@@ -1585,6 +1585,32 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 3. 线上/custom skill 不能只保存 `SKILL.md`；要继续下载/校验 sibling `scripts/` 与 `assets/`，再纳入 sandbox 执行。
 4. Secret/API key 授权弹窗和本地保存仍未接。
 
+### 16.12 iOS/Dart Skills tool loop 第一阶段（2026-05-04）
+
+继续推进 iOS/Flutter 侧 Skills 诚实工具链，避免 iOS 只把 `FunctionCallResponse` 裸文本展示给用户。
+
+已完成：
+
+1. `platform_gemma_runtime.dart` 在 iOS Skills 模式下为 `flutter_gemma` `createChat(...)` 注册 `loadSkill` / `runJs` / `runIntent` tools，并启用 `supportsFunctionCalls` / `ToolChoice.auto`。
+2. iOS 文本/图片生成循环现在会处理 `FunctionCallResponse` / `ParallelFunctionCallResponse`：
+   - `loadSkill`：从 `GemmaRequest.enabledSkillDetails` 查找当前启用 skill，返回 `skill_instructions`，通过 `Message.toolResponse(...)` 回传模型，然后继续生成。
+   - `runJs`：返回 `pending_bridge`，明确 iOS/Dart JS 执行尚未接通。
+   - `runIntent`：返回 `pending_bridge`，明确 iOS/Dart platform intent 尚未接通。
+3. 最多允许 3 轮 tool response 循环，避免模型反复调用未接工具导致无限生成。
+
+验证：
+
+- `dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_prompt_and_skills.dart`：通过。
+- `flutter analyze`：通过。
+- `flutter build ios --no-codesign`：通过，输出 `build/ios/iphoneos/Runner.app`。
+- `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
+
+仍待做：
+
+1. iOS 真机触发 Skills 模式下的 `loadSkill` function call，验证 tool response 能稳定回到 Gemma 并生成最终答复。
+2. iOS/Dart 真正执行 `run_js` / `run_intent`，或把这些明确保留为 Android-only capability。
+3. Flutter UI 结构化展示 tool call / tool result，而不是只追加 `[tool:name] status` 文本。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：

@@ -354,6 +354,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'iOS flutter_gemma model 重新初始化失败。',
       );
     }
+    final tools = _iosSkillToolsFor(request);
     final chat = await currentModel.createChat(
       temperature: _config?.temperature ?? gemma4E2bIt.temperature,
       topK: _config?.topK ?? gemma4E2bIt.topK,
@@ -362,6 +363,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       supportAudio: false,
       modelType: fg.ModelType.gemma4,
       isThinking: false,
+      tools: tools,
+      supportsFunctionCalls: tools.isNotEmpty,
+      toolChoice: tools.isEmpty ? fg.ToolChoice.none : fg.ToolChoice.auto,
     );
     _flutterGemmaChat = chat;
 
@@ -389,14 +393,135 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       throw RuntimeUnavailableException('iOS 多模态/文本输入失败，已重置会话，请重试：$error');
     }
 
-    await for (final response in chat.generateChatResponseAsync()) {
-      if (response is fg.TextResponse) {
-        yield response.token;
-      } else if (response is fg.ThinkingResponse) {
-        yield response.content;
-      } else if (response is fg.FunctionCallResponse) {
-        yield '\n[function_call] ${response.name}: ${response.args}\n';
+    var toolRounds = 0;
+    var shouldContinueAfterTool = false;
+    do {
+      shouldContinueAfterTool = false;
+      await for (final response in chat.generateChatResponseAsync()) {
+        if (response is fg.TextResponse) {
+          yield response.token;
+        } else if (response is fg.ThinkingResponse) {
+          yield response.content;
+        } else if (response is fg.FunctionCallResponse) {
+          final toolResult = _executeDartSkillTool(response, request);
+          yield '\n[tool:${response.name}] ${toolResult['status'] ?? 'done'}\n';
+          await chat.addQueryChunk(
+            fg.Message.toolResponse(
+              toolName: response.name,
+              response: toolResult,
+            ),
+          );
+          shouldContinueAfterTool = true;
+        } else if (response is fg.ParallelFunctionCallResponse) {
+          for (final call in response.calls) {
+            final toolResult = _executeDartSkillTool(call, request);
+            yield '\n[tool:${call.name}] ${toolResult['status'] ?? 'done'}\n';
+            await chat.addQueryChunk(
+              fg.Message.toolResponse(
+                toolName: call.name,
+                response: toolResult,
+              ),
+            );
+          }
+          shouldContinueAfterTool = response.calls.isNotEmpty;
+        }
       }
+      toolRounds += 1;
+    } while (shouldContinueAfterTool && toolRounds < 3);
+  }
+
+  List<fg.Tool> _iosSkillToolsFor(GemmaRequest request) {
+    if (request.enabledSkillNames.isEmpty &&
+        request.enabledSkillDetails.isEmpty) {
+      return const [];
+    }
+    return const [
+      fg.Tool(
+        name: 'loadSkill',
+        description:
+            'Loads an enabled skill by name and returns its full instructions.',
+        parameters: {
+          'skillName': {
+            'type': 'string',
+            'description': 'The name of the enabled skill to load.',
+          },
+        },
+      ),
+      fg.Tool(
+        name: 'runJs',
+        description:
+            'Attempts to run a JS skill. iOS/Dart execution is not connected yet and returns an honest pending result.',
+        parameters: {
+          'skillName': {'type': 'string'},
+          'scriptName': {'type': 'string'},
+          'data': {'type': 'string'},
+        },
+      ),
+      fg.Tool(
+        name: 'runIntent',
+        description:
+            'Attempts to run a platform intent. iOS/Dart execution is not connected yet and returns an honest pending result.',
+        parameters: {
+          'intent': {'type': 'string'},
+          'parameters': {'type': 'string'},
+        },
+      ),
+    ];
+  }
+
+  Map<String, dynamic> _executeDartSkillTool(
+    fg.FunctionCallResponse call,
+    GemmaRequest request,
+  ) {
+    final normalizedName = call.name.replaceAll('_', '').toLowerCase();
+    switch (normalizedName) {
+      case 'loadskill':
+        final requestedName =
+            (call.args['skillName'] ?? call.args['skill_name'] ?? '')
+                .toString()
+                .trim();
+        final skill = request.enabledSkillDetails.firstWhere(
+          (skill) => skill['name'] == requestedName,
+          orElse: () => const {},
+        );
+        if (skill.isEmpty) {
+          return {
+            'status': 'failed',
+            'skill_name': requestedName,
+            'error': 'Skill not found or not enabled.',
+          };
+        }
+        return {
+          'status': 'succeeded',
+          'skill_name': skill['name'] ?? requestedName,
+          'skill_instructions':
+              '---\nname: ${skill['name'] ?? requestedName}\ndescription: ${skill['description'] ?? ''}\n---\n\n${skill['instructions'] ?? ''}',
+        };
+      case 'runjs':
+        return {
+          'status': 'pending_bridge',
+          'skill_name':
+              (call.args['skillName'] ?? call.args['skill_name'] ?? '')
+                  .toString(),
+          'script_name':
+              (call.args['scriptName'] ??
+                      call.args['script_name'] ??
+                      'index.html')
+                  .toString(),
+          'data': (call.args['data'] ?? '{}').toString(),
+          'result':
+              'iOS/Dart JS execution bridge is not implemented yet. Do not claim this JS skill has executed.',
+        };
+      case 'runintent':
+        return {
+          'status': 'pending_bridge',
+          'intent': (call.args['intent'] ?? '').toString(),
+          'parameters': (call.args['parameters'] ?? '{}').toString(),
+          'result':
+              'iOS/Dart intent execution bridge is not implemented yet. Do not claim this platform action has executed.',
+        };
+      default:
+        return {'status': 'failed', 'error': 'Unsupported tool: ${call.name}'};
     }
   }
 
