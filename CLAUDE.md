@@ -1718,6 +1718,30 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 2. iOS 真机用 `GEMMA_IOS_AUDIO_PROBE=true` 跑固定 WAV / 录音专项；如果仍 code 13，则把它记录为 Gemma iOS audio runtime blocker 并暂停本项目内 iOS audio 深测。
 3. 如果 iOS probe 有进展，再决定是否把默认 UI 从“关闭”调整为“实验开关”；否则继续保持默认关闭。
 
+### 16.16 Flutter test 短 build-dir 闸口恢复（2026-05-04）
+
+根因复查：
+
+- `flutter test --no-pub` 不是 Dart 测试逻辑失败，而是 Flutter tester 在 macOS Native Assets 安装阶段会把 dylib install name 改成绝对路径：
+  `.../build/native_assets/macos/libGemmaModelConstraintProvider.dylib`。
+- `flutter_gemma 0.14.1` 下载的 `libGemmaModelConstraintProvider.dylib` 没有足够 Mach-O load command/headerpad 空间，长路径写入时 `install_name_tool` 报：
+  `larger updated load commands do not fit`。
+- 直接重链/替换上游 prebuilt 不适合本轮低风险修改；当前项目核心目标是 Android/iOS Gemma 能力验证，macOS tester 只作为本地质量闸口。
+
+已完成：
+
+1. 新增 `tool/flutter_test_short_builddir.sh`：
+   - 使用项目内 `.dart_tool/flutter_test_config/settings`，不写用户全局 `~/.config/flutter/settings`。
+   - 将 Flutter `build-dir` 临时设为相对到 `/tmp/gla_ft` 的短路径，缩短 Flutter tester 需要写入 dylib 的绝对 install name。
+   - 继续执行 `flutter test --no-pub "$@"`，可传入单个测试文件或其它 flutter test 参数。
+2. 保留真实风险边界：
+   - 这不是上游 dylib 的根治；直接运行裸 `flutter test --no-pub` 在当前 repo 深路径下仍可能失败。
+   - 后续若升级 `flutter_gemma` 或重新发布带 `-headerpad_max_install_names` 的 macOS prebuilt，可移除 wrapper。
+
+验证：
+
+- `tool/flutter_test_short_builddir.sh`：通过，5 个测试全部通过。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
@@ -1733,7 +1757,7 @@ remote: https://github.com/hhhaiai/galleryFlutter.git
 1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
 2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，UI/播放保留 16k mono 16-bit PCM WAV，送模型前剥离为 raw PCM；iOS 只默认补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭，仅 `GEMMA_IOS_AUDIO_PROBE=true` 可打开固定 WAV harness。
 3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入与 SkillHub.cn 公开目录搜索/导入。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
-4. 验证辅助：`tool/check_prompt_and_skills.dart` 作为当前 macOS native asset 问题下的轻量 smoke gate；Flutter 原生测试仍需后续修复 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
+4. 验证辅助：`tool/check_prompt_and_skills.dart` 可快速验证 Prompt/Skills；`tool/flutter_test_short_builddir.sh` 已恢复 Flutter test 本地闸口。裸 `flutter test --no-pub` 仍需后续上游/根治 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 
 提交到 GitHub 时必须继续使用 Lore Commit Protocol，并在 commit message 中明确记录：
 
@@ -1754,7 +1778,7 @@ cd /Users/sanbo/Desktop/gallery/gemma_local_app
 ```bash
 dart format lib test
 flutter analyze
-flutter test
+tool/flutter_test_short_builddir.sh
 ```
 
 运行 macOS 版本：

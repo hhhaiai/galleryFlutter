@@ -66,6 +66,7 @@
 - [x] iOS/Dart Skills tool loop 第一阶段：Skills 模式下为 `flutter_gemma` 注册 `loadSkill` / `runJs` / `runIntent` tools；`loadSkill` 会把 Dart skill instructions 作为 tool response 回传模型继续生成，`runJs` / `runIntent` 仍明确返回 `pending_bridge`
 - [x] 按功能整理 Skills Hub 代码：Hub UI 抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入/持久化抽到 `lib/src/features/skills/skill_repository.dart`，Home 只保留状态编排和发送 Gemma 请求
 - [x] 增加 `tool/check_prompt_and_skills.dart`：绕开当前 macOS native asset 测试阻断，直接验证 Prompt Lab 插值和 Skills prompt 注入
+- [x] 恢复 Flutter test 本地闸口：新增 `tool/flutter_test_short_builddir.sh`，用项目内临时 Flutter config 把 tester build root 指向 `/tmp/gla_ft`，绕开 `flutter_gemma` macOS dylib headerpad 不足导致的长 install_name 重写失败；不修改用户全局 Flutter config
 - [x] 语音波形/静音判断补强：Android/iOS 波形估算改为解析 WAV PCM 16-bit sample，不再把 RIFF header 当作音量数据，降低 Live 静音切段误判
 - [x] Android AVD 33 smoke：debug APK 安装启动成功；首页核心 UI 可见；录音可进入“正在录音”，30 秒上限后自动回填 `播放语音 30"` 卡片；cache 中 WAV header 确认为 RIFF/WAVE、PCM、mono、16k、16-bit
 - [x] 文档同步到 `docs/`
@@ -79,7 +80,7 @@
 - [ ] Skills Hub 深化：SkillHub.cn 分页/排序/分类、评分/来源校验、签名或 hash 校验、更新检查
 - [ ] Skills 的 JS/WebView sandbox 深化：线上/custom skill JS 文件下载执行、webview 结果原生展示、secret/API key 管理、Android image 结果真机验证
 - [ ] iOS/Dart `FunctionCallResponse` 深化：接入真实 run_js/run_intent 执行、UI 结构化展示、多轮 tool 调用真机验证
-- [ ] 修复 macOS native asset `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题，使 `flutter test --no-pub` 可恢复
+- [ ] 上游/根治 macOS native asset `libGemmaModelConstraintProvider.dylib` headerpad 问题，使直接运行 `flutter test --no-pub` 也不依赖短 build-dir wrapper
 - [ ] iOS 真机模型下载后真实首轮对话验证：当前 Release 构建已通过，但 `devicectl` 安装到 iPhone 仍被签名完整性校验阻断，需要用 Xcode/签名设置修复后在设备上验证 token 输出
 - [ ] iOS 后台下载真机长时间验证：前台下载、切后台、取消、重启、断网恢复、续传后 size 校验
 - [ ] macOS/Windows/Linux 本地后端选型和接入
@@ -94,5 +95,5 @@ dart --disable-dart-dev --packages=.dart_tool/package_config.json tool/check_pro
 flutter build apk --debug
 cd android && ./gradlew :app:lintDebug
 cd .. && flutter build ios --no-codesign
-flutter test --no-pub  # 当前仍卡在 macOS native asset install_name_tool/headerpad 问题
+tool/flutter_test_short_builddir.sh  # 当前 Flutter test 入口；直接 flutter test --no-pub 仍会撞长 install_name/headerpad 问题
 ```
