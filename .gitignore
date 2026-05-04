@@ -44,3 +44,4 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 .omx/
+tool/ios_vision_probe_main.dart
