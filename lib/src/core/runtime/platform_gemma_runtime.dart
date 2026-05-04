@@ -5,6 +5,7 @@ import 'dart:typed_data' show ByteData, Endian, Uint8List;
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
+import 'package:flutter_gemma/core/ffi/litert_lm_client.dart' as fg_ffi;
 import 'package:flutter_gemma/flutter_gemma.dart' as fg;
 import 'package:path_provider/path_provider.dart';
 
@@ -40,6 +41,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   List<String> _androidEnabledSkillNames = const [];
   fg.InferenceModel? _flutterGemmaModel;
   fg.InferenceChat? _flutterGemmaChat;
+  fg_ffi.LiteRtLmFfiClient? _iosRawFfiClient;
 
   @override
   Future<void> initialize(GemmaModelConfig config) async {
@@ -359,6 +361,16 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     final isAudioRequest = request.audioPaths.isNotEmpty;
     final config = _config ?? gemma4E2bIt;
     final modelPath = await _resolveModelPath(config);
+    final tools = _iosSkillToolsFor(request);
+    if (isImageRequest && !isAudioRequest && tools.isEmpty) {
+      yield* _generateIosImageWithRawLiteRtLm(
+        request: request,
+        prompt: prompt,
+        config: config,
+        modelPath: modelPath,
+      );
+      return;
+    }
     if (isImageRequest || isAudioRequest) {
       await _initializeFlutterGemma(
         config,
@@ -384,7 +396,6 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'iOS flutter_gemma model 重新初始化失败。',
       );
     }
-    final tools = _iosSkillToolsFor(request);
     final chat = await currentModel.createChat(
       // Vision answers should be factual and stable. Keep text/skills creative
       // defaults, but reduce sampling for image grounding so counts and visible
@@ -477,6 +488,60 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       }
       toolRounds += 1;
     } while (shouldContinueAfterTool && toolRounds < 3);
+  }
+
+  Stream<String> _generateIosImageWithRawLiteRtLm({
+    required GemmaRequest request,
+    required String prompt,
+    required GemmaModelConfig config,
+    required String modelPath,
+  }) async* {
+    // flutter_gemma 0.14.1 manually wraps .litertlm messages with Gemma turn
+    // markers on iOS before sending them into the LiteRT-LM JSON conversation
+    // API. Android and non-iOS .litertlm paths send raw text and let LiteRT-LM
+    // own the chat template. For iOS vision this nested-template difference is
+    // a real quality risk, so image-only requests use the same raw JSON path as
+    // Android: content=[image,text] with an unwrapped prompt.
+    await _prepareFlutterGemmaModel(config, modelPath);
+    await _flutterGemmaChat?.session.close();
+    _flutterGemmaChat = null;
+    await _flutterGemmaModel?.close();
+    _flutterGemmaModel = null;
+
+    final firstImage = File(request.imagePaths.first);
+    if (!await firstImage.exists()) {
+      throw RuntimeUnavailableException('图片文件不存在：${request.imagePaths.first}');
+    }
+    final imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
+    final mediaPrompt = _visionPrompt(prompt);
+    final cacheDir = (await getApplicationSupportDirectory()).path;
+    final client = fg_ffi.LiteRtLmFfiClient();
+    _iosRawFfiClient = client;
+    try {
+      await client.initialize(
+        modelPath: modelPath,
+        backend: 'gpu',
+        maxTokens: 1024,
+        cacheDir: cacheDir,
+        enableVision: config.supportImage,
+        maxNumImages: config.supportImage ? 1 : 0,
+      );
+      client.createConversation(temperature: 0.1, topK: 1, topP: 0.95, seed: 1);
+      await for (final rawChunk in client.chatRaw(
+        mediaPrompt,
+        imageBytes: imageBytes,
+        enableThinking: false,
+      )) {
+        yield fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawChunk);
+      }
+    } catch (error) {
+      throw RuntimeUnavailableException('iOS 图片推理失败，已重置会话，请重试：$error');
+    } finally {
+      if (identical(_iosRawFfiClient, client)) {
+        _iosRawFfiClient = null;
+      }
+      client.shutdown();
+    }
   }
 
   Future<Uint8List> _readGemmaPcm16FromWav(String audioPath) async {
@@ -721,9 +786,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   String _visionPrompt(String prompt) {
     final trimmed = prompt.trim();
     if (_isDefaultVisionPrompt(trimmed)) {
-      return 'Look at the image carefully and describe only what is visible: main objects, people, scene, visible text, and important details. If a count or detail is uncertain, say it is uncertain instead of guessing. Respond in $_preferredReplyLanguageName.';
+      return 'Look at the image carefully and describe what is visible. Start with the main foreground subject and people, then mention background context separately. When counting people, report the main/foreground people first and keep tiny distant background figures or reflections separate as uncertain background details; do not merge them into one confident main count. Respond in $_preferredReplyLanguageName.';
     }
-    return 'Use the image as primary evidence and answer the user request. Do not infer invisible people or objects; if a visual detail is uncertain, say it is uncertain. Respond in $_preferredReplyLanguageName. User request: $trimmed';
+    return 'Use the image as primary evidence and answer the user request. Distinguish main foreground subjects from tiny distant background figures or reflections, especially for people counts; if a visual detail is uncertain, say it is uncertain instead of giving one blended count. Respond in $_preferredReplyLanguageName. User request: $trimmed';
   }
 
   String _audioPrompt(String prompt) {
@@ -899,6 +964,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   @override
   Future<void> stop() async {
     if (Platform.isIOS) {
+      _iosRawFfiClient?.cancelGeneration();
       await _flutterGemmaChat?.session.stopGeneration();
       return;
     }
@@ -914,6 +980,8 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     await _activeGenerationController?.close();
     _activeGenerationController = null;
     if (Platform.isIOS) {
+      _iosRawFfiClient?.shutdown();
+      _iosRawFfiClient = null;
       await _flutterGemmaChat?.session.close();
       _flutterGemmaChat = null;
       await _flutterGemmaModel?.close();

@@ -1895,6 +1895,46 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 - 用用户反馈的“两个人”原图在 iOS 上重新跑图片识别，和 Android 同图输出做 A/B。
 - 如果归一化后仍把两个人回答成三个人，下一步继续查 `flutter_gemma` FFI 的 image JSON / LiteRT-LM vision encoder 行为；不能换成非 Gemma/cloud vision 作为本项目验收路径。
 
+### 16.22 iOS 图片人数漂移二次根因（2026-05-04）
+
+用户复测后仍反馈：同一张两人图片 iOS 还是回答“三个人”。
+
+继续取证：
+
+- 已从 iPhone app 容器拉取最近的 `tmp/image_picker_*.jpg` 到 `.omx/logs/ios-images/`，最新图片为蓝色游船场景。
+- 直接查看图片可确认：主船/前景中是 1 个成年人 + 1 个儿童，共 2 个主要人物。
+- 同时图片远处岸边确实有很小的背景路人/人形。模型如果被提示“描述 people/visible people”但没有区分主体和背景，容易把背景小人混入一个确定总数，回答成“3 人”。这不是正确的产品体验；默认图片理解应该优先说“主体/前景两人”，背景小人只能单独标为远处/不确定。
+- 继续查 `flutter_gemma 0.14.1` FFI 代码还发现更深一层差异：`Message.transformToChatPrompt(...)` 对 iOS `.litertlm` 会手动添加 Gemma `<start_of_turn>...` turn markers；但 `.litertlm` FFI 实际走的是 LiteRT-LM JSON conversation API，Android / non-iOS `.litertlm` 路线都是传 raw text，由 LiteRT-LM SDK 自己处理模板。也就是说 iOS 图片链路存在 `JSON role=user + text 内再嵌一层 turn markers` 的 nested-template 风险，这和 Android Gallery 路线不一致，可能进一步影响视觉 grounding。
+
+已完成：
+
+- iOS 普通图片请求（不带 audio、不带 Skills tools）绕过 `flutter_gemma` 的 `InferenceChat/Message.transformToChatPrompt` path，改为直接使用 `LiteRtLmFfiClient`：
+  - `initialize(... enableVision: true, maxNumImages: 1)`；
+  - `createConversation(temperature: 0.1, topK: 1, topP: 0.95, seed: 1)`；
+  - `chatRaw(mediaPrompt, imageBytes: normalizedPng)`；
+  - 让 LiteRT-LM JSON conversation API 接收 `content=[image,text]` 和未包 turn markers 的 raw prompt，尽量贴近 Android `Content.ImageBytes + Content.Text(prompt)`。
+- `stop()` / `dispose()` 已能取消和释放这个 iOS raw FFI client。
+- `_visionPrompt(...)` 调整为更准确的视觉 grounding：
+  - 默认先描述 main foreground subject / people；
+  - 对人数问题先给主体/前景人数；
+  - 远处很小的背景人形、倒影、人形物体要单独说明为 background/uncertain；
+  - 不把背景小人和主体混成一个确定主人数。
+- 这仍然是 Gemma 本地推理，不引入非 Gemma 视觉模型，也没有写死“这张图是两个人”。
+
+验证：
+
+- `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过，8 个测试全部通过。
+- `flutter build ios --no-codesign`：通过，确认 raw FFI import 和 iOS 编译可过。
+- `flutter build ios --release`：通过并完成签名。
+- `flutter build apk --debug`：通过。
+- iPhone 安装复测暂未完成：构建完成后设备 `people` 变为 `unavailable`，`devicectl` 报 `CoreDeviceService was unable to locate a device matching the requested device identifier`；需要设备重新解锁/连接后再安装复测。
+
+仍需真机专项：
+
+- 安装新构建后，用同一张蓝色游船图复测 iOS 图片识别；预期回答应类似“主体/前景有两个人，远处背景可能有很小的路人/人形，不确定是否计入”。
+- 如果仍输出单一“三个人”，下一步继续在 raw FFI 层记录 exact message JSON / normalized PNG hash / backend，并比较 GPU vs CPU vision backend，不改变 Gemma-4-E2B-it 作为本地基础模型的边界。
+
 ## 17. 本地整理与提交边界（2026-05-04）
 
 当前工程已经是独立 Git 仓库：
