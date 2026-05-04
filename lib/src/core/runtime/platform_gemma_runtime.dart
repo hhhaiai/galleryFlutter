@@ -26,10 +26,6 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   static const _eventChannel = EventChannel(
     'com.example.gemma_local_app/runtime_events',
   );
-  static const _iosAudioProbeEnabled = bool.fromEnvironment(
-    'GEMMA_IOS_AUDIO_PROBE',
-  );
-
   StreamController<String>? _activeGenerationController;
   StreamSubscription<dynamic>? _eventSubscription;
   GemmaModelConfig? _config;
@@ -165,6 +161,16 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     }
   }
 
+  fg.ModelType _flutterGemmaModelType(GemmaModelConfig config) {
+    switch (config.modelTypeName) {
+      case 'gemmaIt':
+        return fg.ModelType.gemmaIt;
+      case 'gemma4':
+      default:
+        return fg.ModelType.gemma4;
+    }
+  }
+
   Future<void> _prepareFlutterGemmaModel(
     GemmaModelConfig config,
     String modelPath,
@@ -185,7 +191,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     try {
       await fg.FlutterGemma.initialize(maxDownloadRetries: 8);
       await fg.FlutterGemma.installModel(
-        modelType: fg.ModelType.gemma4,
+        modelType: _flutterGemmaModelType(config),
         fileType: fg.ModelFileType.litertlm,
       ).fromFile(modelPath).install();
     } catch (error) {
@@ -346,24 +352,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   Stream<String> _generateWithFlutterGemma(GemmaRequest request) async* {
-    if (request.audioPaths.isNotEmpty && !_iosAudioProbeEnabled) {
-      throw const RuntimeUnavailableException(
-        'iOS 当前的 flutter_gemma + Gemma-4-E2B-it 音频理解链路会触发 Failed to start streaming (code: 13)。为保证稳定性，iOS 端暂时关闭语音输入 / Live 语音通话；本项目不会用非 Gemma ASR 方案替代 Gemma 原生 audio 能力验收。',
-      );
-    }
     final prompt = _contextualPrompt(request);
 
     // iOS .litertlm FFI multimodal sessions are not reliably reusable. Rebuild
-    // per media request so text/image/audio probe modalities stay isolated.
-    // Audio remains disabled by default; GEMMA_IOS_AUDIO_PROBE enables this
-    // fixed-WAV harness only for validating Gemma native audio, not for release.
+    // per media request so text/image/audio modalities stay isolated.
     final isImageRequest = request.imagePaths.isNotEmpty;
     final isAudioRequest = request.audioPaths.isNotEmpty;
     final config = _config ?? gemma4E2bIt;
-    final modelPath = await _resolveModelPath(config);
+    var modelPath = await _resolveModelPath(config);
+
     final tools = _iosSkillToolsFor(request);
-    if (isImageRequest && !isAudioRequest && tools.isEmpty) {
-      yield* _generateIosImageWithRawLiteRtLm(
+    if ((isImageRequest || isAudioRequest) && tools.isEmpty) {
+      yield* _generateIosMediaWithRawLiteRtLm(
         request: request,
         prompt: prompt,
         config: config,
@@ -371,9 +371,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       );
       return;
     }
+    // 这里处理的是：纯文字、图片、或图片+Skills 的 flutter_gemma 高级 API 路径。
+    final effectiveConfig = config;
     if (isImageRequest || isAudioRequest) {
       await _initializeFlutterGemma(
-        config,
+        effectiveConfig,
         modelPath,
         forceReload: true,
         supportImage: isImageRequest,
@@ -381,7 +383,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       );
     } else if (_flutterGemmaModel == null) {
       await _initializeFlutterGemma(
-        config,
+        effectiveConfig,
         modelPath,
         supportImage: false,
         supportAudio: false,
@@ -407,7 +409,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       topP: _config?.topP ?? gemma4E2bIt.topP,
       supportImage: isImageRequest,
       supportAudio: isAudioRequest,
-      modelType: fg.ModelType.gemma4,
+      modelType: _flutterGemmaModelType(effectiveConfig),
       isThinking: false,
       tools: tools,
       supportsFunctionCalls: tools.isNotEmpty,
@@ -490,7 +492,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     } while (shouldContinueAfterTool && toolRounds < 3);
   }
 
-  Stream<String> _generateIosImageWithRawLiteRtLm({
+  Stream<String> _generateIosMediaWithRawLiteRtLm({
     required GemmaRequest request,
     required String prompt,
     required GemmaModelConfig config,
@@ -499,21 +501,41 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     // flutter_gemma 0.14.1 manually wraps .litertlm messages with Gemma turn
     // markers on iOS before sending them into the LiteRT-LM JSON conversation
     // API. Android and non-iOS .litertlm paths send raw text and let LiteRT-LM
-    // own the chat template. For iOS vision this nested-template difference is
-    // a real quality risk, so image-only requests use the same raw JSON path as
-    // Android: content=[image,text] with an unwrapped prompt.
+    // own the chat template. For iOS vision and audio this nested-template
+    // difference causes quality issues (vision) and code 13 errors (audio).
+    // All media requests use the raw JSON path: content=[image?,audio,text]
+    // with an unwrapped prompt.
     await _prepareFlutterGemmaModel(config, modelPath);
     await _flutterGemmaChat?.session.close();
     _flutterGemmaChat = null;
     await _flutterGemmaModel?.close();
     _flutterGemmaModel = null;
 
-    final firstImage = File(request.imagePaths.first);
-    if (!await firstImage.exists()) {
-      throw RuntimeUnavailableException('图片文件不存在：${request.imagePaths.first}');
+    final isImageRequest = request.imagePaths.isNotEmpty;
+    final isAudioRequest = request.audioPaths.isNotEmpty;
+
+    Uint8List? imageBytes;
+    if (isImageRequest) {
+      final firstImage = File(request.imagePaths.first);
+      if (!await firstImage.exists()) {
+        throw RuntimeUnavailableException(
+          '图片文件不存在：${request.imagePaths.first}',
+        );
+      }
+      imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
     }
-    final imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
-    final mediaPrompt = _visionPrompt(prompt);
+
+    Uint8List? audioBytes;
+    if (isAudioRequest) {
+      audioBytes = await _readGemmaPcm16FromWav(request.audioPaths.first);
+    }
+
+    final mediaPrompt = isImageRequest && isAudioRequest
+        ? _imageAndAudioPrompt(prompt)
+        : isImageRequest
+        ? _visionPrompt(prompt)
+        : _audioPrompt(prompt);
+
     final cacheDir = (await getApplicationSupportDirectory()).path;
     final client = fg_ffi.LiteRtLmFfiClient();
     _iosRawFfiClient = client;
@@ -523,19 +545,21 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         backend: 'gpu',
         maxTokens: 1024,
         cacheDir: cacheDir,
-        enableVision: config.supportImage,
-        maxNumImages: config.supportImage ? 1 : 0,
+        enableVision: isImageRequest && config.supportImage,
+        maxNumImages: isImageRequest && config.supportImage ? 1 : 0,
+        enableAudio: isAudioRequest && config.supportAudio,
       );
       client.createConversation(temperature: 0.1, topK: 1, topP: 0.95, seed: 1);
       await for (final rawChunk in client.chatRaw(
         mediaPrompt,
         imageBytes: imageBytes,
+        audioBytes: audioBytes,
         enableThinking: false,
       )) {
         yield fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawChunk);
       }
     } catch (error) {
-      throw RuntimeUnavailableException('iOS 图片推理失败，已重置会话，请重试：$error');
+      throw RuntimeUnavailableException('iOS 多模态推理失败，已重置会话，请重试：$error');
     } finally {
       if (identical(_iosRawFfiClient, client)) {
         _iosRawFfiClient = null;

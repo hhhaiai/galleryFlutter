@@ -3,21 +3,30 @@ import 'package:flutter/material.dart';
 import '../../core/model/gemma_model_config.dart';
 import 'model_download_service.dart';
 
-class ModelsDrawer extends StatelessWidget {
-  const ModelsDrawer({
-    super.key,
+class ModelEntry {
+  const ModelEntry({
+    required this.config,
     required this.status,
     required this.onDownload,
     required this.onCancel,
     required this.onDelete,
     required this.onRefresh,
+    this.tag,
   });
 
+  final GemmaModelConfig config;
   final ModelDownloadStatus status;
   final VoidCallback onDownload;
   final VoidCallback onCancel;
   final VoidCallback onDelete;
   final VoidCallback onRefresh;
+  final String? tag;
+}
+
+class ModelsDrawer extends StatelessWidget {
+  const ModelsDrawer({super.key, required this.models});
+
+  final List<ModelEntry> models;
 
   @override
   Widget build(BuildContext context) {
@@ -30,13 +39,11 @@ class ModelsDrawer extends StatelessWidget {
             const SizedBox(height: 20),
             Text('Models', style: Theme.of(context).textTheme.titleLarge),
             const SizedBox(height: 12),
-            _ModelDownloadCard(
-              status: status,
-              onDownload: onDownload,
-              onCancel: onCancel,
-              onDelete: onDelete,
-              onRefresh: onRefresh,
-            ),
+            for (final entry in models)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: _ModelDownloadCard(entry: entry),
+              ),
           ],
         ),
       ),
@@ -45,23 +52,14 @@ class ModelsDrawer extends StatelessWidget {
 }
 
 class _ModelDownloadCard extends StatelessWidget {
-  const _ModelDownloadCard({
-    required this.status,
-    required this.onDownload,
-    required this.onCancel,
-    required this.onDelete,
-    required this.onRefresh,
-  });
+  const _ModelDownloadCard({required this.entry});
 
-  final ModelDownloadStatus status;
-  final VoidCallback onDownload;
-  final VoidCallback onCancel;
-  final VoidCallback onDelete;
-  final VoidCallback onRefresh;
+  final ModelEntry entry;
 
   @override
   Widget build(BuildContext context) {
-    final config = gemma4E2bIt;
+    final config = entry.config;
+    final status = entry.status;
     final progress = status.clampedProgress;
     final percent = (progress * 100).clamp(0, 100).toStringAsFixed(1);
     final eta = _formatDuration(status.estimatedRemaining);
@@ -71,7 +69,36 @@ class _ModelDownloadCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(config.name, style: Theme.of(context).textTheme.titleMedium),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    config.name,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                if (entry.tag != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.primaryContainer.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      entry.tag!,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
             const SizedBox(height: 8),
             Text(config.modelFile),
             const SizedBox(height: 8),
@@ -104,7 +131,7 @@ class _ModelDownloadCard extends StatelessWidget {
                 FilledButton.icon(
                   onPressed: status.type == ModelDownloadStatusType.inProgress
                       ? null
-                      : onDownload,
+                      : entry.onDownload,
                   icon: const Icon(Icons.download),
                   label: Text(
                     status.type == ModelDownloadStatusType.partiallyDownloaded
@@ -114,18 +141,18 @@ class _ModelDownloadCard extends StatelessWidget {
                 ),
                 if (status.type == ModelDownloadStatusType.inProgress)
                   OutlinedButton.icon(
-                    onPressed: onCancel,
+                    onPressed: entry.onCancel,
                     icon: const Icon(Icons.stop),
                     label: const Text('暂停'),
                   ),
                 OutlinedButton.icon(
-                  onPressed: onRefresh,
+                  onPressed: entry.onRefresh,
                   icon: const Icon(Icons.refresh),
                   label: const Text('刷新'),
                 ),
                 if (status.type != ModelDownloadStatusType.notDownloaded)
                   TextButton.icon(
-                    onPressed: onDelete,
+                    onPressed: entry.onDelete,
                     icon: const Icon(Icons.delete_outline),
                     label: const Text('删除'),
                   ),

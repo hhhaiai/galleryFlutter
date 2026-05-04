@@ -244,12 +244,9 @@ class ModelDownloadController {
     _emit(_fallback.status);
   }
 
-  void cancel() {
+  void cancel(GemmaModelConfig config) {
     if (Platform.isAndroid || Platform.isIOS) {
-      _nativeMethodChannel.invokeMethod<void>(
-        'cancel',
-        _nativeArgs(gemma4E2bIt),
-      );
+      _nativeMethodChannel.invokeMethod<void>('cancel', _nativeArgs(config));
       return;
     }
     _fallback.cancel();

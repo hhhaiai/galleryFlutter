@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:io' show File, Platform;
+import 'dart:io' show File;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,6 +36,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   final _scrollController = ScrollController();
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
   StreamSubscription<AudioInputEvent>? _audioEventSubscription;
+
+  GemmaModelConfig get _activeModel => gemma4E2bIt;
 
   ModelDownloadStatus _downloadStatus = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
@@ -88,7 +90,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       if (mounted) setState(() => _downloadStatus = status);
     });
     _audioEventSubscription = _audioInput.events.listen(_handleAudioInputEvent);
-    _downloadController.refreshStatus(gemma4E2bIt).then((status) {
+    _downloadController.refreshStatus(_activeModel).then((status) {
       if (mounted) setState(() => _downloadStatus = status);
     });
     _loadOnlineSkills();
@@ -110,7 +112,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _downloadModel() async {
-    await _downloadController.download(gemma4E2bIt);
+    await _downloadController.download(_activeModel);
   }
 
   Future<void> _loadOnlineSkills() async {
@@ -164,7 +166,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       audioAttachments.length,
     );
     if (!_downloadStatus.isDownloaded) {
-      _showSnackBar('请先从左侧菜单进入「Models」下载 ${gemma4E2bIt.name}。下载完成后再发送。');
+      _showSnackBar('请先从左侧菜单进入「Models」下载 ${_activeModel.name}。下载完成后再发送。');
       return;
     }
     _inputController.clear();
@@ -222,7 +224,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _scrollToBottom();
 
     try {
-      await _runtime.initialize(gemma4E2bIt);
+      await _runtime.initialize(_activeModel);
       await for (final token in _runtime.generate(
         GemmaRequest(
           prompt: prompt,
@@ -495,12 +497,6 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _pickAudioFile() async {
-    if (Platform.isIOS && !_iosAudioProbeEnabled) {
-      _showSnackBar(
-        'iOS 语音理解当前为稳定性已暂时关闭；本项目会继续验证 Gemma 原生 audio，不用非 Gemma ASR 方案替代验收。',
-      );
-      return;
-    }
     if (_liveCallActive) {
       _showSnackBar('Live 语音通话进行中，请先停止 Live 再选择语音文件。');
       return;
@@ -520,12 +516,6 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _toggleRecording() async {
-    if (Platform.isIOS && !_iosAudioProbeEnabled) {
-      _showSnackBar(
-        'iOS 实时录音当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 会触发 code 13。',
-      );
-      return;
-    }
     if (_liveCallActive) {
       _showSnackBar('Live 语音通话进行中，请先停止 Live。');
       return;
@@ -558,12 +548,6 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<void> _toggleLiveVoiceCall() async {
-    if (Platform.isIOS && !_iosAudioProbeEnabled) {
-      _showSnackBar(
-        'iOS Live 语音通话当前为稳定性已暂时关闭；当前 flutter_gemma + Gemma-4-E2B-it 音频链路会触发 code 13。',
-      );
-      return;
-    }
     if (_liveCallActive) {
       await _stopLiveVoiceCall(showToast: true);
       return;
@@ -573,7 +557,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       return;
     }
     if (!_downloadStatus.isDownloaded) {
-      _showSnackBar('请先下载 ${gemma4E2bIt.name}，再开启 Live 语音通话。');
+      _showSnackBar('请先下载 ${_activeModel.name}，再开启 Live 语音通话。');
       return;
     }
     final supported = await _audioInput.isSupported;
@@ -897,7 +881,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     _stopRequested = false;
     final buffer = StringBuffer();
     try {
-      await _runtime.initialize(gemma4E2bIt);
+      await _runtime.initialize(_activeModel);
       await for (final token in _runtime.generate(request)) {
         if (_stopRequested || !_liveCallActive) break;
         buffer.write(token);
@@ -1103,11 +1087,17 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         ],
       ),
       drawer: ModelsDrawer(
-        status: _downloadStatus,
-        onDownload: _downloadModel,
-        onCancel: _downloadController.cancel,
-        onDelete: () => _downloadController.delete(gemma4E2bIt),
-        onRefresh: () => _downloadController.refreshStatus(gemma4E2bIt),
+        models: [
+          ModelEntry(
+            config: gemma4E2bIt,
+            status: _downloadStatus,
+            onDownload: _downloadModel,
+            onCancel: () => _downloadController.cancel(_activeModel),
+            onDelete: () => _downloadController.delete(_activeModel),
+            onRefresh: () => _downloadController.refreshStatus(_activeModel),
+            tag: '主力模型',
+          ),
+        ],
       ),
       body: Stack(
         children: [
@@ -2302,8 +2292,6 @@ enum _ComposerMode {
   final String label;
   final IconData icon;
 }
-
-const _iosAudioProbeEnabled = bool.fromEnvironment('GEMMA_IOS_AUDIO_PROBE');
 
 enum _ChatRole { user, assistant }
 

@@ -371,10 +371,36 @@ final class IOSAudioInput: NSObject, UIDocumentPickerDelegate, AVAudioRecorderDe
     guard ascii(data, 0, 4) == "RIFF", ascii(data, 8, 4) == "WAVE" else {
       throw NSError(domain: "IOSAudioInput", code: 1102, userInfo: [NSLocalizedDescriptionKey: "不是有效的 RIFF/WAVE 文件。"])
     }
-    let audioFormat = littleUInt16(data, 20)
-    let channels = littleUInt16(data, 22)
-    let rate = littleUInt32(data, 24)
-    let bits = littleUInt16(data, 34)
+    // Walk chunks instead of assuming fixed offsets — AVAudioRecorder may
+    // write extra chunks (fact, LIST, …) before fmt / data.
+    var offset = 12
+    var audioFormat: UInt16 = 0
+    var channels: UInt16 = 0
+    var rate: UInt32 = 0
+    var bits: UInt16 = 0
+    var foundFmt = false
+    while offset + 8 <= data.count {
+      let chunkId = ascii(data, offset, 4)
+      let chunkSize = Int(littleUInt32(data, offset + 4))
+      let chunkDataOffset = offset + 8
+      guard chunkSize >= 0, chunkDataOffset + chunkSize <= data.count else { break }
+      if chunkId == "fmt " {
+        guard chunkSize >= 16 else {
+          throw NSError(domain: "IOSAudioInput", code: 1103, userInfo: [NSLocalizedDescriptionKey: "WAV fmt chunk 太小。"])
+        }
+        audioFormat = littleUInt16(data, chunkDataOffset)
+        channels = littleUInt16(data, chunkDataOffset + 2)
+        rate = littleUInt32(data, chunkDataOffset + 4)
+        bits = littleUInt16(data, chunkDataOffset + 14)
+        foundFmt = true
+      } else if chunkId == "data" {
+        break
+      }
+      offset = chunkDataOffset + chunkSize + (chunkSize & 1)
+    }
+    guard foundFmt else {
+      throw NSError(domain: "IOSAudioInput", code: 1103, userInfo: [NSLocalizedDescriptionKey: "WAV 文件缺少 fmt chunk。"])
+    }
     guard audioFormat == 1 || audioFormat == 0xFFFE else {
       throw NSError(domain: "IOSAudioInput", code: 1103, userInfo: [NSLocalizedDescriptionKey: "WAV 必须是 PCM 格式。"])
     }

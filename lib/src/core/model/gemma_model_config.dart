@@ -39,6 +39,7 @@ class GemmaModelConfig {
     required this.visionAccelerator,
     required this.taskIds,
     required this.bestForTaskIds,
+    this.modelTypeName = 'gemma4',
   });
 
   final String name;
@@ -60,6 +61,7 @@ class GemmaModelConfig {
   final GemmaAccelerator visionAccelerator;
   final List<GemmaTaskId> taskIds;
   final List<GemmaTaskId> bestForTaskIds;
+  final String modelTypeName;
 
   String get huggingFaceDownloadUrl =>
       'https://huggingface.co/$modelId/resolve/$commitHash/$modelFile?download=true';
@@ -107,3 +109,5 @@ const gemma4E2bIt = GemmaModelConfig(
     GemmaTaskId.askAudio,
   ],
 );
+
+const availableModels = [gemma4E2bIt];
