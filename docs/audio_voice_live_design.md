@@ -106,10 +106,10 @@ stopPlayback()
 - 语音文件通过系统 `ACTION_OPEN_DOCUMENT audio/*` 选择；若是 m4a/mp3 等压缩音频，原生侧会先解码为 PCM，再统一封装成 16k / mono / 16-bit WAV 保存到 cacheDir。
 - 播放使用 `MediaPlayer`。
 - 波形估算解析 WAV 的 PCM 16-bit data chunk 后按 sample 振幅分桶，不再直接统计包含 RIFF header 的原始字节；Live 静音判断因此更接近真实音量。
-- 发送给模型时读取第一条 `audioPaths.take(1)`，解析 WAV `data` chunk，送入 `Content.AudioBytes` 的是 16k / mono / 16-bit raw PCM，不包含 RIFF/WAVE header。
+- 发送给模型时读取第一条 `audioPaths.take(1)`，解析并归一化 WAV `data` chunk 后重新构造完整 16k / mono / 16-bit WAV，送入 `Content.AudioBytes`。这与 Google AI Edge Gallery 的 `ChatMessageAudioClip.genByteArrayForWav()` 路径一致。
 - `EngineConfig.audioBackend = Backend.CPU()`。
 
-注意：当前 Android runtime 对 UI/播放保留 16k mono PCM WAV 文件，但模型输入会剥离 WAV header，仅把 raw PCM 交给 `Content.AudioBytes`，以对齐 Google AI Edge Gallery 的 Ask Audio 路径。
+注意：当前 Android runtime 对 UI/播放保留 16k mono PCM WAV 文件，模型输入也保留 WAV 容器。旧版“剥离 WAV header 后只发 raw PCM”的说明已废弃，因为 Gallery 的 Ask Audio 路径实际是 raw PCM + 44 字节 WAV header。
 
 ### iOS
 
@@ -129,26 +129,12 @@ lib/src/core/runtime/platform_gemma_runtime.dart
   - `UIDocumentPickerViewController` 选择语音文件。
   - `AVAudioRecorder` 录制 16k / mono / 16-bit PCM WAV 语音。
   - `AVAudioPlayer` 点击播放已发送语音。
-- flutter_gemma API 已存在 `Message.withAudio(...)`、`supportAudio`、`enableAudioModality`、`addAudio(...)` 能力，但当前真机验证显示 `Gemma-4-E2B-it` 音频链路会触发 `Failed to start streaming (code: 13)`。
-- 因此 iOS 运行时默认继续拦截 `audioPaths`，暂不暴露 audio 给普通用户；已增加固定 WAV harness：仅在 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 时打开 iOS 语音入口，并把 16k mono PCM WAV 的 `data` chunk 剥离为 raw PCM 后送 `Message` audioBytes，用于真机专项复现/验证。目标发送方式仍是：
-- iOS audio input 的波形估算也已改为解析 WAV PCM 16-bit sample，保持和 Android 一致。
+- flutter_gemma API 已存在 `Message.withAudio(...)`、`supportAudio`、`enableAudioModality`、`addAudio(...)` 能力；本项目 iOS 默认对齐 Google AI Edge allowlist 使用 Gemma 3n，并绕过插件高级封装，直接使用 LiteRT-LM raw FFI Conversation JSON。
+- iOS 原生 `audio_input` channel 已接入文件选择/录音/播放，`audio_input_events` 已能输出录音状态和电平事件，文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
+- 2026-05-14 修复了 iOS 语音识别失败的关键输入格式问题：Dart 侧不再剥离 WAV `data` chunk 后只发送 raw PCM，而是保留完整 WAV 容器；针对 people iPhone 复测出现的 `Failed to start streaming (code: 13)`，当前会进一步把 iOS/macOS 常见的 `FLLR` 等 padding/metadata chunk 规整为最小 44-byte `RIFF/fmt/data` 16k mono 16-bit PCM WAV 后再传给 FFI。剥离 header 会导致 LiteRT-LM 侧拿到无容器的 opaque PCM blob；带额外 chunk 的容器则可能触发 iOS LiteRT-LM streaming code 13。
+- 与图片一致，音频属于多模态请求；每次 iOS media request 会重建 raw FFI client/conversation，避免文字会话模板与多模态 JSON 混用。audio-only 请求优先使用 CPU backend，并在失败时 fallback GPU，错误会带出已尝试 backend。默认走 path-based JSON + 非流式 `sendMessage(...)`，并固定 text -> image -> audio 顺序，让 Gemma3DataProcessor 负责音频预处理。
 
-```dart
-fg.Message.withAudio(
-  text: _audioPrompt(prompt),
-  audioBytes: rawPcm16Bytes,
-  isUser: true,
-)
-```
-
-当前稳定策略：
-
-- 与图片一致，音频属于多模态请求；如果未来重新打开 iOS audio runtime，每次音频请求先 `forceReload` 重建 flutter_gemma model/client/session，优先保证稳定。
-- 普通文字请求不做完整重启。
-
-已补基础能力：iOS 原生 `audio_input` channel 已接入文件选择/录音/播放，`audio_input_events` 已能输出录音状态和电平事件，文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验；Dart probe 会再次校验并只取 raw PCM bytes。
-
-待补：使用 `GEMMA_IOS_AUDIO_PROBE=true` 在真机跑固定 WAV / 录音专项验证。验证前默认 UI 继续关闭 iOS 语音理解入口，避免影响文字/图片稳定。
+当前 people iPhone profile smoke 已验证固定 WAV 能被模型处理并返回 `AUDIO_RECEIVED`。后续真机专项仍需覆盖自然录音、选择 WAV、选择 m4a/mp3 后转 WAV，以及 Gemma 实际转写质量。
 
 ## Live 语音通话方案探索
 
@@ -213,7 +199,7 @@ Chat transcript append assistant text
 P0：
 
 - Android：真机验证语音文件、实时录音、点击播放、Gemma 语音理解；重点覆盖应用内录音、标准 wav、m4a、mp3、第三方 App 导出音频。
-- iOS：固定 WAV harness 验证 `flutter_gemma Message.withAudio(...)`；若仍 code 13，记录 Gemma iOS audio blocker 并暂停本项目内 iOS audio 深测，不用非 Gemma ASR 方案替代验收。
+- iOS：真机验证完整 WAV bytes FFI 路径；若仍 code 13 或不识别，记录 Gemma/iOS FFI audio blocker，不用非 Gemma ASR 方案替代验收。
 
 P1：
 
@@ -227,3 +213,85 @@ P2：
 - Live Phase 2：原生 PCM streaming + VAD。
 - AI 文字回复接 TTS，形成完整语音对话。
 - 多平台桌面音频文件支持。
+
+
+## 2026-05-14 语音识别修复记录
+
+本轮针对“iOS 语音不识别，Android 也不识别”做了代码级收口：
+
+1. iOS FFI 音频输入格式修复：
+   - 文件：`lib/src/core/runtime/platform_gemma_runtime.dart`
+   - `_readGemmaPcm16FromWav` 改为 `_readGemmaWavBytes`。
+   - 保留完整 16k mono 16-bit WAV bytes 传给 `LiteRtLmFfiClient.chatRaw(audioBytes: ...)`。
+   - 依据：`flutter_gemma 0.14.1` 官方 example 录音后直接发送原始 WAV；Google Android Gallery 也是 raw PCM 重新加 WAV header 后传 `Content.AudioBytes`。
+
+2. Android 录音保存稳定性修复：
+   - 文件：`android/app/src/main/kotlin/com/example/gemma_local_app/MainActivity.kt`
+   - `stopRecording()` 先主动 `AudioRecord.stop()` 以打断阻塞中的 `read()`，再等待录音线程完成 WAV 写入。
+   - 如果线程未结束或文件仍为空，不再把未完成/空 WAV 交给模型，而是返回 `RECORD_SAVE_FAILED`。
+
+3. 默认语音 prompt 加强：
+   - 默认语音输入先要求“准确转写语音”，再总结/回答。
+   - 对姓名、数字、日期、短语和不确定点做明确要求，减少模型只泛泛总结或忽略语音的概率。
+
+验证：
+
+- `flutter analyze`：通过。
+- `tool/flutter_test_short_builddir.sh`：通过，9 tests。
+- `./android/gradlew -p android :app:assembleDebug --offline`：通过。
+- `flutter build ios --simulator --debug --no-pub`：通过，产物 `build/ios/iphonesimulator/Runner.app`。
+- Android 真机 `adb install -r -d build/app/outputs/flutter-apk/app-debug.apk`：通过；启动后模型仍为 `已下载`，未见当前进程 FATAL。
+
+限制：
+
+- people iPhone 已重新 USB 连接；当前已完成 iOS code 13 输入格式/CPU backend 修复与单元测试，仍需把最新构建安装到 people iPhone 并在 UI 重新发送语音确认真实转写。
+- Android 已完成安装/启动/模型文件存在验证，并通过 UI 录音发送进入 LiteRT-LM audio runtime；由于本轮音源来自电脑外放/环境噪声，转写质量仍需用户对着手机清晰复测。
+
+## 2026-05-14 录音交互稳定性补强
+
+- 录音中再次点击 composer「语音」按钮会直接停止录音并附加到输入框，不再先弹出 bottom sheet，避免“看起来点了停止但还在录”的误操作。
+- 点击「发送」时如果仍处于录音中，Flutter 会先调用 `stopRecording()` 并把生成的 WAV 附件加入本次请求；停止失败则不发送，避免空语音或旧语音误发。
+- Android 原生 `AndroidAudioInput` 增加保存日志：`recording saved`、`recording ready`、`recording save incomplete`，便于 adb/logcat 验证录音文件是否真正写完。
+- Android 真机验证记录：录音中点击 composer 语音按钮可直接停止并出现附件；发送后 logcat 出现 `GemmaLiteRtRuntime: audio input ready: wavBytes=176044`，界面输出“转录：你好，这是第二四期音讯测试。请实别这句。”和总结，说明录音停止、附件发送、LiteRT-LM audio runtime 与模型转写链路已打通。
+
+## 2026-05-14 Android 语音复测纠偏
+
+- 复测纠偏：直接用手机麦克风录电脑外放时，Gemma 会明显幻听，不能作为语音识别质量结论；将同一个 UI 附件文件替换为清晰 16k mono WAV 后复测，logcat 显示 `audio input ready: wavBytes=246564`，UI 转写为“你好，这是一个非常清晰的语音测试。今天是5月14日，请准确地读出这句。”，说明 App audio 文件链路可用，主要风险在麦克风采集/环境声与模型 ASR 精度。
+
+### Google AI Edge iOS 对齐结论（2026-05-14）
+
+官方 `google-ai-edge/gallery/model_allowlists/ios_1_0_0.json` 的 iOS 可用音频模型是 Gemma 3n E2B/E4B，不是 Gemma 4。Gemma 4 E2B/E4B 的 `llm_ask_audio` 出现在 Android allowlist `1_0_14.json`。因此本项目 iOS audio 不能继续用 `gemma-4-E2B-it.litertlm` 硬测 code 13；当前已把 iOS 活跃模型切换为 `Gemma-3n-E2B-it`，Android 保持 `Gemma-4-E2B-it`。
+
+限制：`google/gemma-3n-E2B-it-litert-lm` 是 Hugging Face gated repo；没有授权 token 或本地预下载文件时，iOS 下载会被 401 拒绝。
+
+### 2026-05-14 方案切换记录
+
+当前继续按“逐个方案验证”推进：
+
+1. Gemma 4 + blob/base64 audio JSON：people 手测仍报 `Failed to start streaming (code: 13)`，不再作为稳定路线。
+2. PhoneClaw 对齐方案：audio-only 改成临时 WAV 文件路径 JSON，并优先非流式 `sendMessage`；该实现已落地，并已在 people iPhone profile smoke 中返回真实模型输出 `AUDIO_RECEIVED`。
+3. 官方 iOS allowlist 方案：iOS 活跃模型恢复为 `Gemma-3n-E2B-it`；people iPhone app container 中已存在完整 `gemma-3n-E2B-it-int4.litertlm`，并完成 profile smoke 验证。
+4. iOS 26 启动稳定性：当前连接的 iPhone13 上 `FlutterGemmaPlugin.register(with:)` 会在启动时 SIGSEGV，因此 iOS 暂时不注册 flutter_gemma 插件，运行时改为 raw FFI；iOS Skills/function calling 暂停，避免用不可验证路径冒充成功。
+
+### 2026-05-14 继续测试：iOS native direct session 方案
+
+在 PhoneClaw path JSON 与 Dart raw FFI 之后，新增第三条 iOS 运行时路径：`IOSGemmaRuntime.swift` 通过 `dlopen/dlsym` 直接调用 LiteRT-LM C API 的 `litert_lm_session_generate_content(...)`，输入为 `LiteRtLmInputData(type=audio/text)`，绕过：
+
+- `flutter_gemma` 插件注册；
+- Dart FFI `LiteRtLmFfiClient` Conversation JSON；
+- `conversation_send_message_stream` 的 streaming code 13 路径。
+
+结论：native direct session 不作为默认 iOS audio 路径，因为真机错误显示底层 `session_generate_content` 不会自动跑 LiteRT-LM `AudioPreprocessor`，会报 `Audio must be preprocessed before being used in SessionAdvanced.`；它只保留为显式实验开关 `GEMMA_IOS_USE_NATIVE_DIRECT=1`。默认稳定路径是 Dart raw FFI Conversation API：`content` 顺序固定为 text -> image -> audio，audio-only 使用 path-based JSON + 非流式 `sendMessage`，让 Gemma3DataProcessor 负责音频预处理。
+
+
+### 2026-05-14 people iPhone 复测结论：为什么会提示“请提供音频”
+
+本次用户手测“已经发了音频，但模型提示请提供音频”后，排查结论如下：
+
+- 不是录音为空：从 people iPhone container 拉取 `tmp/voice_1778748629479.wav`，文件为 16kHz / mono / int16 WAV，约 6.53 秒、208KB，存在有效峰值与 RMS。
+- 旧 iOS JSON 组包顺序是 audio -> image -> text；LiteRT-LM/Gemma3n 官方 data processor 测试覆盖的是 text -> audio，真机表现证明 audio 放在 text 前面时，模型可能完成 prefill 但回答像“没有音频”。
+- 已修复 `buildIosPathMessageJsonForTesting(...)`：默认顺序改为 text -> image -> audio，并用单元测试锁住，避免再次回退。
+- 已新增 iOS profile smoke 结果文件 `Library/Application Support/gemma_ios_audio_smoke_result.json`，用于 devicectl 拉取真实模型结果，而不是只依赖 Flutter debugPrint。
+- people iPhone profile smoke 验证通过：安装 `build/ios/iphoneos/Runner.app` 后启动，拉取结果为 `status=success`、`response=AUDIO_RECEIVED`，证明当前默认 path JSON + Conversation API 路径能让 LiteRT-LM 收到并处理音频。
+
+仍需继续验证的是用户自然语音的转写质量；稳定性验收不能只看“收到音频”，还要用清晰真人语音确认不再输出“请提供音频”。

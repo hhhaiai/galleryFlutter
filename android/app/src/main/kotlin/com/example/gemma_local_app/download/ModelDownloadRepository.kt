@@ -1,42 +1,72 @@
 package com.example.gemma_local_app.download
 
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.Context
-import androidx.work.ExistingWorkPolicy
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OutOfQuotaPolicy
-import androidx.work.WorkInfo
-import androidx.work.WorkManager
-import androidx.work.workDataOf
+import android.content.Intent
+import android.content.IntentFilter
+import android.database.Cursor
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import io.flutter.plugin.common.EventChannel
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 class ModelDownloadRepository(private val context: Context) {
-  private val workManager = WorkManager.getInstance(context)
+  private val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+  private val prefs = context.getSharedPreferences("model_downloads", Context.MODE_PRIVATE)
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private val scheduler = Executors.newSingleThreadScheduledExecutor()
   private var eventSink: EventChannel.EventSink? = null
+  private var progressTicker: ScheduledFuture<*>? = null
+  private var activeArgs: Map<String, Any?>? = null
+  private var completionReceiverRegistered = false
 
   fun setEventSink(sink: EventChannel.EventSink?) {
     eventSink = sink
+    if (sink == null) {
+      stopProgressTicker()
+    } else {
+      activeArgs?.let { startProgressTicker(it) }
+    }
   }
 
   fun refreshStatus(args: Map<String, Any?>): Map<String, Any?> {
     val paths = paths(args)
     migrateLegacyModelIfNeeded(paths)
     val finalFile = File(paths.finalPath)
-    val tmpFile = File(paths.tmpPath)
-    return when {
-      finalFile.exists() && (paths.totalBytes <= 0L || finalFile.length() >= paths.totalBytes) -> statusMap(
+    if (finalFile.exists() && (paths.totalBytes <= 0L || finalFile.length() >= paths.totalBytes)) {
+      clearDownloadId(paths)
+      return statusMap(
         status = STATUS_SUCCEEDED,
         receivedBytes = finalFile.length(),
         totalBytes = paths.totalBytes,
         localPath = finalFile.absolutePath,
       )
-      tmpFile.exists() || partialPartBytes(paths) > 0L -> statusMap(
+    }
+
+    val downloadId = getDownloadId(paths)
+    if (downloadId > 0L) {
+      val queried = queryDownload(paths, downloadId)
+      if (queried != null) return queried
+      clearDownloadId(paths)
+    }
+
+    val partial = File(paths.tmpPath)
+    return if (partial.exists() && partial.length() > 0L) {
+      statusMap(
         status = STATUS_PARTIALLY_DOWNLOADED,
-        receivedBytes = maxOf(tmpFile.length(), partialPartBytes(paths)),
+        receivedBytes = partial.length(),
         totalBytes = paths.totalBytes,
         localPath = finalFile.absolutePath,
       )
-      else -> statusMap(
+    } else {
+      statusMap(
         status = STATUS_NOT_DOWNLOADED,
         totalBytes = paths.totalBytes,
         localPath = finalFile.absolutePath,
@@ -46,84 +76,200 @@ class ModelDownloadRepository(private val context: Context) {
 
   fun download(args: Map<String, Any?>) {
     val paths = paths(args)
-    val request = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
-      .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-      .setInputData(
-        workDataOf(
-          KEY_MODEL_NAME to paths.modelName,
-          KEY_MODEL_URL to paths.url,
-          KEY_MODEL_NORMALIZED_NAME to paths.normalizedName,
-          KEY_MODEL_VERSION to paths.version,
-          KEY_MODEL_FILE_NAME to paths.fileName,
-          KEY_MODEL_TOTAL_BYTES to paths.totalBytes,
-        )
-      )
-      .addTag(paths.modelName)
-      .build()
+    activeArgs = args
+    registerCompletionReceiver()
 
-    workManager.cancelUniqueWork(paths.modelName)
-    workManager.pruneWork()
-    workManager.enqueueUniqueWork(paths.modelName, ExistingWorkPolicy.REPLACE, request)
-    workManager.getWorkInfoByIdLiveData(request.id).observeForever { info ->
-      if (info != null) emitWorkInfo(paths, info)
+    val current = refreshStatus(args)
+    if (current["status"] == STATUS_SUCCEEDED || current["status"] == STATUS_IN_PROGRESS) {
+      emit(current)
+      startProgressTicker(args)
+      return
     }
+
+    cancel(args, deleteFiles = false)
+    File(paths.finalPath).parentFile?.mkdirs()
+    File(paths.tmpPath).delete()
+
+    val request = DownloadManager.Request(Uri.parse(paths.url))
+      .setTitle("galleryFlutter model download")
+      .setDescription(paths.modelName)
+      .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+      .setAllowedOverMetered(true)
+      .setAllowedOverRoaming(true)
+      .setDestinationInExternalFilesDir(context, null, paths.tmpFileName)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      request.setRequiresCharging(false)
+      request.setRequiresDeviceIdle(false)
+    }
+
+    val id = downloadManager.enqueue(request)
+    Log.i(TAG, "Enqueued system download id=$id model=${paths.modelName} dest=${paths.tmpPath}")
+    setDownloadId(paths, id)
+    emit(
+      statusMap(
+        status = STATUS_IN_PROGRESS,
+        totalBytes = paths.totalBytes,
+        localPath = paths.finalPath,
+      )
+    )
+    startProgressTicker(args)
   }
 
   fun cancel(args: Map<String, Any?>) {
-    val modelName = args["name"] as? String ?: "Gemma-4-E2B-it"
-    workManager.cancelUniqueWork(modelName)
+    cancel(args, deleteFiles = false)
+    emit(refreshStatus(args))
   }
 
-  fun delete(args: Map<String, Any?>): Map<String, Any?> {
-    cancel(args)
+  private fun cancel(args: Map<String, Any?>, deleteFiles: Boolean) {
     val paths = paths(args)
-    val rootDir = context.getExternalFilesDir(null) ?: error("externalFilesDir unavailable")
-    File(paths.finalPath).delete()
-    File(paths.tmpPath).delete()
-    rootDir.listFiles { file -> file.name.startsWith("${paths.fileName}.$TMP_FILE_EXT.part") }
-      ?.forEach { it.delete() }
-    val legacyDir = File(rootDir, paths.normalizedName)
-    if (legacyDir.exists()) legacyDir.deleteRecursively()
-    return refreshStatus(args)
-  }
-
-  private fun emitWorkInfo(paths: DownloadPaths, info: WorkInfo) {
-    val progress = info.progress
-    when (info.state) {
-      WorkInfo.State.ENQUEUED -> emit(
-        statusMap(
-          status = STATUS_IN_PROGRESS,
-          totalBytes = paths.totalBytes,
-          localPath = paths.finalPath,
-        )
-      )
-      WorkInfo.State.RUNNING -> emit(
-        statusMap(
-          status = STATUS_IN_PROGRESS,
-          receivedBytes = progress.getLong(KEY_RECEIVED_BYTES, 0L),
-          totalBytes = progress.getLong(KEY_TOTAL_BYTES, paths.totalBytes),
-          bytesPerSecond = progress.getLong(KEY_BYTES_PER_SECOND, 0L),
-          localPath = progress.getString(KEY_LOCAL_PATH) ?: paths.finalPath,
-        )
-      )
-      WorkInfo.State.SUCCEEDED -> emit(refreshStatus(paths.args))
-      WorkInfo.State.FAILED -> emit(
-        statusMap(
-          status = STATUS_FAILED,
-          totalBytes = paths.totalBytes,
-          errorMessage = info.outputData.getString(KEY_ERROR_MESSAGE)
-            ?: progress.getString(KEY_ERROR_MESSAGE)
-            ?: "Download failed",
-          localPath = paths.finalPath,
-        )
-      )
-      WorkInfo.State.CANCELLED -> emit(refreshStatus(paths.args))
-      WorkInfo.State.BLOCKED -> Unit
+    val id = getDownloadId(paths)
+    if (id > 0L) {
+      runCatching { downloadManager.remove(id) }
+      clearDownloadId(paths)
+    }
+    if (deleteFiles) {
+      File(paths.finalPath).delete()
+      File(paths.tmpPath).delete()
+      val rootDir = context.getExternalFilesDir(null)
+      rootDir?.listFiles { file -> file.name.startsWith("${paths.fileName}.$TMP_FILE_EXT") }
+        ?.forEach { it.delete() }
+      val legacyDir = rootDir?.let { File(it, paths.normalizedName) }
+      if (legacyDir?.exists() == true) legacyDir.deleteRecursively()
     }
   }
 
+  fun delete(args: Map<String, Any?>): Map<String, Any?> {
+    cancel(args, deleteFiles = true)
+    return refreshStatus(args)
+  }
+
+  private fun queryDownload(paths: DownloadPaths, downloadId: Long): Map<String, Any?>? {
+    val cursor = downloadManager.query(DownloadManager.Query().setFilterById(downloadId)) ?: return null
+    cursor.use {
+      if (!it.moveToFirst()) return null
+      val status = it.intColumn(DownloadManager.COLUMN_STATUS)
+      val downloaded = it.longColumn(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+      val total = it.longColumn(DownloadManager.COLUMN_TOTAL_SIZE_BYTES).takeIf { value -> value > 0L }
+        ?: paths.totalBytes
+      val reason = it.intColumn(DownloadManager.COLUMN_REASON)
+      if (status == DownloadManager.STATUS_FAILED) {
+        Log.w(
+          TAG,
+          "System download failed id=$downloadId reason=$reason downloaded=$downloaded total=$total dest=${paths.tmpPath}",
+        )
+      }
+      return when (status) {
+        DownloadManager.STATUS_SUCCESSFUL -> promoteSystemDownload(paths, downloaded, total)
+        DownloadManager.STATUS_RUNNING,
+        DownloadManager.STATUS_PENDING,
+        DownloadManager.STATUS_PAUSED -> statusMap(
+          status = STATUS_IN_PROGRESS,
+          receivedBytes = downloaded,
+          totalBytes = total,
+          localPath = paths.finalPath,
+        )
+        DownloadManager.STATUS_FAILED -> statusMap(
+          status = STATUS_FAILED,
+          receivedBytes = downloaded,
+          totalBytes = total,
+          errorMessage = downloadFailureReason(reason),
+          localPath = paths.finalPath,
+        )
+        else -> statusMap(
+          status = STATUS_NOT_DOWNLOADED,
+          totalBytes = paths.totalBytes,
+          localPath = paths.finalPath,
+        )
+      }
+    }
+  }
+
+  private fun promoteSystemDownload(paths: DownloadPaths, downloaded: Long, total: Long): Map<String, Any?> {
+    val tmp = File(paths.tmpPath)
+    val finalFile = File(paths.finalPath)
+    if (tmp.exists()) {
+      finalFile.parentFile?.mkdirs()
+      if (finalFile.exists()) finalFile.delete()
+      if (!tmp.renameTo(finalFile)) {
+        tmp.copyTo(finalFile, overwrite = true)
+        tmp.delete()
+      }
+    }
+    clearDownloadId(paths)
+    stopProgressTicker()
+    val received = if (finalFile.exists()) finalFile.length() else downloaded
+    return statusMap(
+      status = STATUS_SUCCEEDED,
+      receivedBytes = received,
+      totalBytes = maxOf(total, paths.totalBytes),
+      localPath = finalFile.absolutePath,
+    )
+  }
+
+  private fun startProgressTicker(args: Map<String, Any?>) {
+    stopProgressTicker()
+    activeArgs = args
+    progressTicker = scheduler.scheduleAtFixedRate({
+      val status = refreshStatus(args)
+      emit(status)
+      val type = status["status"]
+      if (type == STATUS_SUCCEEDED || type == STATUS_FAILED || type == STATUS_NOT_DOWNLOADED) {
+        stopProgressTicker()
+      }
+    }, 0L, PROGRESS_INTERVAL_MS, TimeUnit.MILLISECONDS)
+  }
+
+  private fun stopProgressTicker() {
+    progressTicker?.cancel(false)
+    progressTicker = null
+  }
+
+  private fun registerCompletionReceiver() {
+    if (completionReceiverRegistered) return
+    val receiver = object : BroadcastReceiver() {
+      override fun onReceive(context: Context, intent: Intent) {
+        if (DownloadManager.ACTION_DOWNLOAD_COMPLETE != intent.action) return
+        val args = activeArgs ?: return
+        emit(refreshStatus(args))
+      }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      context.registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      @Suppress("DEPRECATION")
+      context.registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE))
+    }
+    completionReceiverRegistered = true
+  }
+
   private fun emit(map: Map<String, Any?>) {
-    eventSink?.success(map)
+    val sink = eventSink ?: return
+    mainHandler.post { sink.success(map) }
+  }
+
+  private fun getDownloadId(paths: DownloadPaths): Long = prefs.getLong(downloadIdKey(paths), -1L)
+
+  private fun setDownloadId(paths: DownloadPaths, id: Long) {
+    prefs.edit().putLong(downloadIdKey(paths), id).apply()
+  }
+
+  private fun clearDownloadId(paths: DownloadPaths) {
+    prefs.edit().remove(downloadIdKey(paths)).apply()
+  }
+
+  private fun downloadIdKey(paths: DownloadPaths): String = "download:${paths.modelName}:${paths.version}:${paths.fileName}"
+
+  private fun downloadFailureReason(reason: Int): String = when (reason) {
+    DownloadManager.ERROR_CANNOT_RESUME -> "系统下载失败：不支持继续下载，请点删除后重试。"
+    DownloadManager.ERROR_DEVICE_NOT_FOUND -> "系统下载失败：存储设备不可用。"
+    DownloadManager.ERROR_FILE_ALREADY_EXISTS -> "系统下载失败：文件已存在。"
+    DownloadManager.ERROR_FILE_ERROR -> "系统下载失败：文件写入错误。"
+    DownloadManager.ERROR_HTTP_DATA_ERROR -> "系统下载失败：HTTP 数据错误。"
+    DownloadManager.ERROR_INSUFFICIENT_SPACE -> "系统下载失败：存储空间不足。"
+    DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "系统下载失败：重定向过多。"
+    DownloadManager.ERROR_UNHANDLED_HTTP_CODE -> "系统下载失败：服务器返回不支持的 HTTP 状态。"
+    DownloadManager.ERROR_UNKNOWN -> "系统下载失败：未知错误。"
+    else -> "系统下载失败：reason=$reason"
   }
 
   private fun migrateLegacyModelIfNeeded(paths: DownloadPaths) {
@@ -139,13 +285,6 @@ class ModelDownloadRepository(private val context: Context) {
     } catch (_: Throwable) {
       legacyFile.copyTo(finalFile, overwrite = true)
     }
-  }
-
-  private fun partialPartBytes(paths: DownloadPaths): Long {
-    val dir = context.getExternalFilesDir(null) ?: return 0L
-    return dir.listFiles { file -> file.name.startsWith("${paths.fileName}.$TMP_FILE_EXT.part") }
-      ?.sumOf { it.length() }
-      ?: 0L
   }
 
   private fun paths(args: Map<String, Any?>): DownloadPaths {
@@ -168,6 +307,7 @@ class ModelDownloadRepository(private val context: Context) {
       totalBytes = totalBytes,
       finalPath = File(dir, flatFileName).absolutePath,
       tmpPath = File(dir, "$flatFileName.$TMP_FILE_EXT").absolutePath,
+      tmpFileName = "$flatFileName.$TMP_FILE_EXT",
     )
   }
 
@@ -188,6 +328,14 @@ class ModelDownloadRepository(private val context: Context) {
       "localPath" to localPath,
     )
   }
+
+  private fun Cursor.intColumn(name: String): Int = getInt(getColumnIndexOrThrow(name))
+  private fun Cursor.longColumn(name: String): Long = getLong(getColumnIndexOrThrow(name))
+
+  companion object {
+    private const val TAG = "ModelDownloadRepository"
+    private const val PROGRESS_INTERVAL_MS = 1000L
+  }
 }
 
 private data class DownloadPaths(
@@ -201,4 +349,24 @@ private data class DownloadPaths(
   val totalBytes: Long,
   val finalPath: String,
   val tmpPath: String,
+  val tmpFileName: String,
 )
+
+const val TMP_FILE_EXT = "gallerytmp"
+const val KEY_MODEL_NAME = "modelName"
+const val KEY_MODEL_URL = "modelUrl"
+const val KEY_MODEL_NORMALIZED_NAME = "normalizedName"
+const val KEY_MODEL_VERSION = "version"
+const val KEY_MODEL_FILE_NAME = "fileName"
+const val KEY_MODEL_TOTAL_BYTES = "totalBytes"
+const val KEY_STATUS = "status"
+const val KEY_RECEIVED_BYTES = "receivedBytes"
+const val KEY_TOTAL_BYTES = "totalBytesOut"
+const val KEY_BYTES_PER_SECOND = "bytesPerSecond"
+const val KEY_LOCAL_PATH = "localPath"
+const val KEY_ERROR_MESSAGE = "errorMessage"
+const val STATUS_NOT_DOWNLOADED = "notDownloaded"
+const val STATUS_PARTIALLY_DOWNLOADED = "partiallyDownloaded"
+const val STATUS_IN_PROGRESS = "inProgress"
+const val STATUS_SUCCEEDED = "succeeded"
+const val STATUS_FAILED = "failed"

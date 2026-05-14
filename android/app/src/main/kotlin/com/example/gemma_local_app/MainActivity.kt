@@ -2,6 +2,12 @@ package com.example.gemma_local_app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
@@ -20,6 +26,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.CalendarContract
+import android.provider.CalendarContract.Events
+import android.provider.CalendarContract.Instances
 import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
@@ -57,6 +66,11 @@ import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -66,6 +80,58 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import org.json.JSONObject
+
+class ScheduledNotificationReceiver : BroadcastReceiver() {
+  override fun onReceive(context: Context, intent: Intent) {
+    val title = intent.getStringExtra(EXTRA_TITLE) ?: "Gemma reminder"
+    val message = intent.getStringExtra(EXTRA_MESSAGE) ?: ""
+    val deeplink = intent.getStringExtra(EXTRA_DEEPLINK).orEmpty()
+    val channelId = intent.getStringExtra(EXTRA_CHANNEL_ID) ?: DEFAULT_CHANNEL_ID
+    val channelName = intent.getStringExtra(EXTRA_CHANNEL_NAME) ?: DEFAULT_CHANNEL_NAME
+    val notificationManager =
+      context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      notificationManager.createNotificationChannel(
+        NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_DEFAULT)
+      )
+    }
+    val contentIntent =
+      PendingIntent.getActivity(
+        context,
+        intent.getIntExtra(EXTRA_REQUEST_CODE, 0),
+        Intent(context, MainActivity::class.java).apply {
+          action = Intent.ACTION_VIEW
+          if (deeplink.isNotBlank()) data = Uri.parse(deeplink)
+          flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        },
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+    val notification =
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        android.app.Notification.Builder(context, channelId)
+      } else {
+        android.app.Notification.Builder(context)
+      }
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setContentTitle(title)
+        .setContentText(message)
+        .setContentIntent(contentIntent)
+        .setAutoCancel(true)
+        .build()
+    notificationManager.notify(intent.getIntExtra(EXTRA_REQUEST_CODE, 0), notification)
+  }
+
+  companion object {
+    const val EXTRA_TITLE = "title"
+    const val EXTRA_MESSAGE = "message"
+    const val EXTRA_DEEPLINK = "deeplink"
+    const val EXTRA_CHANNEL_ID = "channel_id"
+    const val EXTRA_CHANNEL_NAME = "channel_name"
+    const val EXTRA_REQUEST_CODE = "request_code"
+    const val DEFAULT_CHANNEL_ID = "agent_skill_tasks_channel"
+    const val DEFAULT_CHANNEL_NAME = "Agent Skill Task"
+  }
+}
 
 class MainActivity : FlutterActivity() {
   private val runtime by lazy { GemmaLiteRtRuntime(this) }
@@ -314,6 +380,7 @@ private class AndroidAudioInput(private val activity: MainActivity) {
           }
         }
         writeWavFile(file, pcm.toByteArray())
+        Log.d("AndroidAudioInput", "recording saved: path=${file.absolutePath}, bytes=${file.length()}")
       } catch (throwable: Throwable) {
         stopState = "failed"
         Log.e("AndroidAudioInput", "recording failed", throwable)
@@ -334,15 +401,30 @@ private class AndroidAudioInput(private val activity: MainActivity) {
 
   fun stopRecording(result: MethodChannel.Result) {
     val file = recordingFile
-    if (file == null || audioRecord == null) {
+    val record = audioRecord
+    if (file == null || record == null) {
       result.success(null)
       return
     }
     isRecording = false
-    recordingThread?.join(1200)
+    val thread = recordingThread
+    try {
+      record.stop()
+    } catch (_: Throwable) {
+      // The recording thread also stops/releases the recorder. Calling stop()
+      // here only unblocks a pending AudioRecord.read() so the WAV file is
+      // finalized before we hand it to the model.
+    }
+    thread?.join(RECORDING_STOP_JOIN_MS)
     audioRecord = null
     recordingThread = null
     recordingFile = null
+    if (thread?.isAlive == true || !file.exists() || file.length() <= WAV_HEADER_BYTES) {
+      Log.w("AndroidAudioInput", "recording save incomplete: alive=${thread?.isAlive}, exists=${file.exists()}, bytes=${if (file.exists()) file.length() else 0}")
+      result.error("RECORD_SAVE_FAILED", "录音文件尚未保存完成或内容为空，请重新录音。", null)
+      return
+    }
+    Log.d("AndroidAudioInput", "recording ready: path=${file.absolutePath}, bytes=${file.length()}")
     val durationMs = (System.currentTimeMillis() - recordingStartedAtMs).toInt().coerceAtLeast(1000)
     emitAudioEvent(mapOf("type" to "recording", "state" to "stopped", "reason" to "manual"))
     result.success(audioMap(file, durationMs = durationMs))
@@ -747,6 +829,8 @@ private class AndroidAudioInput(private val activity: MainActivity) {
     private const val CODEC_TIMEOUT_US = 10_000L
     private const val SAMPLE_RATE = 16000
     private const val MAX_AUDIO_SECONDS = 30
+    private const val RECORDING_STOP_JOIN_MS = 3_000L
+    private const val WAV_HEADER_BYTES = 44L
   }
 }
 
@@ -1032,6 +1116,10 @@ private class GemmaSkillToolSet(
     Log.d(TAG, "runIntent: intent=$intent parameters=$parameters")
     return when (intent.trim()) {
       "send_email" -> startSendEmailIntent(parameters)
+      "get_current_date_and_time" -> currentDateAndTime()
+      "create_calendar_event" -> startCreateCalendarEventIntent(parameters)
+      "read_calendar_events" -> readCalendarEvents(parameters)
+      "schedule_notification" -> scheduleNotification(parameters)
       else -> mapOf(
         "action" to intent,
         "parameters" to parameters,
@@ -1081,8 +1169,232 @@ private class GemmaSkillToolSet(
     return result
   }
 
+  private fun currentDateAndTime(): Map<String, String> {
+    val value = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss EEEE", Locale.getDefault()).format(Date())
+    return mapOf(
+      "action" to "get_current_date_and_time",
+      "status" to "succeeded",
+      "current_date_and_time" to value,
+    )
+  }
+
+  private fun startCreateCalendarEventIntent(parameters: String): Map<String, String> {
+    val json = runCatching { JSONObject(parameters.ifBlank { "{}" }) }.getOrNull()
+      ?: return mapOf("action" to "create_calendar_event", "status" to "failed", "error" to "Invalid JSON parameters")
+    val title = json.optString("title").takeIf { it.isNotBlank() }
+      ?: return mapOf("action" to "create_calendar_event", "status" to "failed", "error" to "title is required")
+    val description = json.optString("description")
+    val beginTime = parseDateTimeMillis(json.optString("begin_time"))
+      ?: return mapOf("action" to "create_calendar_event", "status" to "failed", "error" to "begin_time must be YYYY-MM-DDTHH:MM:SS")
+    val endTime = parseDateTimeMillis(json.optString("end_time"))
+      ?: return mapOf("action" to "create_calendar_event", "status" to "failed", "error" to "end_time must be YYYY-MM-DDTHH:MM:SS")
+    val latch = CountDownLatch(1)
+    var status = "started"
+    var error = ""
+    context.runOnUiThread {
+      try {
+        val calendarIntent = Intent(Intent.ACTION_INSERT).apply {
+          data = Events.CONTENT_URI
+          putExtra(Events.TITLE, title)
+          putExtra(Events.DESCRIPTION, description)
+          putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, beginTime)
+          putExtra(CalendarContract.EXTRA_EVENT_END_TIME, endTime)
+        }
+        context.startActivity(calendarIntent)
+      } catch (throwable: Throwable) {
+        status = "failed"
+        error = throwable.message ?: "Unable to start calendar intent"
+      } finally {
+        latch.countDown()
+      }
+    }
+    latch.await(2, TimeUnit.SECONDS)
+    return buildMap {
+      put("action", "create_calendar_event")
+      put("status", status)
+      put("title", title)
+      put("description", description)
+      put("begin_time", json.optString("begin_time"))
+      put("end_time", json.optString("end_time"))
+      if (error.isNotBlank()) put("error", error)
+    }
+  }
+
+  private fun readCalendarEvents(parameters: String): Map<String, String> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) {
+      context.runOnUiThread {
+        ActivityCompat.requestPermissions(context, arrayOf(Manifest.permission.READ_CALENDAR), READ_CALENDAR_REQUEST_CODE)
+      }
+      return mapOf(
+        "action" to "read_calendar_events",
+        "status" to "failed",
+        "error" to "READ_CALENDAR permission is required. Permission request was started; try again after granting it.",
+      )
+    }
+    val json = runCatching { JSONObject(parameters.ifBlank { "{}" }) }.getOrNull()
+      ?: return mapOf("action" to "read_calendar_events", "status" to "failed", "error" to "Invalid JSON parameters")
+    val date = json.optString("date").takeIf { it.isNotBlank() }
+      ?: return mapOf("action" to "read_calendar_events", "status" to "failed", "error" to "date is required")
+    val startOfDay =
+      runCatching {
+        Calendar.getInstance().apply {
+          time = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(date) ?: Date()
+          set(Calendar.HOUR_OF_DAY, 0)
+          set(Calendar.MINUTE, 0)
+          set(Calendar.SECOND, 0)
+          set(Calendar.MILLISECOND, 0)
+        }
+      }.getOrNull()
+        ?: return mapOf("action" to "read_calendar_events", "status" to "failed", "error" to "date must be YYYY-MM-DD")
+    val endOfDay = startOfDay.clone() as Calendar
+    endOfDay.add(Calendar.DAY_OF_MONTH, 1)
+    endOfDay.add(Calendar.MILLISECOND, -1)
+    val events = mutableListOf<JSONObject>()
+    val uriBuilder = Instances.CONTENT_URI.buildUpon()
+    android.content.ContentUris.appendId(uriBuilder, startOfDay.timeInMillis)
+    android.content.ContentUris.appendId(uriBuilder, endOfDay.timeInMillis)
+    val projection = arrayOf(Instances.TITLE, Instances.DESCRIPTION, Instances.BEGIN, Instances.END)
+    context.contentResolver.query(
+      uriBuilder.build(),
+      projection,
+      null,
+      null,
+      "${Instances.BEGIN} ASC",
+    )?.use { cursor ->
+      val titleIndex = cursor.getColumnIndex(Instances.TITLE)
+      val descriptionIndex = cursor.getColumnIndex(Instances.DESCRIPTION)
+      val beginIndex = cursor.getColumnIndex(Instances.BEGIN)
+      val endIndex = cursor.getColumnIndex(Instances.END)
+      val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+      while (cursor.moveToNext()) {
+        val begin = if (beginIndex >= 0) cursor.getLong(beginIndex) else 0L
+        val end = if (endIndex >= 0) cursor.getLong(endIndex) else 0L
+        events.add(
+          JSONObject()
+            .put("title", if (titleIndex >= 0) cursor.getString(titleIndex).orEmpty() else "")
+            .put("description", if (descriptionIndex >= 0) cursor.getString(descriptionIndex).orEmpty() else "")
+            .put("begin_time", if (begin > 0) format.format(Date(begin)) else "")
+            .put("end_time", if (end > 0) format.format(Date(end)) else "")
+        )
+      }
+    }
+    return mapOf(
+      "action" to "read_calendar_events",
+      "status" to "succeeded",
+      "date" to date,
+      "events" to org.json.JSONArray(events).toString(),
+    )
+  }
+
+  private fun scheduleNotification(parameters: String): Map<String, String> {
+    val json = runCatching { JSONObject(parameters.ifBlank { "{}" }) }.getOrNull()
+      ?: return mapOf("action" to "schedule_notification", "status" to "failed", "error" to "Invalid JSON parameters")
+    val title = json.optString("title").takeIf { it.isNotBlank() }
+      ?: return mapOf("action" to "schedule_notification", "status" to "failed", "error" to "title is required")
+    val message = json.optString("message").takeIf { it.isNotBlank() }
+      ?: return mapOf("action" to "schedule_notification", "status" to "failed", "error" to "message is required")
+    val hour = json.optInt("hour", -1)
+    val minute = json.optInt("minute", -1)
+    if (hour !in 0..23 || minute !in 0..59) {
+      return mapOf("action" to "schedule_notification", "status" to "failed", "error" to "hour/minute are out of range")
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+      ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    ) {
+      context.runOnUiThread {
+        ActivityCompat.requestPermissions(context, arrayOf(Manifest.permission.POST_NOTIFICATIONS), POST_NOTIFICATIONS_REQUEST_CODE)
+      }
+      return mapOf(
+        "action" to "schedule_notification",
+        "status" to "failed",
+        "error" to "POST_NOTIFICATIONS permission is required. Permission request was started; try again after granting it.",
+      )
+    }
+    val repeatDaily = json.optBoolean("repeat_daily", false)
+    val requestCode = UUID.randomUUID().hashCode()
+    val deeplink = resolveNotificationDeeplink(json, message)
+    val pendingIntent = PendingIntent.getBroadcast(
+      context,
+      requestCode,
+      Intent(context, ScheduledNotificationReceiver::class.java).apply {
+        putExtra(ScheduledNotificationReceiver.EXTRA_TITLE, title)
+        putExtra(ScheduledNotificationReceiver.EXTRA_MESSAGE, message)
+        putExtra(ScheduledNotificationReceiver.EXTRA_DEEPLINK, deeplink)
+        putExtra(ScheduledNotificationReceiver.EXTRA_CHANNEL_ID, ScheduledNotificationReceiver.DEFAULT_CHANNEL_ID)
+        putExtra(ScheduledNotificationReceiver.EXTRA_CHANNEL_NAME, ScheduledNotificationReceiver.DEFAULT_CHANNEL_NAME)
+        putExtra(ScheduledNotificationReceiver.EXTRA_REQUEST_CODE, requestCode)
+      },
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    val calendar = Calendar.getInstance().apply {
+      json.optNullableInt("year")?.let { set(Calendar.YEAR, it) }
+      json.optNullableInt("month")?.let { set(Calendar.MONTH, it - 1) }
+      json.optNullableInt("day")?.let { set(Calendar.DAY_OF_MONTH, it) }
+      set(Calendar.HOUR_OF_DAY, hour)
+      set(Calendar.MINUTE, minute)
+      set(Calendar.SECOND, 0)
+      set(Calendar.MILLISECOND, 0)
+      if (before(Calendar.getInstance()) && (repeatDaily || !json.has("year"))) {
+        add(Calendar.DATE, 1)
+      }
+    }
+    val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    try {
+      if (repeatDaily) {
+        alarmManager.setRepeating(
+          AlarmManager.RTC_WAKEUP,
+          calendar.timeInMillis,
+          AlarmManager.INTERVAL_DAY,
+          pendingIntent,
+        )
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager.canScheduleExactAlarms()) {
+        alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, calendar.timeInMillis, pendingIntent)
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, calendar.timeInMillis, pendingIntent)
+      } else {
+        alarmManager.set(AlarmManager.RTC_WAKEUP, calendar.timeInMillis, pendingIntent)
+      }
+    } catch (throwable: SecurityException) {
+      return mapOf(
+        "action" to "schedule_notification",
+        "status" to "failed",
+        "error" to (throwable.message ?: "Exact alarm permission is required"),
+      )
+    }
+    return mapOf(
+      "action" to "schedule_notification",
+      "status" to "succeeded",
+      "title" to title,
+      "message" to message,
+      "scheduled_time" to SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).format(calendar.time),
+      "repeat_daily" to repeatDaily.toString(),
+      "deeplink" to deeplink,
+    )
+  }
+
+  private fun parseDateTimeMillis(value: String): Long? =
+    runCatching { SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).parse(value)?.time }
+      .getOrNull()
+
+  private fun JSONObject.optNullableInt(name: String): Int? =
+    if (has(name) && !isNull(name)) optInt(name) else null
+
+  private fun resolveNotificationDeeplink(json: JSONObject, message: String): String {
+    json.optString("deeplink").takeIf { it.isNotBlank() }?.let { return it }
+    val taskId = json.optString("task_id").takeIf { it.isNotBlank() } ?: "llm_agent_chat"
+    val modelName = json.optString("model_name").takeIf { it.isNotBlank() }
+    val base = if (modelName != null) {
+      "com.example.gemma_local_app://model/$taskId/$modelName"
+    } else {
+      "com.example.gemma_local_app://$taskId/"
+    }
+    return Uri.parse(base).buildUpon().appendQueryParameter("query", message).build().toString()
+  }
+
   companion object {
     private const val TAG = "GemmaSkillToolSet"
+    private const val READ_CALENDAR_REQUEST_CODE = 44003
+    private const val POST_NOTIFICATIONS_REQUEST_CODE = 44004
     private val BUILTIN_SKILLS = listOf(
       GemmaBuiltinSkill(
         name = "calculate-hash",
@@ -1123,6 +1435,21 @@ private class GemmaSkillToolSet(
         name = "kitchen-adventure",
         description = "Text adventure set in a world where everyone is a sentient kitchen appliance.",
         instructions = "Pure text skill. Act as Head Chef DM, use kitchen-scale world building, never write the player's actions, and format each turn with location, situation, and What do you do?",
+      ),
+      GemmaBuiltinSkill(
+        name = "schedule-notification",
+        description = "Schedule a notification for a specific date or repeating daily.",
+        instructions = "If the reminder is not daily, first call run_intent with intent get_current_date_and_time and parameters {}. Then call run_intent with intent schedule_notification and parameters JSON containing title, message, hour, minute, optional year, month, day, repeat_daily, task_id, model_name, or deeplink.",
+      ),
+      GemmaBuiltinSkill(
+        name = "create-calendar-event",
+        description = "Create a calendar event.",
+        instructions = "First call run_intent with intent get_current_date_and_time and parameters {} to calculate the exact date. Then call run_intent with intent create_calendar_event and parameters JSON containing title, description, begin_time, and end_time in YYYY-MM-DDTHH:MM:SS format.",
+      ),
+      GemmaBuiltinSkill(
+        name = "read-calendar-events",
+        description = "Read OS calendar events for a specific date.",
+        instructions = "First call run_intent with intent get_current_date_and_time and parameters {} to calculate the target date. Then call run_intent with intent read_calendar_events and parameters JSON containing date in YYYY-MM-DD format.",
       ),
     )
   }

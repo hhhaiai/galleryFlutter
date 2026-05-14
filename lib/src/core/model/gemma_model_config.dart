@@ -110,4 +110,33 @@ const gemma4E2bIt = GemmaModelConfig(
   ],
 );
 
-const availableModels = [gemma4E2bIt];
+const gemma3nE2bItIos = GemmaModelConfig(
+  name: 'Gemma-3n-E2B-it',
+  modelId: 'google/gemma-3n-E2B-it-litert-lm',
+  modelFile: 'gemma-3n-E2B-it-int4.litertlm',
+  commitHash: '73b019b63436d346f68dd9c1dbfd117eb264d888',
+  description:
+      'Google AI Edge Gallery iOS allowlist model；支持 iOS 文字、图片和声音输入；上下文长度 4K。',
+  sizeInBytes: 3388604416,
+  minDeviceMemoryInGb: 6,
+  supportImage: true,
+  supportAudio: true,
+  supportThinking: false,
+  topK: 64,
+  topP: 0.95,
+  temperature: 1.0,
+  maxContextLength: 4096,
+  maxTokens: 4096,
+  accelerators: [GemmaAccelerator.gpu],
+  visionAccelerator: GemmaAccelerator.gpu,
+  taskIds: [
+    GemmaTaskId.chat,
+    GemmaTaskId.promptLab,
+    GemmaTaskId.askImage,
+    GemmaTaskId.askAudio,
+  ],
+  bestForTaskIds: [GemmaTaskId.askImage, GemmaTaskId.askAudio],
+  modelTypeName: 'gemmaIt',
+);
+
+const availableModels = [gemma4E2bIt, gemma3nE2bItIos];

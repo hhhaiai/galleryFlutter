@@ -25,5 +25,24 @@ void main() {
     expect(prompt, contains('run_js'));
     expect(prompt, contains('send_email'));
     expect(prompt, contains('kitchen-adventure'));
+    expect(prompt, contains('schedule-notification'));
+    expect(prompt, contains('schedule_notification'));
   });
+
+  test(
+    'Built-in Skills default selection mirrors Android Gallery latest defaults',
+    () {
+      final enabled = defaultEnabledBuiltInSkillNames();
+
+      expect(enabled, contains('interactive-map'));
+      expect(enabled, contains('schedule-notification'));
+      expect(enabled, contains('mood-tracker'));
+      expect(enabled, contains('query-wikipedia'));
+      expect(enabled, contains('qr-code'));
+      expect(enabled, isNot(contains('calculate-hash')));
+      expect(enabled, isNot(contains('kitchen-adventure')));
+      expect(enabled, isNot(contains('text-spinner')));
+      expect(enabled, isNot(contains('send-email')));
+    },
+  );
 }

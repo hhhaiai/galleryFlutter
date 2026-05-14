@@ -616,7 +616,7 @@ docs/audio_voice_live_design.md
 - 入口：`GemmaTaskId.askAudio`
 - 请求字段：`GemmaRequest.audioPaths`
 - 新增 `lib/src/features/gemma_home/audio_input_service.dart`，通过 `com.example.gemma_local_app/audio_input` MethodChannel 统一调用原生音频能力。
-- UI：点击 composer「语音」按钮弹出 bottom sheet，包含「实时录音 / 停止录音」「选择语音文件」「Live 语音通话探索」。
+- UI：点击 composer「语音」按钮弹出 bottom sheet，包含「实时录音 / 停止录音」「选择语音文件」「Live 语音通话探索」；录音中再次点击 composer 语音按钮会直接停止并附加，点击发送时如仍在录音也会先停止并附加，避免用户误把空消息发出。
 - 发送前：输入框上方显示 `_AttachedAudioStrip`，包含语音波形、播放按钮、时长、删除按钮。
 - 发送后：`_ChatMessage.audioAttachments` 保存语音消息；用户消息气泡显示 `_VoiceMessageGrid` / `_VoiceMessageCard`，不再只显示 `[语音 × 1]`；点击卡片可播放。
 - 默认语音 prompt：如果用户只发语音不写文字，默认使用「请识别并总结这段语音内容。」
@@ -627,18 +627,17 @@ Android 第一阶段：
 - `MainActivity.kt` 新增 `AndroidAudioInput`：系统音频文件选择、`AudioRecord` 录音并封装成 16k / mono / 16-bit PCM WAV、`MediaPlayer` 播放。
 - Runtime 初始化对齐 Gallery：`audioBackend = if (supportAudio) Backend.CPU() else null`。
 - Android 音频请求的主 backend 已修正为与 Gallery 一致的多模态优先路径：audio/image 请求优先走 GPU 主 backend，纯文字仍保持 CPU 首轮轻量初始化。
-- Runtime generate 读取 `audioPaths.take(1)`，从 WAV `data` chunk 提取 16k / mono / 16-bit raw PCM 后加入 `Content.AudioBytes(audioBytes)`；内容顺序为图片、音频、文本。
+- Runtime generate 读取 `audioPaths.take(1)`，将输入规整为 16k / mono / 16-bit PCM WAV，并以完整 WAV bytes 加入 `Content.AudioBytes(audioBytes)`；内容顺序为图片、音频、文本。
 - 对 audio-only 请求，若 LiteRT-LM native compiled model 调用报 `Status Code: 12/13`，Dart 侧会自动补一次 CPU fallback，再降级回文字模式。
 - 选择语音文件时，若拿到 m4a/mp3 等压缩音频，Android 原生侧会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一落成 16k mono 16-bit PCM WAV 存盘；若本身是 WAV，则保留/按需规整成 Gemma 可用格式。
-- 注意：UI/播放/波形继续使用 WAV 文件，但模型输入对齐 Gallery：`Content.AudioBytes` 接收 raw PCM，不再把 RIFF/WAVE header 传给模型。
+- 注意：旧版“剥离 RIFF/WAVE header 只传 PCM”的说明已废弃；当前对齐 Gallery 的实际 Ask Audio 路线：PCM 数据在发送前带 44 字节 WAV header，模型侧接收完整 WAV 容器。
 
 iOS 第一阶段当前事实：
 
 - 添加 `NSMicrophoneUsageDescription`。
 - iOS 自有 `audio_input` 原生 channel（`UIDocumentPickerViewController`、`AVAudioRecorder`、`AVAudioPlayer`）已接入；`audio_input_events` 已能输出录音状态和电平事件。录音目标格式为 16k / mono / 16-bit PCM WAV，单段上限 30 秒；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
-- `flutter_gemma` API 层存在 `Message.withAudio(...)` / `supportAudio` 等能力，但当前真机验证显示 `Gemma-4-E2B-it` iOS 音频链路会触发 `Failed to start streaming (code: 13)`。
-- 因此默认情况下 `platform_gemma_runtime.dart` 遇到 `audioPaths` 仍会显式抛出稳定性提示；`gemma_home_screen.dart` 在 iOS 端也暂时关闭语音文件、实时录音和 Live 语音入口，避免影响文字/图片稳定。
-- 已增加固定 WAV harness：仅在 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 时，iOS UI 才允许语音文件/录音/Live 入口；runtime 会校验 16k mono 16-bit PCM WAV，并只把 raw PCM data chunk 作为 `Message` audioBytes 发送，用于真机专项复现/验证 code 13。若确认 Gemma iOS audio runtime 当前不可用，则暂停本项目内 iOS audio 深测，而不是改用非 Gemma 方案作为成功路径。
+- `flutter_gemma` API 层存在 `Message.withAudio(...)` / `supportAudio` 等能力；2026-05-14 已改为 LiteRT-LM raw FFI Conversation JSON media 路径，并在校验 16k mono 16-bit PCM WAV 后保留完整 WAV 容器。当前默认顺序固定为 text -> image -> audio，audio-only 使用 path JSON + 非流式 `sendMessage`，people iPhone profile smoke 已返回真实模型输出 `AUDIO_RECEIVED`。
+- 仍需继续用用户自然语音做转写质量验收；若自然语音仍出现“请提供音频”或 code 13，应优先检查 JSON 顺序/音频文件有效性/LiteRT-LM backend，而不能用非 Gemma ASR 冒充成功。
 
 Live 语音通话探索：
 
@@ -893,15 +892,15 @@ POST_NOTIFICATIONS
 - [x] 应用显示名称改为 `galleryFlutter`，已覆盖 Flutter 标题、Android label、iOS/macOS display name、Linux/Windows 窗口/资源名
 - [x] 主界面改为 ChatGPT 类聊天布局：顶部状态、中间消息气泡、底部 composer
 - [x] composer 增加图片、语音、Skills、Prompt Lab 快捷入口
-- [x] Android 模型下载改为系统后台下载：WorkManager + ForegroundInfo 通知 + `.gallerytmp` + HTTP Range 断点续传
+- [x] Android 模型下载改为系统下载：DownloadManager + `.gallerytmp/.cfg` + 系统托管断点续传
 - [x] Android 下载桥接新增 MethodChannel/EventChannel：`com.example.gemma_local_app/model_download` / `model_download_events`
-- [x] Android 模型下载新增并发分片能力：Worker 对支持 Range 的大文件最多开启 4 路 HTTP byte-range coroutine，分片保存为 `{modelFile}.gallerytmp.partN`，每个 part 按已有长度断点续传，全部完成后合并为 `.gallerytmp` 并 rename 为正式 `.litertlm`
+- [x] Android 下载执行权迁移到系统 DownloadManager/DownloadProvider；“多进程”由系统下载服务进程承担，App 进程退出后系统仍可继续写 `.gallerytmp`
 - [x] Android 模型文件路径调整为扁平路径：`/storage/emulated/0/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`；旧嵌套路径下载完成的模型会在 `refreshStatus` 时迁移
 - [x] Android 发送文字后闪退/遮罩根因已定位为 LiteRT-LM 初始化在主线程触发 5s input dispatching ANR；已改为后台单线程初始化/生成，并将首轮推理降为 CPU + maxTokens 1024 + 暂停 vision/audio backend，避免首轮加载阻塞 UI
 - [x] 聊天气泡支持 Markdown 渲染：新增 `flutter_markdown`，用户输入和模型输出均用 `MarkdownBody(selectable: true)` 展示，支持标题、列表、引用、行内代码和代码块
 - [x] Android 真机已重新编译安装，并授予 POST_NOTIFICATIONS 权限用于前台下载通知
 - [x] 常规验证通过：`dart format lib test`、`flutter analyze`、`flutter test`、`flutter build apk --debug`
-- [x] Android 后台下载点击闪退已定位并修复：Android 16 / targetSdk 36 禁止 foreground service type none，已给 WorkManager SystemForegroundService 合并 `android:foregroundServiceType="dataSync"`，ForegroundInfo 显式传 `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC`；adb 点击下载验证无 FATAL/ANR，WorkManager 持续下载，退后台仍有 progress，回前台 pid 不变
+- [x] Android 下载失败根因已重新收口：旧 WorkManager expedited worker 需要 ForegroundInfo，后续按用户要求废弃 App 进程内 Worker，改用系统 DownloadManager；adb 验证系统 DownloadThread 下载、App 被 kill 后临时文件仍增长
 - [x] iOS 不再显示死胡同式“暂不支持”：参考 Google AI Edge Gallery 已上架 iOS App Store、Gallery README、LiteRT-LM iOS/macOS prebuilt 和 iOS allowlist，Dart runtime 旧 iOS 文案已移除；iOS 必须进入原生 MethodChannel runtime。
 - [x] iOS 原生模型下载断点续传修复：`IOSModelDownloadManager.swift` 使用 `URLSessionConfiguration.background`，对已有 `.gallerytmp` 发送 `Range`；续传响应为 HTTP 206 时把本次下载片段追加到旧 `.gallerytmp`，响应为 200 时认为服务端忽略 Range 并覆盖重下，避免旧逻辑把剩余片段当成完整模型导致损坏文件；进度统计加入 resume offset。
 - [x] Dart 前台下载兜底修复：如果已有 `.gallerytmp` 但 Range 请求返回 200，则删除旧 tmp 并用 `FileMode.write` 覆盖，不再 append 完整响应。
@@ -937,7 +936,7 @@ App Store: Google AI Edge Gallery
 1. `google-ai-edge/gallery` README 同时提供 Google Play 与 App Store 下载入口；本项目不能再把 iOS 简单标记为“暂不支持”。
 2. `gallery/model_allowlists/ios_1_0_0.json` 存在 iOS allowlist，Gemma 3n E2B/E4B 条目明确描述 iOS 上支持 text、vision、audio input，说明 Gallery 的产品能力已经面向 iOS 规划/分发。
 3. `google-ai-edge/LiteRT-LM` 存在 iOS/macOS 预编译组件目录，例如 `prebuilt/ios_arm64`、`prebuilt/ios_sim_arm64`、`prebuilt/macos_arm64`，说明 `.litertlm`/LiteRT-LM 路线不应被视为 Android-only。
-4. `google-ai-edge/gallery` Android 端模型下载采用 `DownloadRepository.kt` + `DownloadWorker.kt` + WorkManager + notification；本项目 Android 已按该方向升级为系统后台下载、多 Range 分片、断点续传。
+4. `google-ai-edge/gallery` Android 端模型下载采用 `DownloadRepository.kt` + `DownloadWorker.kt` + WorkManager + notification；本项目 Android 曾按该方向实现，后按用户“必须使用系统下载”的要求改为 Android DownloadManager。
 5. `google-ai-edge/mediapipe-samples/examples/llm_inference/ios` 展示 iOS LLM 示例的模型选择、下载页、聊天页、`NetworkService.swift`、`OnDeviceModel.swift`；可作为 iOS 下载/初始化/聊天体验参考。
 6. Gallery Skills 公开资料包含 `skills/README.md`、`skill.proto`、内置/featured skills、本地导入、URL 导入、免责声明与校验流程。本项目 Skills Hub 设计应沿用这一产品形态。
 
@@ -1113,8 +1112,8 @@ docs/auto_work_plan.md
 - [ ] 下载文件完整性校验。
 - [ ] sha256 或 size 校验。
 - [ ] 下载失败重试策略。
-- [x] Android 后台下载/通知：WorkManager + ForegroundInfo dataSync + SystemForegroundService dataSync。
-- [x] Android 并发分片下载：最多 4 路 Range part，支持 `.partN` 级断点续传。
+- [x] Android 系统下载：DownloadManager + DownloadProvider 系统通知/任务托管。
+- [x] Android 断点续传：由系统 DownloadManager 维护 `.gallerytmp/.cfg`，远端支持 `Accept-Ranges: bytes`。
 - [x] Android 模型最终路径扁平化为 `/storage/emulated/0/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`。
 - [ ] 下载速度、剩余时间展示优化。
 
@@ -1687,20 +1686,18 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 5. Android/iOS 真机验证目录搜索、导入、Gemma prompt 注入和最终回答质量。
 
 
-### 16.15 Android audio raw PCM 对齐与 iOS 固定 WAV probe（2026-05-04）
+### 16.15 Android audio 历史修正记录（2026-05-04，已被 20.3 更新）
 
 继续按用户要求复查 Android audio 与 iOS audio blocker，重点对齐 `/Users/sanbo/Desktop/gallery/Android` 的实际 Ask Audio 输入路径。
 
 已完成：
 
 1. Android `Content.AudioBytes` 输入修正：
-   - 参考 Gallery `LlmChatModelHelper.kt` / `Utils.kt`，模型侧接收的是 16k / mono / 16-bit raw PCM bytes，而不是带 RIFF/WAVE header 的完整 WAV 文件。
-   - `MainActivity.readAudioForGemma(...)` 现在仍要求 UI/播放层提供 WAV 文件，但发送前会解析 WAV `data` chunk、按需转 mono/resample/trim，然后只把 raw PCM 传入 `Content.AudioBytes`。
-   - 删除旧的“compatible WAV byte-for-byte 直接传给模型”路径，避免把 RIFF header 当作音频 sample 交给 LiteRT-LM。
+   - 该小节当时对 Gallery 的理解不完整，已被 2026-05-14 的 20.3 纠正：Gallery 的 `genByteArrayForWav()` 是 raw PCM + 44 字节 WAV header 后传 `Content.AudioBytes`。当前 `MainActivity.readAudioForGemma(...)` 会解析输入 WAV、按需转 mono/resample/trim，然后重新构造完整 16k mono 16-bit PCM WAV bytes 传给模型。
 2. iOS 固定 WAV probe：
    - 默认行为不变：iOS 语音文件、实时录音、Live 入口继续关闭，避免普通用户撞到 `Failed to start streaming (code: 13)`。
    - 新增 `GEMMA_IOS_AUDIO_PROBE` dart-define：只有使用 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 构建时，iOS UI 才允许语音入口。
-   - iOS runtime probe 会校验 16kHz / mono / 16-bit PCM WAV、30 秒上限，并把 WAV `data` chunk 剥离为 raw PCM 后放入 `fg.Message(audioBytes: ...)`，用于真机专项验证 Gemma 原生 audio。
+   - iOS runtime 会校验 16kHz / mono / 16-bit PCM WAV、30 秒上限，并保留完整 WAV bytes 走 `LiteRtLmFfiClient.chatRaw(audioBytes: ...)`。
 3. 继续保持项目根因边界：不能用非 Gemma ASR 把 iOS audio “做成可用”来冒充 Gemma 原生语音理解。
 
 验证：
@@ -1710,13 +1707,13 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 - `flutter build apk --debug`：通过，输出 `build/app/outputs/flutter-apk/app-debug.apk`。
 - `cd android && ./gradlew :app:lintDebug`：通过；仍只有既有 Gradle/插件 deprecated/experimental 警告。
 - `flutter build ios --no-codesign --dart-define=GEMMA_IOS_AUDIO_PROBE=true`：通过，输出 `build/ios/iphoneos/Runner.app`。
-- `flutter test --no-pub`：未通过，仍卡在既有 macOS native asset `libGemmaModelConstraintProvider.dylib` 的 `install_name_tool` headerpad/load command 问题；不是本次 Android raw PCM / iOS probe 变更引入。
+- `flutter test --no-pub`：未通过，仍卡在既有 macOS native asset `libGemmaModelConstraintProvider.dylib` 的 `install_name_tool` headerpad/load command 问题；不是本次 Android/iOS audio 变更引入。
 
 仍待做：
 
-1. Android 真机专项验证录音、WAV、m4a、mp3、多来源导出音频，确认 raw PCM 输入后 Gemma 理解质量。
-2. iOS 真机用 `GEMMA_IOS_AUDIO_PROBE=true` 跑固定 WAV / 录音专项；如果仍 code 13，则把它记录为 Gemma iOS audio runtime blocker 并暂停本项目内 iOS audio 深测。
-3. 如果 iOS probe 有进展，再决定是否把默认 UI 从“关闭”调整为“实验开关”；否则继续保持默认关闭。
+1. Android 真机继续专项验证录音、WAV、m4a、mp3、多来源导出音频，确认完整 WAV 输入后的 Gemma 理解质量。
+2. iOS 真机在线后跑固定 WAV / 录音专项；如果仍 code 13，则把它记录为 Gemma iOS audio runtime blocker 并暂停本项目内 iOS audio 深测。
+3. 如果 iOS 真机验证仍不稳定，再决定是否把默认 UI 降为实验入口；否则保持当前实现但诚实提示风险。
 
 ### 16.16 Flutter test 短 build-dir 闸口恢复（2026-05-04）
 
@@ -1831,7 +1828,7 @@ xcrun devicectl device process launch --device <UDID> <bundle_id>
 
 项目自己的模型下载并不依赖这个插件：
 
-- Android：`WorkManager + ForegroundInfo` 系统后台任务，可在 App 后台继续下载并显示系统通知。
+- Android：`DownloadManager` 系统下载任务，可在 App 后台/进程被杀后继续由系统下载服务调度，并显示系统下载通知。
 - iOS：`IOSModelDownloadManager` 使用 `URLSessionConfiguration.background(withIdentifier:)`，`sessionSendsLaunchEvents = true`，并通过 `AppDelegate.handleEventsForBackgroundURLSession` 接系统回调；App 退后台后由 iOS 系统托管继续/调度下载。
 - iOS 限制：系统后台下载会被电量、网络、温控、锁屏等策略调度，不保证一直满速，但任务可保留、恢复、完成后唤醒 App。
 
@@ -1948,7 +1945,7 @@ remote: https://github.com/hhhaiai/galleryFlutter.git
 本轮按功能整理后的提交边界：
 
 1. 文本 / 图片 / Prompt Lab 质量：保留 Gemma 作为唯一回复基础；Prompt Lab 模板真实插入用户输入；文字、图片、图片+语音请求都有明确本地 Gemma prompt。
-2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，UI/播放保留 16k mono 16-bit PCM WAV，送模型前剥离为 raw PCM；iOS 只默认补齐 audio input/录音/选择/波形/权限，runtime 因 `flutter_gemma + Gemma-4-E2B-it` code 13 继续关闭，仅 `GEMMA_IOS_AUDIO_PROBE=true` 可打开固定 WAV harness。
+2. Audio：Android 继续走 Gallery/LiteRT-LM audio 路线，UI/播放保留 16k mono 16-bit PCM WAV，送模型时重新构造完整 WAV bytes；iOS 已接入 audio input/录音/选择/波形/权限与完整 WAV FFI 输入，真机仍需设备在线后复测。
 3. Skills / Skills Hub：`Skills Hub` UI 已从 Home 大文件抽到 `lib/src/features/skills/skills_hub_sheet.dart`，线上导入和持久化由 `lib/src/features/skills/skill_repository.dart` 负责；当前已支持粘贴 URL 导入、SkillHub.cn 公开目录搜索/导入、`SKILL.md` sha256 校验与本地 hash 元数据展示。Android ToolProvider 已支持 `loadSkill` / `run_intent(send_email)` / bundled built-in `run_js`，image 结果可附着到 assistant 气泡；webview、线上/custom JS、secret/API key 仍诚实标为待深化。
 4. 验证辅助：`tool/check_prompt_and_skills.dart` 可快速验证 Prompt/Skills；`tool/flutter_test_short_builddir.sh` 已恢复 Flutter test 本地闸口。裸 `flutter test --no-pub` 仍需后续上游/根治 `libGemmaModelConstraintProvider.dylib` headerpad/install_name_tool 问题。
 
@@ -2013,3 +2010,249 @@ flutter build ios --release
    - 重要决策
 4. 运行验证命令。
 5. 最终回复用户时说明改动路径和验证结果。
+
+## 20. Android Gallery 最新 Skills 变动同步（2026-05-14）
+
+本轮根据来源工程 `Android/` 当前 `main` 最新提交 `c8c7cef` 同步到 Flutter 工程的 Android/Skills 路线。
+
+来源变动要点：
+
+- Android Gallery 最新提交将 `calculate-hash`、`kitchen-adventure`、`text-spinner`、`send-email` 改为默认不启用。
+- 试用入口移除上述几个 skill 的 try-out chip，并新增 `schedule-notification` 的 “Schedule Reminder” 入口。
+- `Skill` proto 新增 `user_modified_selection`，用于区分“用户手动选择”和“内置默认选择”。Flutter 工程当前没有 DataStore proto 持久化 built-in 选择，因此本轮用 `selectedByDefault` 保留同等默认语义；用户在运行期仍可通过 Skills Hub 手动开关。
+- 来源 Android assets 中还存在 `create-calendar-event`、`read-calendar-events`、`schedule-notification` 三个本地 intent 类 skill，Flutter Android assets 此前缺失，本轮已补齐。
+
+已完成更新：
+
+- `lib/src/features/skills/skill.dart`
+  - `GemmaSkill` 增加 `selectedByDefault`；新增 `defaultEnabledBuiltInSkillNames()`。
+  - 默认禁用 `calculate-hash`、`kitchen-adventure`、`text-spinner`、`send-email`。
+  - 新增 `schedule-notification`、`create-calendar-event`、`read-calendar-events` 三个 built-in skill 定义。
+  - Skills system prompt 更新为 Android 已支持 `send_email`、`get_current_date_and_time`、`create_calendar_event`、`read_calendar_events`、`schedule_notification` 等 `run_intent` 动作。
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+  - 初始启用 skill 集合改为 `defaultEnabledBuiltInSkillNames()`，与 Android Gallery 最新默认选择保持一致。
+- `android/app/src/main/assets/skills/`
+  - 从来源工程补齐 `schedule-notification/`、`create-calendar-event/`、`read-calendar-events/`。
+- `android/app/src/main/kotlin/com/example/gemma_local_app/MainActivity.kt`
+  - Android ToolSet 的 `runIntent` 新增 `get_current_date_and_time`、`create_calendar_event`、`read_calendar_events`、`schedule_notification`。
+  - 新增 `ScheduledNotificationReceiver`，用 AlarmManager + NotificationManager 支撑本地提醒通知。
+  - `schedule_notification` 支持 `title`、`message`、`hour`、`minute`、可选日期、每日重复和 deeplink。
+  - `read_calendar_events` 在缺少 `READ_CALENDAR` 权限时会触发权限请求并诚实返回失败，授权后可重试。
+- `android/app/src/main/AndroidManifest.xml`
+  - 增加日历/提醒相关权限、Flutter app 自身 deeplink scheme、通知 receiver。
+- `test/prompt_and_skills_test.dart`
+  - 增加默认启用集合回归测试，锁定 Android Gallery 最新默认策略。
+
+验证记录：
+
+- `flutter test`：失败，原因仍是既有 `flutter_gemma` macOS native asset dylib install_name_tool/headerpad 问题，不是本轮代码逻辑失败。
+- `tool/flutter_test_short_builddir.sh`：通过，9 个测试全部通过。
+- `flutter analyze`：通过，No issues found。
+- `flutter build apk --debug --no-pub`：通过，产物为 `build/app/outputs/flutter-apk/app-debug.apk`。
+
+仍需真机专项验证：
+
+- Android 真机打开 Skills，确认默认启用项为 `interactive-map`、`schedule-notification`、`mood-tracker`、`query-wikipedia`、`qr-code`，且四个默认禁用项可手动开启。
+- 授权通知权限后，用 Gemma 请求 “Set a daily reminder at 9am to check my schedule for today.”，确认可触发 `schedule_notification` 并在系统侧创建提醒。
+- 如需 `read-calendar-events`，需先授予日历读取权限；未授权时返回失败是预期行为。
+
+### 20.1 Android 可用性收口（2026-05-14）
+
+用户要求确保 `gemma_local_app` 稳定、可用后，继续做了设备级冒烟验证。
+
+发现的问题：
+
+- 首次安装 `build/app/outputs/flutter-apk/app-release.apk` 到已连接 Android 设备 `M2012K11AC` 失败：
+  - `INSTALL_FAILED_OLDER_SDK`
+  - 设备 SDK 为 30，但工程 Android `minSdk = 31`。
+- 这会导致当前连接设备无法安装，属于真实可用性问题。
+
+修复：
+
+- `android/app/build.gradle.kts`
+  - `minSdk` 从 31 调整为 30。
+  - 代码中 Android 12+ exact alarm 能力仍通过 `Build.VERSION.SDK_INT >= Build.VERSION_CODES.S` 做运行期分支；SDK 30 设备会走兼容的 `AlarmManager.set(...)` / `setAndAllowWhileIdle(...)` 路径。
+
+验证：
+
+- `flutter build apk --release --no-pub`：通过，产物 `build/app/outputs/flutter-apk/app-release.apk`。
+- Android 真机安装：通过。
+  - device: `M2012K11AC`
+  - serial: `986b35a0`
+  - package: `com.example.gemma_local_app`
+  - installed `versionName=1.0.0`, `versionCode=1`, `minSdk=30`, `targetSdk=36`
+- Android 真机启动：通过。
+  - `adb shell monkey -p com.example.gemma_local_app -c android.intent.category.LAUNCHER 1`
+  - app pid: `9585`
+  - 启动后未在当前进程 logcat 中发现 `FATAL EXCEPTION` / `AndroidRuntime` 崩溃输出。
+- `flutter analyze`：通过，No issues found。
+- `tool/flutter_test_short_builddir.sh`：通过，9 个测试全部通过。
+
+注意：
+
+- 当前安装的是新包 `com.example.gemma_local_app`，不是来源工程包 `com.google.aiedge.gallery`，不会覆盖原 Gallery 应用数据。
+- 真正模型推理仍需要在 app 内下载 `Gemma-4-E2B-it` 模型后验证；本轮已经证明 APK 可构建、可安装、可启动，且基础代码闸口通过。
+
+
+### 20.2 Android 系统 DownloadManager 下载与本地模型快速导入验证（2026-05-14）
+
+用户反馈 Android 端“下载不了”，并明确要求下载必须使用系统下载、多进程下载、支持断点续传；随后提供本机已下载模型 `/Users/sanbo/Desktop/models/gemma/gemma-4-E2B-it.litertlm` 用于快速完成手机端模型就绪。
+
+本轮修复/收口：
+
+- `android/app/src/main/kotlin/com/example/gemma_local_app/download/ModelDownloadRepository.kt`
+  - Android 主下载路径从 App 进程内 WorkManager/自写 HTTP Worker 改为系统 `DownloadManager`。
+  - 使用 `DownloadManager.enqueue(...)`，目标文件先写入 `gemma-4-e2b-it.litertlm.gallerytmp`。
+  - 使用 `setDestinationInExternalFilesDir(context, null, ...)`，兼容 Android 11 / MIUI 的系统下载目标路径。
+  - download id 写入 `SharedPreferences("model_downloads")`，App 重启后通过 `DownloadManager.Query` 恢复进度/状态。
+  - 成功后 `promoteSystemDownload()` 将 `.gallerytmp` rename/copy 为正式 `gemma-4-e2b-it.litertlm`。
+  - `cancel/delete` 调用 `downloadManager.remove(id)`，避免系统任务继续写临时文件。
+- `android/app/src/main/kotlin/com/example/gemma_local_app/download/ModelDownloadWorker.kt`
+  - 删除旧 Worker，避免继续依赖 App 进程内下载实现。
+- `android/app/build.gradle.kts` / `android/app/src/main/AndroidManifest.xml`
+  - 移除 App 自己不再需要的 WorkManager foreground-service 下载依赖/声明；系统下载由 Android DownloadManager/DownloadProvider 托管。
+- `docs/model_download_flow.md`
+  - 更新为当前真实架构：Android DownloadManager 系统下载、系统进程托管、`.gallerytmp/.cfg` 断点续传。
+
+adb 真机验证：
+
+- 设备：`M2012K11AC`，serial `986b35a0`，Android SDK 30。
+- 安装：`adb install -r -d build/app/outputs/flutter-apk/app-debug.apk` 成功，保留 App 数据。
+- 系统下载验证：
+  - UI 点击 Models 下载后显示 `状态: 下载中`。
+  - logcat 出现 `DownloadManager: call insert is com.example.gemma_local_app`、`DownloadThread: in runInternal ... huggingface.co/...gemma-4-E2B-it.litertlm?download=true`、`ModelDownloadRepository: Enqueued system download id=1213`。
+  - 设备文件出现：`gemma-4-e2b-it.litertlm.gallerytmp` 与 `gemma-4-e2b-it.litertlm.gallerytmp.cfg`。
+  - `am kill com.example.gemma_local_app` 后 `pid_after_kill=none`，20 秒后 `.gallerytmp` 从 `24773697` 增长到 `25624576`，证明下载不依赖 App 进程。
+- 快速导入已下载模型：
+  - 先在 App UI 点 `删除`，取消当前系统下载任务并清空临时文件。
+  - `adb push /Users/sanbo/Desktop/models/gemma/gemma-4-E2B-it.litertlm /sdcard/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`。
+  - 推送结果：`2583085056 bytes`，手机路径 `stat` 同为 `2583085056`。
+  - App 点击 `刷新` 后顶部状态显示 `已下载`。
+  - 重新安装最新 debug 包并启动后仍显示 `已下载`，证明模型路径和状态恢复可用。
+
+验证命令：
+
+- `flutter analyze`：通过，No issues found。
+- `tool/flutter_test_short_builddir.sh`：通过，9 个测试全部通过。
+- `./android/gradlew -p android :app:assembleDebug --offline`：通过。
+- `adb install -r -d build/app/outputs/flutter-apk/app-debug.apk`：通过。
+
+注意：logcat 中仍可看到 `com.google.aiedge.gallery` 的旧 `AGDownloadWorker` 输出，那是来源 Gallery App 包名，不是当前 `com.example.gemma_local_app`，不要误判为本项目仍在使用 WorkManager。
+
+### 20.3 Android/iOS 语音识别修复（2026-05-14）
+
+用户继续反馈：iOS 语音不识别，Android 也不识别。
+
+根因/风险收口：
+
+- iOS FFI 路径此前把 16k mono PCM WAV 的 `data` chunk 剥离成 raw PCM 后传给 `LiteRtLmFfiClient.chatRaw(audioBytes: ...)`。但 `flutter_gemma 0.14.1` 官方 example 是直接发送完整 WAV bytes；Google Android Gallery 也是 `raw PCM + WAV header` 后传 `Content.AudioBytes`。剥离 header 会导致 LiteRT-LM 侧拿到无容器的 opaque PCM blob，表现为语音附件可播放但模型无法识别。
+- Android 录音停止时只置 `isRecording=false` 后等待线程，`AudioRecord.read()` 仍可能阻塞；如果等待超时，存在把尚未写完/空 WAV 交给模型的风险。
+- 默认语音 prompt 偏“总结”，对“先转写”约束不够强，容易让模型泛泛回复或忽略语音细节。
+
+修复：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - `_readGemmaPcm16FromWav` 改为 `_readGemmaWavBytes`。
+  - iOS FFI audio 不再剥离 WAV header，校验 16k/mono/16-bit/<=30s 后返回完整 WAV bytes。
+  - 默认 audio prompt 改为“先准确转写，再总结/回答”，强调姓名、数字、日期和不确定点。
+- `android/app/src/main/kotlin/com/example/gemma_local_app/MainActivity.kt`
+  - `stopRecording()` 主动 `AudioRecord.stop()` 打断阻塞 read，再等待录音线程写完 WAV。
+  - 增加空文件/未保存完成保护，避免把坏音频交给 Gemma。
+- `docs/audio_voice_live_design.md`
+  - 同步 Android/iOS 语音输入真实数据格式与本轮修复记录。
+
+验证：
+
+- `flutter analyze`：通过，No issues found。
+- `tool/flutter_test_short_builddir.sh`：通过，9 tests。
+- `./android/gradlew -p android :app:assembleDebug --offline`：通过。
+- `flutter build ios --simulator --debug --no-pub`：通过，产物 `build/ios/iphonesimulator/Runner.app`。
+- Android 真机 `adb install -r -d build/app/outputs/flutter-apk/app-debug.apk`：通过；启动后顶部仍显示 `Gemma-4-E2B-it · Local AI / 已下载`，模型文件大小仍为 `2583085056`，当前 app 进程未见 FATAL。
+
+剩余风险：
+
+- 当前 `xcrun xctrace list devices` 显示两台 iPhone offline，因此本轮不能声明 iOS 真机语音识别已通过，只能声明 iOS simulator 编译通过。
+- Android 真机已通过 UI 录音发送链路验证：logcat 出现 `GemmaLiteRtRuntime: audio input ready: wavBytes=176044`，界面输出“转录：你好，这是第二四期音讯测试。请实别这句。”和总结；说明录音停止、附件发送、LiteRT-LM audio runtime 与模型转写链路已打通。
+
+
+### 20.4 语音录制交互稳定性补强（2026-05-14）
+
+- 录音中点击 composer「语音」按钮现在直接停止并附加，不再先弹 bottom sheet，避免用户以为已停止但实际还在录音。
+- 点击「发送」时如果仍处于录音中，会先停止录音、校验附件并一起发送，避免空语音/旧语音被误发。
+- Android 原生录音保存增加 `AndroidAudioInput` 日志：`recording saved/ready` 和保存不完整告警，便于 adb 真机定位。
+- Android 真机验证：录音发送后 logcat 出现 `audio input ready: wavBytes=960044`，Gemma 输出了“音频转录”段落，证明音频链路已进入 LiteRT-LM audio runtime。
+
+### 20.5 Android 语音复测纠偏（2026-05-14）
+
+- 复测纠偏：直接用手机麦克风录电脑外放时，Gemma 会明显幻听，不能作为语音识别质量结论；将同一个 UI 附件文件替换为清晰 16k mono WAV 后复测，logcat 显示 `audio input ready: wavBytes=246564`，UI 转写为“你好，这是一个非常清晰的语音测试。今天是5月14日，请准确地读出这句。”，说明 App audio 文件链路可用，主要风险在麦克风采集/环境声与模型 ASR 精度。
+
+### 20.6 iOS code 13 音频推理专项修复（2026-05-14）
+
+用户在 people iPhone 真机复测 iOS 语音时仍报：`iOS 多模态推理失败，已重置会话，请重试：Exception: Failed to start streaming (code: 13)`。
+
+本轮修复收口：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - iOS 音频输入仍保留完整 WAV 容器，但不再把带 `FLLR` 等 padding/metadata chunk 的原始容器直接传入 LiteRT-LM；现在会解析 `data` chunk 后重建最小 44-byte `RIFF/fmt/data` 16k mono 16-bit PCM WAV。
+  - iOS audio-only raw FFI 推理优先使用 `cpu` backend，并在失败时 fallback `gpu`；错误信息会带出已尝试 backend，便于继续定位 code 13。
+  - 高级 `flutter_gemma` audio-only fallback 路径同样选择 CPU backend，避免主 decoder GPU + audio executor CPU 的 iOS 组合触发 streaming 启动失败。
+- `test/gemma_wav_normalization_test.dart`
+  - 新增带 `FLLR` padding chunk 的 iOS/macOS 风格 WAV 归一化测试，锁定输出为最小 44-byte WAV + 原 PCM data。
+- `docs/audio_voice_live_design.md` / `docs/feature_mapping.md` / `docs/progress.md`
+  - 同步 code 13 根因假设与当前修复策略：iOS runtime 送模型前使用干净 WAV 容器、audio-only CPU 优先；仍需 people iPhone 真机手动发送语音验证模型实际转写。
+
+验证：
+
+- `flutter analyze`：通过，No issues found。
+- `FLUTTER_TEST_BUILD_DIR=/tmp/gla_ft_unit tool/flutter_test_short_builddir.sh test/gemma_wav_normalization_test.dart`：通过。
+- `FLUTTER_TEST_BUILD_DIR=/tmp/gla_ft_all tool/flutter_test_short_builddir.sh`：通过，10 tests。
+
+待真机复测：
+
+- people iPhone 已 USB 连接，下一步需安装当前构建并在 UI 重新发送一段语音；期望 syslog 出现 `[GemmaIOS] raw media inference backend=cpu audioBytes=...`，若 CPU 仍失败再自动尝试 GPU 并输出最终 backend 列表。
+
+### 20.7 iOS code 13 streaming fallback（2026-05-14）
+
+用户在 people iPhone 安装 20.6 后手动复测仍提示同样的 `Failed to start streaming (code: 13)`。
+
+追加修复：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - 在 iOS raw FFI media path 中捕获 streaming API 的 code 13：`LiteRtLmFfiClient.chatRaw(...)` 如果启动 streaming 失败，不再直接向 UI 报错，而是使用同一 conversation 和同一 `{type: audio, blob: ...}` JSON 调用非 streaming `LiteRtLmFfiClient.sendMessage(...)`。
+  - 该 fallback 仍是真实 LiteRT-LM/Gemma 推理，只是不走 token streaming；若成功，会一次性返回完整回复。
+  - 若 sync `sendMessage(...)` 也失败，再按 backend fallback 继续尝试 CPU/GPU，最后返回真实错误。
+
+验证与安装：
+
+- `flutter analyze`：通过。
+- `FLUTTER_TEST_BUILD_DIR=/tmp/b tool/flutter_test_short_builddir.sh`：通过，10 tests。
+- `flutter run --debug --no-resident -d 00008120-000605C42244201E`：Xcode build 成功并执行安装/启动；仍因 Dart VM Service 未 attach 而长时间等待，随后使用 `xcrun devicectl device process launch --device BAD258BF-4E4A-5C40-9701-AEF8CCF43E6D com.example.gemmaLocalApp` 启动成功。
+- 为避免残留挂起，已清理两个旧 `flutter run --debug --no-resident` 进程。
+
+下一步：people iPhone 需要再次手动发送语音。若仍报错，说明并非 streaming API 专项问题，而更可能是 iOS LiteRT-LM audio executor / Gemma-4-E2B-it 音频支持在当前设备链路上的 native blocker；届时需要抓 `[GemmaIOS] streaming failed... trying sync sendMessage` 之后的真实 sync 错误。
+
+### 20.8 对齐 Google AI Edge iOS allowlist（2026-05-14）
+
+用户指出“Google AI Edge 好像已经实现了，iOS 可以工作”。复查官方 `google-ai-edge/gallery` 最新公开仓库后，关键结论是：**Gallery 的 iOS 可工作音频模型不是 Gemma 4，而是 iOS allowlist 中的 Gemma 3n E2B/E4B**。
+
+证据：
+
+- `model_allowlists/ios_1_0_0.json` 只列出 `Gemma-3n-E2B-it`、`Gemma-3n-E4B-it`、`Gemma3-1B-IT`；其中 Gemma 3n E2B/E4B 标注 `llmSupportAudio: true` 和 `llm_ask_audio`。
+- Android 最新 allowlist `1_0_14.json` 才列出 `Gemma-4-E2B-it` / `Gemma-4-E4B-it` 的 `llm_ask_audio`。
+- GitHub issue #692 正好记录了同类问题：Gemma 4 LiteRT-LM 在 iOS 初始化/推理失败，而公开 iOS allowlist 不列 Gemma 4。
+
+本轮代码调整：
+
+- `lib/src/core/model/gemma_model_config.dart`
+  - 新增 `gemma3nE2bItIos`，字段按 Google AI Edge iOS allowlist：`google/gemma-3n-E2B-it-litert-lm`、`gemma-3n-E2B-it-int4.litertlm`、commit `73b019b63436d346f68dd9c1dbfd117eb264d888`、size `3388604416`、`supportImage/supportAudio=true`、`modelTypeName='gemmaIt'`。
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+  - `_activeModel` 改为平台选择：iOS 使用 `Gemma-3n-E2B-it`，Android 继续使用 `Gemma-4-E2B-it`。
+  - App title / Models drawer 显示当前平台模型；iOS tag 为 `iOS 音频模型`。
+
+验证：
+
+- `flutter analyze`：通过。
+- `FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh`：通过，10 tests。
+- 已重新安装并启动到 people iPhone，保留 App 数据。
+
+注意：Gemma 3n 的 Hugging Face 仓库是 gated repo；直接 HEAD 下载返回 `401 GatedRepo`。所以 iOS 现在会正确要求/下载 Gallery iOS allowlist 模型，但如果没有 HF token/授权或本地预下载文件，仍无法完成模型获取。当前 `/Users/sanbo/Desktop/models/gemma` 只有 Gemma 4 E2B/E4B，没有 Gemma 3n E2B。

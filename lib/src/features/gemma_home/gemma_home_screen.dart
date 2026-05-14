@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:io' show File;
+import 'dart:convert';
+import 'dart:io' show File, Platform;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'audio_input_service.dart';
 import '../../core/model/gemma_model_config.dart';
@@ -37,21 +40,20 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
   StreamSubscription<AudioInputEvent>? _audioEventSubscription;
 
-  GemmaModelConfig get _activeModel => gemma4E2bIt;
+  GemmaModelConfig get _activeModel =>
+      Platform.isIOS ? gemma3nE2bItIos : gemma4E2bIt;
 
   ModelDownloadStatus _downloadStatus = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
   );
   PromptTemplate _template = promptLabTemplates.first;
   List<GemmaSkill> _onlineSkills = const [];
-  late final Set<String> _enabledSkillNames = {
-    for (final skill in builtInSkills) skill.name,
-  };
+  late final Set<String> _enabledSkillNames = defaultEnabledBuiltInSkillNames();
   final List<_ChatMessage> _messages = [
     const _ChatMessage(
       role: _ChatRole.assistant,
       text:
-          '你好，我是 galleryFlutter。本地模型下载完成后，我可以用 Gemma-4-E2B-it 进行对话，并逐步支持图片、语音、Skills 和 Prompt Lab。',
+          '你好，我是 galleryFlutter。本地模型下载完成后，我会使用当前平台对应的本地 Gemma 模型进行对话、图片、语音、Skills 和 Prompt Lab。',
     ),
   ];
   final Set<_ComposerMode> _enabledModes = {_ComposerMode.text};
@@ -94,6 +96,98 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       if (mounted) setState(() => _downloadStatus = status);
     });
     _loadOnlineSkills();
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _maybeRunIosAudioSmoke(),
+    );
+  }
+
+  Future<void> _maybeRunIosAudioSmoke() async {
+    if (!Platform.isIOS || kReleaseMode) return;
+    const envKey = 'GEMMA_IOS_AUDIO_SMOKE_PATH';
+    const definePath = String.fromEnvironment(envKey);
+    final envPath = Platform.environment[envKey]?.trim() ?? '';
+    const argPrefix = '--gemma-ios-audio-smoke=';
+    String? argPath;
+    for (final arg in Platform.executableArguments) {
+      if (arg.startsWith(argPrefix)) {
+        final value = arg.substring(argPrefix.length).trim();
+        if (value.isNotEmpty) {
+          argPath = value;
+          break;
+        }
+      }
+    }
+    final defineAudioPath = definePath.trim();
+    final rawAudioPath = envPath.isNotEmpty
+        ? envPath
+        : (defineAudioPath.isNotEmpty ? defineAudioPath : (argPath ?? ''));
+    if (rawAudioPath.isEmpty) return;
+
+    final audioPath = rawAudioPath.startsWith('/')
+        ? rawAudioPath
+        : '${(await getApplicationSupportDirectory()).path}/$rawAudioPath';
+
+    debugPrint(
+      '[GemmaIOS][smoke] start model=${_activeModel.name} audio=$audioPath',
+    );
+    await _writeIosAudioSmokeResult(status: 'started', audioPath: audioPath);
+    try {
+      await _runtime.initialize(_activeModel);
+      final response = await _runtime
+          .generate(
+            GemmaRequest(
+              prompt:
+                  'If the attached audio was received and processed, reply with exactly "AUDIO_RECEIVED". Otherwise reply "NO_AUDIO".',
+              audioPaths: [audioPath],
+            ),
+          )
+          .join();
+      debugPrint(
+        '[GemmaIOS][smoke] success chars=${response.length} text=$response',
+      );
+      await _writeIosAudioSmokeResult(
+        status: 'success',
+        audioPath: audioPath,
+        response: response,
+      );
+    } catch (error, stackTrace) {
+      debugPrint('[GemmaIOS][smoke] failed: $error');
+      debugPrint(stackTrace.toString());
+      await _writeIosAudioSmokeResult(
+        status: 'failed',
+        audioPath: audioPath,
+        error: error.toString(),
+        stackTrace: stackTrace.toString(),
+      );
+    }
+  }
+
+  Future<void> _writeIosAudioSmokeResult({
+    required String status,
+    required String audioPath,
+    String? response,
+    String? error,
+    String? stackTrace,
+  }) async {
+    if (!Platform.isIOS || kReleaseMode) return;
+    try {
+      final supportDir = await getApplicationSupportDirectory();
+      final file = File('${supportDir.path}/gemma_ios_audio_smoke_result.json');
+      await file.writeAsString(
+        const JsonEncoder.withIndent('  ').convert({
+          'status': status,
+          'model': _activeModel.modelId,
+          'audioPath': audioPath,
+          'response': response,
+          'error': error,
+          'stackTrace': stackTrace,
+          'writtenAt': DateTime.now().toIso8601String(),
+        }),
+        flush: true,
+      );
+    } catch (writeError) {
+      debugPrint('[GemmaIOS][smoke] result write failed: $writeError');
+    }
   }
 
   @override
@@ -140,6 +234,17 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     if (_liveCallActive) {
       _showSnackBar('Live 语音通话进行中，请先停止后再手动发送。');
       return;
+    }
+    if (_recording) {
+      try {
+        final attached = await _stopRecordingAndAttach(
+          successMessage: '已停止录音并准备发送。',
+        );
+        if (!attached) return;
+      } on PlatformException catch (error) {
+        _showSnackBar('录音停止失败：${error.message ?? error.code}');
+        return;
+      }
     }
     final rawInput = _inputController.text.trim();
     final imagePaths = _attachedImages.map((image) => image.path).toList();
@@ -427,23 +532,28 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     if (_autoStoppingRecording || !_recording || _liveCallActive) return;
     _autoStoppingRecording = true;
     try {
-      final audio = await _audioInput.stopRecording();
-      if (!mounted) return;
-      setState(() => _recording = false);
-      if (audio == null) return;
-      setState(() {
-        _attachedAudios
-          ..clear()
-          ..add(audio);
-        _enabledModes.add(_ComposerMode.voice);
-      });
-      _showSnackBar('已达到 30 秒上限，录音已自动附加到输入框。');
+      await _stopRecordingAndAttach(successMessage: '已达到 30 秒上限，录音已自动附加到输入框。');
     } on PlatformException catch (error) {
       if (mounted) setState(() => _recording = false);
       _showSnackBar('录音自动停止失败：${error.message ?? error.code}');
     } finally {
       _autoStoppingRecording = false;
     }
+  }
+
+  Future<bool> _stopRecordingAndAttach({String? successMessage}) async {
+    final audio = await _audioInput.stopRecording();
+    if (!mounted) return false;
+    setState(() => _recording = false);
+    if (audio == null) return false;
+    setState(() {
+      _attachedAudios
+        ..clear()
+        ..add(audio);
+      _enabledModes.add(_ComposerMode.voice);
+    });
+    if (successMessage != null) _showSnackBar(successMessage);
+    return true;
   }
 
   Future<void> _showAudioSourceSheet() async {
@@ -531,16 +641,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
         _showSnackBar('开始录音，再点语音按钮可停止并附加到输入框。');
         return;
       }
-      final audio = await _audioInput.stopRecording();
-      if (!mounted) return;
-      setState(() => _recording = false);
-      if (audio == null) return;
-      setState(() {
-        _attachedAudios
-          ..clear()
-          ..add(audio);
-        _enabledModes.add(_ComposerMode.voice);
-      });
+      await _stopRecordingAndAttach();
     } on PlatformException catch (error) {
       if (mounted) setState(() => _recording = false);
       _showSnackBar('录音失败：${error.message ?? error.code}');
@@ -1015,9 +1116,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   String get _defaultImageComposerPrompt =>
       _prefersChineseUi ? '请描述这张图片。' : 'Describe this image.';
 
-  String get _defaultAudioComposerPrompt => _prefersChineseUi
-      ? '请识别并总结这段语音内容。'
-      : 'Listen to this audio and summarize it.';
+  String get _defaultAudioComposerPrompt =>
+      _prefersChineseUi ? '请逐字转写这段语音。' : 'Transcribe this audio verbatim.';
 
   String get _defaultMediaComposerPrompt => _prefersChineseUi
       ? '请结合图片和语音内容，识别关键信息并回答。'
@@ -1057,7 +1157,11 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       return;
     }
     if (mode == _ComposerMode.voice) {
-      _showAudioSourceSheet();
+      if (_recording && !_liveCallActive) {
+        unawaited(_toggleRecording());
+      } else {
+        _showAudioSourceSheet();
+      }
       return;
     }
     if (mode == _ComposerMode.skills) {
@@ -1078,7 +1182,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 0,
-        title: const _AppTitle(),
+        title: _AppTitle(model: _activeModel),
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 12),
@@ -1089,13 +1193,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       drawer: ModelsDrawer(
         models: [
           ModelEntry(
-            config: gemma4E2bIt,
+            config: _activeModel,
             status: _downloadStatus,
             onDownload: _downloadModel,
             onCancel: () => _downloadController.cancel(_activeModel),
             onDelete: () => _downloadController.delete(_activeModel),
             onRefresh: () => _downloadController.refreshStatus(_activeModel),
-            tag: '主力模型',
+            tag: Platform.isIOS ? 'iOS 音频模型' : '主力模型',
           ),
         ],
       ),
@@ -1160,7 +1264,9 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 }
 
 class _AppTitle extends StatelessWidget {
-  const _AppTitle();
+  const _AppTitle({required this.model});
+
+  final GemmaModelConfig model;
 
   @override
   Widget build(BuildContext context) {
@@ -1170,7 +1276,7 @@ class _AppTitle extends StatelessWidget {
       children: [
         Text('galleryFlutter', style: Theme.of(context).textTheme.titleMedium),
         Text(
-          'Gemma-4-E2B-it · Local AI',
+          '${model.name} · Local AI',
           style: Theme.of(context).textTheme.bodySmall,
         ),
       ],

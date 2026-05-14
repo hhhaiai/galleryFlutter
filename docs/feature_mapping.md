@@ -48,12 +48,12 @@
 - Flutter 页面入口：`GemmaTaskId.askAudio`
 - 请求字段：`GemmaRequest.audioPaths`
 - 方案文档：`docs/audio_voice_live_design.md`
-- UI 流程：点击 composer 语音按钮 → bottom sheet 选择「实时录音 / 选择语音文件 / Live 语音通话探索」→ 录音或音频文件附着到输入框 → 发送后用户消息气泡显示微信式语音波形卡片。
+- UI 流程：点击 composer 语音按钮 → bottom sheet 选择「实时录音 / 选择语音文件 / Live 语音通话探索」→ 录音或音频文件附着到输入框 → 发送后用户消息气泡显示微信式语音波形卡片；录音中再次点语音按钮会直接停止，录音中点发送会先停止并附加。
 - 已发送语音展示：`_ChatMessage.audioAttachments` 保存语音路径、时长、波形；`_VoiceMessageCard` 显示播放按钮、波形条和时长；点击调用原生 `playAudio(path)` 播放。
-- Android 实现：`MainActivity.kt` 新增 `AndroidAudioInput`，通过 `com.example.gemma_local_app/audio_input` 提供系统音频文件选择、`AudioRecord` 录音、`MediaPlayer` 播放；系统文件选择若拿到 m4a/mp3 等压缩音频，会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一转成 16k mono 16-bit WAV 存盘；runtime 初始化时 `audioBackend = Backend.CPU()`；generate 时 Dart 先注入明确 audio prompt，原生再把第一条 `audioPath` 解析为 16k mono 16-bit raw PCM bytes 并加入 `Content.AudioBytes`，顺序为图片、音频、文本；对 UNKNOWN_LENGTH 的系统 URI 会先复制到 cache 再解码。
-- iOS 实现当前状态：`Info.plist` 添加麦克风权限文案，`IOSAudioInput.swift` 已接入文件选择、录音、播放、`audio_input_events` 电平事件；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。但真机验证显示 `flutter_gemma + Gemma-4-E2B-it` 音频请求会触发 `Failed to start streaming (code: 13)`，所以默认仍显式拦截 iOS audio；仅 `--dart-define=GEMMA_IOS_AUDIO_PROBE=true` 会打开固定 WAV harness，把 WAV data chunk 剥离成 raw PCM 后送 `Message` audioBytes 复现/验证，不作为发布能力。
-- 格式策略：录音与文件选择在原生侧落成 16k mono 16-bit PCM WAV，便于播放/波形/校验；真正送模型时 Android 与 iOS probe 都剥离 WAV header，只传 raw PCM，尽量对齐 Gallery `Content.AudioBytes` 语义；Android 录音达到 30 秒上限会自动停止并回填附件；图片+语音混合输入会使用专门的混合媒体 prompt；Android/iOS 语音波形估算解析 WAV PCM 16-bit sample，不再用 RIFF header 字节估算音量，降低静音判断误差。
-- Live 策略：Android Phase 1 已先落地固定切段/静音切段的伪实时通话（segment -> `GemmaRequest.audioPaths` -> AI 文字回复）；iOS 等 Gemma audio runtime 路径稳定后再打开，不能以非 Gemma ASR 作为本项目 Live 语音成功路径；最后 Phase 3 接 TTS。
+- Android 实现：`MainActivity.kt` 新增 `AndroidAudioInput`，通过 `com.example.gemma_local_app/audio_input` 提供系统音频文件选择、`AudioRecord` 录音、`MediaPlayer` 播放；系统文件选择若拿到 m4a/mp3 等压缩音频，会先用 `MediaExtractor + MediaCodec` 解码为 PCM，再统一转成 16k mono 16-bit WAV 存盘；runtime 初始化时 `audioBackend = Backend.CPU()`；generate 时 Dart 先注入明确 audio prompt，原生再把第一条 `audioPath` 解析/规整为 16k mono 16-bit PCM WAV bytes 并加入 `Content.AudioBytes`，顺序为图片、音频、文本；对 UNKNOWN_LENGTH 的系统 URI 会先复制到 cache 再解码。
+- iOS 实现当前状态：`Info.plist` 添加麦克风权限文案，`IOSAudioInput.swift` 已接入文件选择、录音、播放、`audio_input_events` 电平事件；文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。历史真机验证曾显示旧音频请求会触发 `Failed to start streaming (code: 13)`；2026-05-14 已改为校验后发送完整 WAV 容器到 LiteRT-LM FFI，并在 people iPhone code 13 复测后进一步重建为最小 44-byte `RIFF/fmt/data` WAV、audio-only CPU backend 优先。iOS 真机语音质量仍需重新验证。
+- 格式策略：录音与文件选择在原生侧落成 16k mono 16-bit PCM WAV，便于播放/波形/校验；真正送模型时 Android 与 iOS 都保留完整 WAV 容器，避免无 header PCM blob；iOS 送 FFI 前会去掉额外 padding/metadata chunk，重建干净 44-byte WAV；Android 录音达到 30 秒上限会自动停止并回填附件；图片+语音混合输入会使用专门的混合媒体 prompt；Android/iOS 语音波形估算解析 WAV PCM 16-bit sample，不再用 RIFF header 字节估算音量，降低静音判断误差。
+- Live 策略：Android Phase 1 已先落地固定切段/静音切段的伪实时通话（segment -> `GemmaRequest.audioPaths` -> AI 文字回复）；iOS 需真机复测 Gemma audio runtime 后再声明稳定，不能以非 Gemma ASR 作为本项目 Live 语音成功路径；最后 Phase 3 接 TTS。
 
 ## Prompt Lab
 
@@ -96,3 +96,9 @@
 - Android runtime：Skills 模式会启用 Gallery 同款 `ToolProvider` 方向的原生工具集，`ConversationConfig.tools = listOf(tool(GemmaSkillToolSet(...)))`，并打开 constrained decoding；已接 `loadSkill`、`runJs`、`runIntent` 三个工具形态。
 - 当前工具执行边界：`loadSkill` 能返回内置/线上 skill instructions；`run_intent(send_email)` 会拉起 Android 邮件 Intent；Android 已内置 Gallery `assets/skills/*` 并通过本地 headless WebView 执行 bundled built-in `run_js`；image 输出会保存到 cache 并附着到 assistant 气泡展示，webview 输出目前以结构化文字提示，线上/custom skill 的 JS 文件下载与执行仍待深化。
 - iOS/Flutter 侧已把 Skills 模式下的 `loadSkill` / `runJs` / `runIntent` 作为 `flutter_gemma` tools 注册；`loadSkill` 可从 Dart enabledSkillDetails 返回 instructions 并回传模型继续生成，`runJs` / `runIntent` 仍返回诚实 `pending_bridge`，避免伪装已执行。
+
+
+## 平台模型映射更新（2026-05-14）
+
+- Android：继续以 `Gemma-4-E2B-it` 为活跃模型，对齐 Google AI Edge Android allowlist 的 Gemma 4 多模态/audio 条目。
+- iOS：活跃模型改为 `Gemma-3n-E2B-it`，对齐 Google AI Edge `ios_1_0_0.json` 中 `llmSupportAudio=true` / `llm_ask_audio` 的 iOS allowlist 条目。此前用 Gemma 4 在 iOS audio 上遇到的 `Failed to start streaming (code: 13)` 不再作为主要实现路线。

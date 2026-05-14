@@ -12,6 +12,7 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    repairDocumentsDirectoryIfNeeded()
     // Do NOT call super.application(...). FlutterAppDelegate's super calls
     // GeneratedPluginRegistrant which registers background_downloader, and
     // BackgroundDownloaderPlugin.register(with:) crashes with
@@ -30,6 +31,16 @@ import UIKit
     modelDownloadManager.register(with: messenger)
     gemmaRuntime.register(with: messenger)
     audioInput.register(with: messenger)
+  }
+
+
+  private func repairDocumentsDirectoryIfNeeded() {
+    guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    var isDirectory: ObjCBool = false
+    if FileManager.default.fileExists(atPath: documents.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+      try? FileManager.default.removeItem(at: documents)
+      try? FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+    }
   }
 
   override func application(

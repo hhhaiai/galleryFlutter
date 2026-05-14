@@ -21,7 +21,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.gemma_local_app"
-        minSdk = 31
+        minSdk = 30
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -47,6 +47,5 @@ flutter {
 
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

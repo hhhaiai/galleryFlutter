@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show File, Platform;
 import 'dart:math' as math;
 import 'dart:typed_data' show ByteData, Endian, Uint8List;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/core/ffi/litert_lm_client.dart' as fg_ffi;
 import 'package:flutter_gemma/flutter_gemma.dart' as fg;
@@ -45,6 +47,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     _config = config;
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
+    _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
+      _handleRuntimeEvent,
+      onError: (Object error) => _activeGenerationController?.addError(error),
+    );
+
     if (Platform.isIOS) {
       if (previousConfig != null &&
           (previousConfig.modelId != config.modelId ||
@@ -55,15 +62,17 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         _flutterGemmaModel = null;
       }
       final modelPath = await _resolveModelPath(config);
-      await _prepareFlutterGemmaModel(config, modelPath);
+      await _validateModelFile(config, modelPath);
+      await _methodChannel.invokeMethod<void>('initialize', {
+        'modelPath': modelPath,
+        'topK': config.topK,
+        'topP': config.topP,
+        'temperature': config.temperature,
+        'maxTokens': 1024,
+      });
       _initialized = true;
       return;
     }
-
-    _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
-      _handleRuntimeEvent,
-      onError: (Object error) => _activeGenerationController?.addError(error),
-    );
 
     if (_initialized &&
         previousConfig?.modelId == config.modelId &&
@@ -133,7 +142,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     bool supportImage = false,
     bool supportAudio = false,
   }) async {
-    await _prepareFlutterGemmaModel(config, modelPath);
+    await _validateModelFile(config, modelPath);
 
     try {
       if (forceReload) {
@@ -145,7 +154,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
       _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
         maxTokens: 1024,
-        preferredBackend: fg.PreferredBackend.gpu,
+        preferredBackend: supportAudio && !supportImage
+            ? fg.PreferredBackend.cpu
+            : fg.PreferredBackend.gpu,
         supportImage: supportImage && config.supportImage,
         supportAudio: supportAudio && config.supportAudio,
         maxNumImages: supportImage && config.supportImage ? 1 : null,
@@ -171,7 +182,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     }
   }
 
-  Future<void> _prepareFlutterGemmaModel(
+  Future<void> _validateModelFile(
     GemmaModelConfig config,
     String modelPath,
   ) async {
@@ -187,6 +198,13 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'iOS 模型文件不完整：$bytes / ${config.sizeInBytes} bytes。请删除后重新下载。',
       );
     }
+  }
+
+  Future<void> _prepareFlutterGemmaModel(
+    GemmaModelConfig config,
+    String modelPath,
+  ) async {
+    await _validateModelFile(config, modelPath);
 
     try {
       await fg.FlutterGemma.initialize(maxDownloadRetries: 8);
@@ -351,6 +369,52 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     }
   }
 
+  Stream<String> _invokeIosNativeGenerate(
+    GemmaRequest request, {
+    required String prompt,
+  }) async* {
+    final generationController = StreamController<String>();
+    await _activeGenerationController?.close();
+    _activeGenerationController = generationController;
+    try {
+      try {
+        await _methodChannel.invokeMethod<void>('generate', {
+          'prompt': prompt,
+          'imagePaths': request.imagePaths,
+          'audioPaths': request.audioPaths,
+        });
+      } on PlatformException catch (error) {
+        if (!generationController.isClosed) {
+          generationController.addError(
+            RuntimeUnavailableException(error.message ?? error.code),
+          );
+          await generationController.close();
+        }
+      }
+
+      await for (final token in generationController.stream.timeout(
+        const Duration(seconds: 180),
+        onTimeout: (sink) {
+          sink.addError(
+            const RuntimeUnavailableException(
+              'iOS native LiteRT-LM 180 秒内没有返回内容，已自动停止。',
+            ),
+          );
+          sink.close();
+        },
+      )) {
+        yield token;
+      }
+    } finally {
+      if (identical(_activeGenerationController, generationController)) {
+        _activeGenerationController = null;
+      }
+      if (!generationController.isClosed) {
+        await generationController.close();
+      }
+    }
+  }
+
   Stream<String> _generateWithFlutterGemma(GemmaRequest request) async* {
     final prompt = _contextualPrompt(request);
 
@@ -362,7 +426,35 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     var modelPath = await _resolveModelPath(config);
 
     final tools = _iosSkillToolsFor(request);
-    if ((isImageRequest || isAudioRequest) && tools.isEmpty) {
+    const useDartFfiDefine = String.fromEnvironment('GEMMA_IOS_USE_DART_FFI');
+    const allowPluginPathDefine = String.fromEnvironment(
+      'GEMMA_IOS_ALLOW_PLUGIN_PATH',
+    );
+    final useDartFfi =
+        useDartFfiDefine == '1' ||
+        useDartFfiDefine.toLowerCase() == 'true' ||
+        Platform.environment['GEMMA_IOS_USE_DART_FFI'] == '1';
+    final allowPluginPath =
+        allowPluginPathDefine == '1' ||
+        allowPluginPathDefine.toLowerCase() == 'true' ||
+        Platform.environment['GEMMA_IOS_ALLOW_PLUGIN_PATH'] == '1';
+    const useNativeDirectDefine = String.fromEnvironment(
+      'GEMMA_IOS_USE_NATIVE_DIRECT',
+    );
+    final useNativeDirect =
+        useNativeDirectDefine == '1' ||
+        useNativeDirectDefine.toLowerCase() == 'true' ||
+        Platform.environment['GEMMA_IOS_USE_NATIVE_DIRECT'] == '1';
+    if (tools.isEmpty && isAudioRequest && useNativeDirect && !useDartFfi) {
+      yield* _invokeIosNativeGenerate(
+        request,
+        prompt: isImageRequest
+            ? _imageAndAudioPrompt(prompt)
+            : _audioPrompt(prompt),
+      );
+      return;
+    }
+    if (tools.isEmpty) {
       yield* _generateIosMediaWithRawLiteRtLm(
         request: request,
         prompt: prompt,
@@ -370,6 +462,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         modelPath: modelPath,
       );
       return;
+    }
+    if (!allowPluginPath) {
+      throw const RuntimeUnavailableException(
+        'iOS Skills/function calling 当前已暂时关闭：为避开 flutter_gemma iOS 插件注册崩溃，iOS 现在统一使用 LiteRT-LM raw FFI 路径。请先用文字/图片/语音验证本地模型。',
+      );
     }
     // 这里处理的是：纯文字、图片、或图片+Skills 的 flutter_gemma 高级 API 路径。
     final effectiveConfig = config;
@@ -431,7 +528,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
         }
         if (isAudioRequest) {
-          audioBytes = await _readGemmaPcm16FromWav(request.audioPaths.first);
+          audioBytes = await _readGemmaWavBytes(request.audioPaths.first);
         }
         final mediaPrompt = isImageRequest && isAudioRequest
             ? _imageAndAudioPrompt(prompt)
@@ -503,8 +600,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     // API. Android and non-iOS .litertlm paths send raw text and let LiteRT-LM
     // own the chat template. For iOS vision and audio this nested-template
     // difference causes quality issues (vision) and code 13 errors (audio).
-    // All media requests use the raw JSON path: content=[image?,audio,text]
-    // with an unwrapped prompt.
+    // All media requests use the raw JSON path with an unwrapped prompt.
+    // Keep the textual instruction before media items. LiteRT-LM's Gemma3n
+    // data-processor tests cover text->audio order, and real-device iOS
+    // testing showed audio->text can make the model answer as if no audio was
+    // provided even though the audio file was decoded and prefilled.
     await _prepareFlutterGemmaModel(config, modelPath);
     await _flutterGemmaChat?.session.close();
     _flutterGemmaChat = null;
@@ -527,48 +627,237 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
 
     Uint8List? audioBytes;
     if (isAudioRequest) {
-      audioBytes = await _readGemmaPcm16FromWav(request.audioPaths.first);
+      audioBytes = await _readGemmaWavBytes(request.audioPaths.first);
     }
 
     final mediaPrompt = isImageRequest && isAudioRequest
         ? _imageAndAudioPrompt(prompt)
         : isImageRequest
         ? _visionPrompt(prompt)
-        : _audioPrompt(prompt);
+        : isAudioRequest
+        ? _audioPrompt(prompt)
+        : prompt;
 
-    final cacheDir = (await getApplicationSupportDirectory()).path;
-    final client = fg_ffi.LiteRtLmFfiClient();
-    _iosRawFfiClient = client;
+    final tempMediaPaths = <String>[];
     try {
-      await client.initialize(
-        modelPath: modelPath,
-        backend: 'gpu',
-        maxTokens: 1024,
-        cacheDir: cacheDir,
-        enableVision: isImageRequest && config.supportImage,
-        maxNumImages: isImageRequest && config.supportImage ? 1 : 0,
-        enableAudio: isAudioRequest && config.supportAudio,
+      String? audioPathForJson;
+      String? imagePathForJson;
+      if (isAudioRequest && audioBytes != null) {
+        audioPathForJson = await _writeIosTempMediaFile(
+          prefix: 'gemma_audio',
+          extension: 'wav',
+          bytes: audioBytes,
+        );
+        tempMediaPaths.add(audioPathForJson);
+      }
+      if (isAudioRequest && isImageRequest && imageBytes != null) {
+        imagePathForJson = await _writeIosTempMediaFile(
+          prefix: 'gemma_image',
+          extension: 'png',
+          bytes: imageBytes,
+        );
+        tempMediaPaths.add(imagePathForJson);
+      }
+
+      final cacheDir = (await getApplicationSupportDirectory()).path;
+      final backends = _iosRawMediaBackends(
+        isImageRequest: isImageRequest,
+        isAudioRequest: isAudioRequest,
       );
-      client.createConversation(temperature: 0.1, topK: 1, topP: 0.95, seed: 1);
-      await for (final rawChunk in client.chatRaw(
-        mediaPrompt,
-        imageBytes: imageBytes,
-        audioBytes: audioBytes,
-        enableThinking: false,
-      )) {
-        yield fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawChunk);
+      Object? lastError;
+      for (final backend in backends) {
+        final client = fg_ffi.LiteRtLmFfiClient();
+        _iosRawFfiClient = client;
+        try {
+          debugPrint(
+            '[GemmaIOS] raw media inference backend=$backend '
+            'imageBytes=${imageBytes?.length ?? 0} '
+            'audioBytes=${audioBytes?.length ?? 0} '
+            'audioPath=${audioPathForJson != null} '
+            'imagePath=${imagePathForJson != null}',
+          );
+          await client.initialize(
+            modelPath: modelPath,
+            backend: backend,
+            maxTokens: 1024,
+            cacheDir: cacheDir,
+            enableVision: isImageRequest && config.supportImage,
+            maxNumImages: isImageRequest && config.supportImage ? 1 : 0,
+            enableAudio: isAudioRequest && config.supportAudio,
+          );
+          client.createConversation(
+            temperature: 0.1,
+            topK: 1,
+            topP: 0.95,
+            seed: 1,
+          );
+
+          if (isAudioRequest) {
+            final messageJson = buildIosPathMessageJsonForTesting(
+              text: mediaPrompt,
+              audioPath: audioPathForJson,
+              imagePath: imagePathForJson,
+            );
+            if (!isImageRequest) {
+              // PhoneClaw's working iOS Gemma 4 route uses file-path JSON and
+              // non-streaming Conversation API for audio-only. This avoids the
+              // iOS streaming startup path that repeatedly returned code 13.
+              final rawResponse = await client.sendMessage(messageJson);
+              yield _extractIosRawResponseText(rawResponse);
+              return;
+            }
+            try {
+              await for (final rawChunk in client.sendMessageStreamRaw(
+                messageJson,
+              )) {
+                yield fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(
+                  rawChunk,
+                );
+              }
+              return;
+            } catch (streamError) {
+              if (!_isIosStreamingStartFailure(streamError)) rethrow;
+              debugPrint(
+                '[GemmaIOS] path-json streaming failed on $backend; '
+                'trying sync sendMessage: $streamError',
+              );
+              final rawResponse = await client.sendMessage(messageJson);
+              yield _extractIosRawResponseText(rawResponse);
+              return;
+            }
+          }
+
+          try {
+            await for (final rawChunk in client.chatRaw(
+              mediaPrompt,
+              imageBytes: imageBytes,
+              enableThinking: false,
+            )) {
+              yield fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawChunk);
+            }
+            return;
+          } catch (streamError) {
+            if (!_isIosStreamingStartFailure(streamError)) rethrow;
+            debugPrint(
+              '[GemmaIOS] streaming failed on $backend; trying sync sendMessage: '
+              '$streamError',
+            );
+            final messageJson = fg_ffi.LiteRtLmFfiClient.buildMessageJson(
+              mediaPrompt,
+              imageBytes: imageBytes,
+            );
+            final rawResponse = await client.sendMessage(messageJson);
+            yield _extractIosRawResponseText(rawResponse);
+            return;
+          }
+        } catch (error) {
+          lastError = error;
+          debugPrint(
+            '[GemmaIOS] raw media inference failed on $backend: $error',
+          );
+        } finally {
+          if (identical(_iosRawFfiClient, client)) {
+            _iosRawFfiClient = null;
+          }
+          client.shutdown();
+        }
       }
-    } catch (error) {
-      throw RuntimeUnavailableException('iOS 多模态推理失败，已重置会话，请重试：$error');
+      throw RuntimeUnavailableException(
+        'iOS 多模态推理失败，已重置会话，请重试：$lastError。'
+        '已尝试 backend=${backends.join(' / ')}。',
+      );
     } finally {
-      if (identical(_iosRawFfiClient, client)) {
-        _iosRawFfiClient = null;
+      for (final path in tempMediaPaths) {
+        try {
+          final file = File(path);
+          if (await file.exists()) await file.delete();
+        } catch (_) {
+          // Best-effort temp cleanup only.
+        }
       }
-      client.shutdown();
     }
   }
 
-  Future<Uint8List> _readGemmaPcm16FromWav(String audioPath) async {
+  List<String> _iosRawMediaBackends({
+    required bool isImageRequest,
+    required bool isAudioRequest,
+  }) {
+    if (isAudioRequest && !isImageRequest) {
+      // Audio encoder is CPU-only in LiteRT-LM. Using CPU as the primary
+      // backend avoids iOS code 13 failures seen when the main decoder starts
+      // on GPU and the audio executor is CPU.
+      return const ['cpu', 'gpu'];
+    }
+    if (!isImageRequest && !isAudioRequest) {
+      return const ['gpu', 'cpu'];
+    }
+    return const ['gpu'];
+  }
+
+  bool _isIosStreamingStartFailure(Object error) {
+    return error.toString().contains('Failed to start streaming (code: 13)');
+  }
+
+  Future<String> _writeIosTempMediaFile({
+    required String prefix,
+    required String extension,
+    required Uint8List bytes,
+  }) async {
+    final tempDir = await getTemporaryDirectory();
+    final safeExt = extension.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '');
+    final path =
+        '${tempDir.path}/'
+        '${prefix}_${DateTime.now().microsecondsSinceEpoch}.$safeExt';
+    final file = File(path);
+    await file.writeAsBytes(bytes, flush: true);
+    return file.path;
+  }
+
+  @visibleForTesting
+  static String buildIosPathMessageJsonForTesting({
+    required String text,
+    String? audioPath,
+    String? imagePath,
+  }) {
+    final content = <Map<String, dynamic>>[];
+    content.add({'type': 'text', 'text': text});
+    if (imagePath != null) {
+      content.add({'type': 'image', 'path': imagePath});
+    }
+    if (audioPath != null) {
+      content.add({'type': 'audio', 'path': audioPath});
+    }
+    return jsonEncode({'role': 'user', 'content': content});
+  }
+
+  String _extractIosRawResponseText(String rawResponse) {
+    final text = fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawResponse);
+    if (text.trim().isEmpty && rawResponse.trim().isNotEmpty) {
+      return _extractTextFallbackFromSdkJson(rawResponse);
+    }
+    return text;
+  }
+
+  String _extractTextFallbackFromSdkJson(String rawResponse) {
+    try {
+      final decoded = jsonDecode(rawResponse);
+      if (decoded is Map<String, dynamic>) {
+        final content = decoded['content'];
+        if (content is List) {
+          return content
+              .whereType<Map<String, dynamic>>()
+              .where((item) => item['type'] == 'text')
+              .map((item) => item['text']?.toString() ?? '')
+              .join();
+        }
+      }
+    } catch (_) {
+      // Keep the raw response below; this is only a last-resort display path.
+    }
+    return rawResponse;
+  }
+
+  Future<Uint8List> _readGemmaWavBytes(String audioPath) async {
     final file = File(audioPath);
     if (!await file.exists()) {
       throw RuntimeUnavailableException('音频文件不存在：$audioPath');
@@ -577,6 +866,21 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     if (bytes.length < 44 ||
         _ascii(bytes, 0, 4) != 'RIFF' ||
         _ascii(bytes, 8, 4) != 'WAVE') {
+      throw RuntimeUnavailableException(
+        'iOS audio probe 需要 16k mono PCM WAV：$audioPath',
+      );
+    }
+    return normalizeGemmaWavBytesForLiteRt(bytes, audioPath: audioPath);
+  }
+
+  @visibleForTesting
+  static Uint8List normalizeGemmaWavBytesForLiteRt(
+    Uint8List bytes, {
+    String audioPath = 'audio.wav',
+  }) {
+    if (bytes.length < 44 ||
+        _asciiBytes(bytes, 0, 4) != 'RIFF' ||
+        _asciiBytes(bytes, 8, 4) != 'WAVE') {
       throw RuntimeUnavailableException(
         'iOS audio probe 需要 16k mono PCM WAV：$audioPath',
       );
@@ -590,7 +894,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     var dataOffset = -1;
     var dataSize = 0;
     while (offset + 8 <= bytes.length) {
-      final chunkId = _ascii(bytes, offset, 4);
+      final chunkId = _asciiBytes(bytes, offset, 4);
       final chunkSize = view.getUint32(offset + 4, Endian.little);
       final chunkDataOffset = offset + 8;
       if (chunkDataOffset + chunkSize > bytes.length) break;
@@ -625,11 +929,32 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         ' 当前 format=$audioFormat channels=$channels sampleRate=$sampleRate bits=$bitsPerSample dataSize=$dataSize。',
       );
     }
-    // Return raw PCM bytes. The Conversation JSON API base64-encodes this
-    // blob and the C++ audio executor expects raw PCM frames, not a WAV
-    // container. Gallery's genByteArrayForWav() adds a WAV header for the
-    // Kotlin Content.AudioBytes path, but the FFI JSON path is different.
-    return Uint8List.sublistView(bytes, dataOffset, dataOffset + dataSize);
+    // Keep a full WAV container, but rebuild it into the minimal 44-byte
+    // RIFF/fmt/data shape before passing it to LiteRT-LM. iOS/macOS encoders
+    // often add padding chunks such as FLLR; those are legal WAV, but the
+    // LiteRT-LM iOS audio JSON path has been observed to fail streaming with
+    // code 13 on such containers. Android already sends this same clean shape.
+    return _buildPcm16MonoWav(bytes.sublist(dataOffset, dataOffset + dataSize));
+  }
+
+  static Uint8List _buildPcm16MonoWav(Uint8List pcmData) {
+    final output = Uint8List(44 + pcmData.length);
+    final header = ByteData.sublistView(output);
+    output.setRange(0, 4, 'RIFF'.codeUnits);
+    header.setUint32(4, 36 + pcmData.length, Endian.little);
+    output.setRange(8, 12, 'WAVE'.codeUnits);
+    output.setRange(12, 16, 'fmt '.codeUnits);
+    header.setUint32(16, 16, Endian.little);
+    header.setUint16(20, 1, Endian.little);
+    header.setUint16(22, 1, Endian.little);
+    header.setUint32(24, 16000, Endian.little);
+    header.setUint32(28, 16000 * 2, Endian.little);
+    header.setUint16(32, 2, Endian.little);
+    header.setUint16(34, 16, Endian.little);
+    output.setRange(36, 40, 'data'.codeUnits);
+    header.setUint32(40, pcmData.length, Endian.little);
+    output.setRange(44, output.length, pcmData);
+    return output;
   }
 
   Future<Uint8List> _readGalleryStyleVisionImageBytes(File imageFile) async {
@@ -712,6 +1037,10 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }
 
   String _ascii(Uint8List bytes, int offset, int count) {
+    return _asciiBytes(bytes, offset, count);
+  }
+
+  static String _asciiBytes(Uint8List bytes, int offset, int count) {
     if (offset + count > bytes.length) return '';
     return String.fromCharCodes(bytes.sublist(offset, offset + count));
   }
@@ -822,9 +1151,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   String _audioPrompt(String prompt) {
     final trimmed = prompt.trim();
     if (_isDefaultAudioPrompt(trimmed)) {
-      return 'Listen to the attached audio clip and accurately identify the useful speech, sounds, requests, numbers, names, and key details. Then summarize or answer in $_preferredReplyLanguageName.';
+      return 'This is a speech recognition task. Listen to the attached audio clip carefully and transcribe the speech verbatim as accurately as possible. Preserve names, numbers, dates, and short phrases. Do not add unrelated content. Respond in $_preferredReplyLanguageName. If any word is unclear, mark only that word as uncertain.';
     }
-    return 'Use the attached audio clip as primary evidence and answer the user request. If the audio is unclear, say exactly what is uncertain. Respond in $_preferredReplyLanguageName. User request: $trimmed';
+    return 'Use the attached audio clip as primary evidence. First transcribe or identify the relevant speech/sounds accurately, then answer the user request. Do not invent unheard words. If the audio is unclear, state exactly what is uncertain. Respond in $_preferredReplyLanguageName. User request: $trimmed';
   }
 
   String _imageAndAudioPrompt(String prompt) {
@@ -878,7 +1207,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   bool _isDefaultAudioPrompt(String prompt) {
     return prompt.isEmpty ||
         prompt == '请识别并总结这段语音内容。' ||
-        prompt == 'Listen to this audio and summarize it.';
+        prompt == '请逐字转写这段语音。' ||
+        prompt == 'Listen to this audio and summarize it.' ||
+        prompt == 'Transcribe this audio verbatim.';
   }
 
   String get _preferredReplyLanguageName {
