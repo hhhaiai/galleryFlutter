@@ -35,6 +35,13 @@
 Flutter 固化位置：
 
 - `lib/src/core/model/gemma_model_config.dart`
+- Runtime 自适应窗口：`lib/src/core/runtime/platform_gemma_runtime.dart`
+
+当前文字对话窗口按设备内存分档，不直接固定为模型最大值：
+
+- iOS fallback / low / medium / high：`8192 / 12288 / 16384 / 24576`
+- Android fallback / low / medium / high：`16384 / 12288 / 24576 / 32000`
+- 图片/语音多模态窗口保持稳定优先，不跟随文字窗口同步放大。
 
 下载地址：
 

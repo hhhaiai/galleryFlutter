@@ -41,11 +41,20 @@ class DeviceRuntimeProfile {
   }) {
     final memoryBytes = totalMemoryBytes ?? 0;
     if (isAppleMobile) {
-      if (totalMemoryBytes == null || memoryBytes <= 5 * _gib) {
-        return DeviceRuntimeProfile(
-          label: totalMemoryBytes == null ? 'ios-low-fallback' : 'ios-low',
-          totalMemoryBytes: totalMemoryBytes,
+      if (totalMemoryBytes == null) {
+        return const DeviceRuntimeProfile(
+          label: 'ios-low-fallback',
           textTokenWindow: 8192,
+          multimodalTokenWindow: 2048,
+          imageMaxDimension: 640,
+          preferCpuForImage: true,
+        );
+      }
+      if (memoryBytes <= 5 * _gib) {
+        return DeviceRuntimeProfile(
+          label: 'ios-low',
+          totalMemoryBytes: totalMemoryBytes,
+          textTokenWindow: 12288,
           multimodalTokenWindow: 2048,
           imageMaxDimension: 640,
           preferCpuForImage: true,
@@ -55,7 +64,7 @@ class DeviceRuntimeProfile {
         return DeviceRuntimeProfile(
           label: 'ios-medium',
           totalMemoryBytes: totalMemoryBytes,
-          textTokenWindow: 12288,
+          textTokenWindow: 16384,
           multimodalTokenWindow: 3072,
           imageMaxDimension: 768,
           preferCpuForImage: false,
@@ -64,30 +73,37 @@ class DeviceRuntimeProfile {
       return DeviceRuntimeProfile(
         label: 'ios-high',
         totalMemoryBytes: totalMemoryBytes,
-        textTokenWindow: 16384,
+        textTokenWindow: 24576,
         multimodalTokenWindow: 4096,
         imageMaxDimension: 896,
         preferCpuForImage: false,
       );
     }
 
-    if (totalMemoryBytes != null && memoryBytes <= 6 * _gib) {
+    if (totalMemoryBytes == null) {
+      return const DeviceRuntimeProfile(
+        label: 'android-medium-fallback',
+        textTokenWindow: 16384,
+        multimodalTokenWindow: 8192,
+        imageMaxDimension: 1024,
+        preferCpuForImage: false,
+      );
+    }
+    if (memoryBytes <= 6 * _gib) {
       return DeviceRuntimeProfile(
         label: 'android-low',
         totalMemoryBytes: totalMemoryBytes,
-        textTokenWindow: 8192,
+        textTokenWindow: 12288,
         multimodalTokenWindow: 3072,
         imageMaxDimension: 640,
         preferCpuForImage: false,
       );
     }
-    if (totalMemoryBytes == null || memoryBytes <= 10 * _gib) {
+    if (memoryBytes <= 10 * _gib) {
       return DeviceRuntimeProfile(
-        label: totalMemoryBytes == null
-            ? 'android-medium-fallback'
-            : 'android-medium',
+        label: 'android-medium',
         totalMemoryBytes: totalMemoryBytes,
-        textTokenWindow: 16384,
+        textTokenWindow: 24576,
         multimodalTokenWindow: 8192,
         imageMaxDimension: 1024,
         preferCpuForImage: false,
@@ -96,7 +112,7 @@ class DeviceRuntimeProfile {
     return DeviceRuntimeProfile(
       label: 'android-high',
       totalMemoryBytes: totalMemoryBytes,
-      textTokenWindow: 16384,
+      textTokenWindow: 32000,
       multimodalTokenWindow: 8192,
       imageMaxDimension: 1024,
       preferCpuForImage: false,

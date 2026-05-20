@@ -135,15 +135,15 @@ cd .. && flutter build ios --no-codesign
 - `lib/src/features/gemma_home/gemma_home_screen.dart` 中 `_activeModel` 已改为固定 `gemma4E2bIt`，不再让 iOS 默认切到 `Gemma-3n-E2B-it`。
 - `lib/src/core/model/gemma_model_config.dart` 中 `availableModels` 已收敛回单模型 `Gemma-4-E2B-it`。
 - 为满足“文字上下文更长一些”，`lib/src/core/runtime/platform_gemma_runtime.dart` 的 runtime session token window 不再固定 `1024`：
-  - 纯文字请求目标窗口：`16384`
-  - 图片/语音等多模态请求目标窗口：Android/default `8192`，iOS `4096`
-  - 最终仍受模型配置 `maxTokens` / `maxContextLength` 共同约束
+  - 纯文字请求按设备内存分档：iOS low/medium/high 为 `12288 / 16384 / 24576`，Android low/medium/high 为 `12288 / 24576 / 32000`；内存探测失败时保守 fallback 仍为 Android `16384`、iOS `8192`
+  - 图片/语音等多模态请求维持稳定优先：iOS low/medium/high 为 `2048 / 3072 / 4096`，Android low/medium/high 为 `3072 / 8192 / 8192`
+  - 最终仍受模型配置 `maxContextLength=32000` 约束
 - 这次调整的直接目的，是避免图片/多模态请求继续出现 `Input token ids are too long ... >= 1024` 这一类会话窗口过小错误。
 
 ### 2026-05-20 双端 Gemma-4-E2B-it 防回退复检
 
 - 已删除代码中的历史 iOS `Gemma-3n-E2B-it` 配置常量，避免后续误把 iOS 默认模型切回 Gemma 3n。
-- 新增 `test/model_baseline_test.dart`：锁定 `availableModels == [gemma4E2bIt]`、模型支持文字/图片/语音任务、runtime session window 纯文字 `16384` / Android 多模态 `8192` / iOS 多模态 `4096`。
+- 新增 `test/model_baseline_test.dart`：锁定 `availableModels == [gemma4E2bIt]`、模型支持文字/图片/语音任务，并覆盖文字窗口按内存扩大、图片/语音多模态窗口不跟随放大的防回退规则。
 - 已同步文档：`docs/feature_mapping.md`、`docs/audio_voice_live_design.md`、`docs/google_ai_edge_ux_design.md` 中的 Gemma 3n 说明现在均标记为历史参考，不是当前默认路线。
 - 验证通过：`flutter analyze`、`FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh`、`flutter build apk --release`、`flutter build ios --release`。
 
@@ -156,9 +156,9 @@ cd .. && flutter build ios --no-codesign
 
 ### 2026-05-20 稳定优先上下文增强
 
-- 纯文字 runtime session window 从 `8192` 提高到 `16384`。
-- 图片/语音多模态 runtime session window：Android/default 从 `4096` 提高到 `8192`；iOS 为稳定保留 `4096`。
-- 不直接启用 32K/256K：当前先保稳定，后续如真机长期稳定再考虑高配设备开关或自适应窗口。
+- 初始纯文字 runtime session window 从 `8192` 提高到 `16384`；当前已经升级为按设备内存分档继续放大。
+- 图片/语音多模态 runtime session window 保持稳定优先，不跟随文字窗口放大。
+- 不启用 256K；当前最高只到 `Gemma-4-E2B-it.maxContextLength=32000`。
 
 ### 2026-05-20 仓库本地模型缓存
 
@@ -179,10 +179,20 @@ cd .. && flutter build ios --no-codesign
 
 - Android/iOS runtime channel 新增 `getDeviceMemoryInfo`。
 - Dart 新增 `DeviceRuntimeProfile.forMemoryBytes(...)`，按设备内存自动设置 text token window、multimodal token window、iOS 图片预处理长边和图片 backend 顺序。
-- iPhone 13 这类 iOS 低内存档使用：text `8192`、图片/语音 `2048`、图片长边 `640`、图片 backend `cpu -> gpu`。
-- Android 中/高内存档保持 text `16384`、图片/语音 `8192`、图片长边 `1024`。
+- iPhone 13 这类 iOS 低内存档使用：text `12288`、图片/语音 `2048`、图片长边 `640`、图片 backend `cpu -> gpu`。
+- iOS 中/高内存档 text 为 `16384 / 24576`，图片/语音仍为 `3072 / 4096`。
+- Android 低/中/高内存档 text 为 `12288 / 24576 / 32000`，图片/语音为 `3072 / 8192 / 8192`，图片长边最高 `1024`。
 - 验证：`flutter analyze` 通过，短路径 Flutter test `14 tests passed`，`flutter build ios --release` 通过，并已安装启动到 iPhone13。
 - 补充验证：`flutter build apk --release` 通过，并已 `adb install -r -d` 安装启动到 Pixel 8。
+
+### 2026-05-20 文字对话上下文二次放大
+
+- 只放大 text-only 窗口，不放大图片/语音多模态窗口。
+- iOS fallback 仍保守 `8192`；内存探测成功后 low/medium/high 为 `12288 / 16384 / 24576`。
+- Android fallback 仍保守 `16384`；内存探测成功后 low/medium/high 为 `12288 / 24576 / 32000`。
+- `test/model_baseline_test.dart` 增加分档测试，锁定 iOS low 图片仍为 `2048`，避免文字扩容再次影响图片稳定性。
+- 验证：`flutter analyze` 通过，短路径 Flutter test `15 tests passed`，`flutter build apk --release` 和 `flutter build ios --release` 通过。
+- 真机 release 启动验证：Pixel 8 `pid=21060`；people / iPhone 14 Pro Max 安装启动成功，模型仍预置在 `Library/Application Support/Gemma_4_E2B_it/...`。
 
 ### 2026-05-20 iPhone 14 Pro Max release 安装
 

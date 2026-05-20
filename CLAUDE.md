@@ -2488,7 +2488,7 @@ BUILD_RELEASE=0 tool/install_release_with_local_gemma4.sh
 
 ### 21.3 2026-05-20 稳定优先的更大上下文增强
 
-用户确认“不追求 256K 单次会话”，但希望在稳定基础上增强更大上下文。本轮采用渐进式放大，不直接打满模型 32K：
+用户确认“不追求 256K 单次会话”，但希望在稳定基础上增强更大上下文。本轮先采用渐进式放大，不直接打满模型 32K：
 
 - 纯文字 session window：从 `8192` 提高到 `16384`。
 - 图片 / 语音多模态 session window：Android/default 从 `4096` 提高到 `8192`；iOS 为稳定保留 `4096`。
@@ -2499,7 +2499,7 @@ BUILD_RELEASE=0 tool/install_release_with_local_gemma4.sh
 - 图片/语音请求会额外占用多模态 encoder 与 KV cache，先从 4K 提到 8K，避免直接 16K/32K 带来 iOS/Android 内存和初始化风险。
 - `Gemma-4-E2B-it.maxContextLength` 仍保留 `32000`，未来如果真机长期稳定，可以再做高配设备开关或自适应 32K。
 
-防回退：`test/model_baseline_test.dart` 已锁定纯文字 `16384`、多模态 `8192`，避免再次退回 `1024` 或旧的 8K/4K。
+防回退：`test/model_baseline_test.dart` 已锁定纯文字不回退到 `1024`，并在后续 21.6/21.7 中升级为按设备内存分档。
 
 ### 21.4 2026-05-20 仓库内本地模型缓存（GitHub 忽略）
 
@@ -2557,7 +2557,7 @@ FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh
 
 修复策略：保留更大文字上下文，但 iOS 多模态回到已知更稳的窗口。
 
-- 纯文字：继续 `16384`。
+- 纯文字：先继续 `16384` 稳定基线，后续只在 text-only 路径按设备内存继续放大。
 - Android/default 图片/语音：继续 `8192`。
 - iOS 图片/语音：回退为 `4096`。
 
@@ -2586,20 +2586,28 @@ Dart 自适应策略：
 - `lib/src/core/runtime/platform_gemma_runtime.dart`
   - 新增 `DeviceRuntimeProfile.forMemoryBytes(...)`。
   - iOS 低内存档（例如 iPhone 13 约 4GB）：
-    - text token window: `8192`
+    - text token window: `12288`
     - image/audio token window: `2048`
     - image max dimension: `640`
     - image backend: `cpu -> gpu`
   - iOS 中内存档（约 6GB）：
-    - text: `12288`
+    - text: `16384`
     - multimodal: `3072`
     - image max dimension: `768`
   - iOS 高内存档（>7GB）：
-    - text: `16384`
+    - text: `24576`
     - multimodal: `4096`
     - image max dimension: `896`
-  - Android 中/高内存档继续保留更大窗口：
-    - text: `16384`
+  - Android 低内存档（<=6GB）：
+    - text: `12288`
+    - multimodal: `3072`
+    - image max dimension: `640`
+  - Android 中内存档（<=10GB）：
+    - text: `24576`
+    - multimodal: `8192`
+    - image max dimension: `1024`
+  - Android 高内存档（>10GB）：
+    - text: `32000`
     - multimodal: `8192`
     - image max dimension: `1024`
 
@@ -2617,3 +2625,26 @@ BUILD_RELEASE=0 INSTALL_ANDROID=0 IOS_DEVICE=CAFC7AFA-4565-5C8D-B724-090061D144D
 结果：analyze 通过，14 tests passed，iOS release 构建通过，并已安装启动到 iPhone13。
 
 补充验证：Android release 也已重新编译通过，并通过 `adb install -r -d` 安装启动到 Pixel 8，pid `17045`。
+
+### 21.7 2026-05-20 文字对话上下文二次放大
+
+用户希望“文字对话更大一些，不过需要验证”。本轮只放大 text-only session window，不同步放大图片/语音多模态窗口，避免重新触发 iPhone 13 图片识别内存峰值问题。
+
+新的文字分档：
+
+- iOS 内存探测失败 fallback：`8192`（保守）
+- iOS 低/中/高内存：`12288 / 16384 / 24576`
+- Android 内存探测失败 fallback：`16384`（保守）
+- Android 低/中/高内存：`12288 / 24576 / 32000`
+
+稳定边界：
+
+- 图片/语音多模态窗口保持 21.6 的稳定值，不跟随文字窗口放大。
+- `Gemma-4-E2B-it.maxContextLength=32000` 仍是最终上限；Android 高内存文字会话打到 `32000`，不会超过模型配置。
+- 低内存/探测失败时不激进放大，优先保启动和图片路径稳定。
+
+验证要求：
+
+- `test/model_baseline_test.dart` 新增文字窗口分档断言，同时断言 iOS low 图片仍为 `2048`。
+- 已重新跑 `flutter analyze`、短路径 Flutter test、Android/iOS release build。
+- 已用 `tool/install_release_with_local_gemma4.sh` 把 release 包安装启动到 Pixel 8 和 people / iPhone 14 Pro Max，并确认预置模型仍存在。

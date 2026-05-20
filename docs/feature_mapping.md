@@ -103,4 +103,4 @@
 - Android：以 `Gemma-4-E2B-it` 为唯一活跃模型。
 - iOS：以 `Gemma-4-E2B-it` 为唯一活跃模型。
 - 图片 / 文字 / 语音识别都必须继续走这一个本地模型。2026-05-14 曾尝试的 iOS `Gemma-3n-E2B-it` allowlist 路线只保留为历史排查记录，不再作为默认产品路线。
-- 为避免 Apple 多模态请求再次落回 `1024` token window，runtime 初始化统一使用更长 session window：纯文字目标 `16384`，Android 图片/语音目标 `8192`，iOS 图片/语音目标 `4096`。
+- 为避免 Apple 多模态请求再次落回 `1024` token window，同时继续放大文字对话，runtime 初始化按设备内存分档：纯文字 iOS low/medium/high 为 `12288 / 16384 / 24576`，Android low/medium/high 为 `12288 / 24576 / 32000`；图片/语音仍走稳定优先窗口，iOS `2048 / 3072 / 4096`，Android `3072 / 8192 / 8192`。
