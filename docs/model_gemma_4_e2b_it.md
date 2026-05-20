@@ -8,7 +8,7 @@
   "modelId": "litert-community/gemma-4-E2B-it-litert-lm",
   "modelFile": "gemma-4-E2B-it.litertlm",
   "commitHash": "7fa1d78473894f7e736a21d920c3aa80f950c0db",
-  "sizeInBytes": 2583085056,
+  "sizeInBytes": 2538766336,
   "minDeviceMemoryInGb": 8,
   "llmSupportImage": true,
   "llmSupportAudio": true,

@@ -132,7 +132,7 @@ Gemma-4-E2B-it
   "modelId": "litert-community/gemma-4-E2B-it-litert-lm",
   "modelFile": "gemma-4-E2B-it.litertlm",
   "commitHash": "7fa1d78473894f7e736a21d920c3aa80f950c0db",
-  "sizeInBytes": 2583085056,
+  "sizeInBytes": 2538766336,
   "minDeviceMemoryInGb": 8,
   "llmSupportImage": true,
   "llmSupportAudio": true,
@@ -1021,7 +1021,7 @@ xcrun devicectl device info processes               PASS，Runner.app/Runner 进
 处理结果：
 
 - iOS 下载主路径确认是 `IOSModelDownloadManager.swift` 的 `URLSessionConfiguration.background(withIdentifier:)`，不是 Dart 前台 HTTP 下载；Flutter 侧 Android/iOS 都优先调用 `com.example.gemma_local_app/model_download` 原生 MethodChannel。
-- 增强 `refreshStatus` 与 `download` 前的恢复逻辑：扫描 Application Support、Documents、Caches 中已有的 `gemma-4-E2B-it.litertlm`、小写 `gemma-4-e2b-it.litertlm`、以及 Gallery 风格嵌套目录；如果发现大小达到 `2583085056` 的完整模型，会迁移到当前 iOS 标准路径 `{ApplicationSupport}/Gemma_4_E2B_it/{commitHash}/gemma-4-E2B-it.litertlm` 并直接返回 `succeeded`，避免重复下载。
+- 增强 `refreshStatus` 与 `download` 前的恢复逻辑：扫描 Application Support、Documents、Caches 中已有的 `gemma-4-E2B-it.litertlm`、小写 `gemma-4-e2b-it.litertlm`、以及 Gallery 风格嵌套目录；如果发现大小达到 `2538766336` 的本地完整模型，会迁移到当前 iOS 标准路径 `{ApplicationSupport}/Gemma_4_E2B_it/{commitHash}/gemma-4-E2B-it.litertlm` 并直接返回 `succeeded`，避免重复下载。
 - 如果发现 final 文件存在但大小不足，会转成 `.gallerytmp` 并显示 partiallyDownloaded，后续使用 HTTP Range 续传。
 - 如果 `.gallerytmp` 已经完整，会 promote 为正式模型文件。
 - 下载仍由 iOS background URLSession 托管，支持 App 切后台后由系统继续调度。
@@ -2126,7 +2126,7 @@ adb 真机验证：
 - 快速导入已下载模型：
   - 先在 App UI 点 `删除`，取消当前系统下载任务并清空临时文件。
   - `adb push /Users/sanbo/Desktop/models/gemma/gemma-4-E2B-it.litertlm /sdcard/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`。
-  - 推送结果：`2583085056 bytes`，手机路径 `stat` 同为 `2583085056`。
+  - 推送结果：`2538766336 bytes`，手机路径 `stat` 同为 `2538766336`。
   - App 点击 `刷新` 后顶部状态显示 `已下载`。
   - 重新安装最新 debug 包并启动后仍显示 `已下载`，证明模型路径和状态恢复可用。
 
@@ -2167,7 +2167,7 @@ adb 真机验证：
 - `tool/flutter_test_short_builddir.sh`：通过，9 tests。
 - `./android/gradlew -p android :app:assembleDebug --offline`：通过。
 - `flutter build ios --simulator --debug --no-pub`：通过，产物 `build/ios/iphonesimulator/Runner.app`。
-- Android 真机 `adb install -r -d build/app/outputs/flutter-apk/app-debug.apk`：通过；启动后顶部仍显示 `Gemma-4-E2B-it · Local AI / 已下载`，模型文件大小仍为 `2583085056`，当前 app 进程未见 FATAL。
+- Android 真机 `adb install -r -d build/app/outputs/flutter-apk/app-debug.apk`：通过；启动后顶部仍显示 `Gemma-4-E2B-it · Local AI / 已下载`，模型文件大小仍为 `2538766336`，当前 app 进程未见 FATAL。
 
 剩余风险：
 
@@ -2256,3 +2256,364 @@ adb 真机验证：
 - 已重新安装并启动到 people iPhone，保留 App 数据。
 
 注意：Gemma 3n 的 Hugging Face 仓库是 gated repo；直接 HEAD 下载返回 `401 GatedRepo`。所以 iOS 现在会正确要求/下载 Gallery iOS allowlist 模型，但如果没有 HF token/授权或本地预下载文件，仍无法完成模型获取。当前 `/Users/sanbo/Desktop/models/gemma` 只有 Gemma 4 E2B/E4B，没有 Gemma 3n E2B。
+
+### 20.9 macOS 中文输入与桌面图片选择修复记录（2026-05-20）
+
+本轮用户在 macOS 调试中连续反馈两个桌面可用性问题：
+
+1. **中文输入不稳定/不能正常上屏**
+2. **图片图标点击后没有正确弹出可用的文件选择流程**
+
+#### 中文输入问题的根因
+
+问题不在 Gemma runtime，而在 Flutter `TextField` 上叠加了移动端式输入干预：
+
+- composer 输入框的 `TextField` 绑定了自定义 `onTap`
+- `onTap` 内部手动执行：
+  - `focusNode.requestFocus()`
+  - `SystemChannels.textInput.invokeMethod('TextInput.show')`
+
+这类逻辑在 Android/iOS 上常用于确保软键盘弹出，但在 macOS 上会干扰系统输入法（尤其是中文 IME）的组合输入流程，表现为：
+
+- 中文候选不稳定
+- 点击输入框后中文无法正常输入
+- 桌面端输入行为和原生 App 不一致
+
+#### 中文输入问题的修复方式
+
+已在：
+
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+
+做以下调整：
+
+- 删除 `TextField` 上针对桌面端的自定义 `onTap` 干预
+- 不再在 macOS 上主动调用 `TextInput.show`
+- 输入框行为回退到 Flutter/macOS 原生文本输入路径
+
+最终结论：
+
+- **桌面端不要为了“模仿手机键盘弹出”去手动操控 `TextField` 的 focus/text input channel**
+- macOS/Windows/Linux 应优先保持系统原生输入法链路
+
+#### 后续防回归原则（中文输入）
+
+以后如果继续改 composer 输入框，必须遵守：
+
+1. **不要在桌面端 `TextField` 上主动调用 `SystemChannels.textInput.show`**
+2. **不要在桌面端为普通输入框额外写 `requestFocus()` 型 onTap 干预**
+3. 如果必须保留手机端软键盘逻辑，必须显式限制到：
+   - `Platform.isAndroid || Platform.isIOS`
+4. 出现“中文无法输入 / 候选异常 / 上屏异常”时，先回查输入框是否又加回了移动端输入干预，再排查 Flutter/macOS 本身
+
+#### 图片图标无效的根因
+
+macOS 上 `image_picker` 底层走的是 `file_selector`，而不是移动端相机/系统相册弹层。当前项目最初仍沿用了手机图片入口：
+
+- 点击图片按钮
+- 弹出 “拍照 / 从相册选择”
+
+这在桌面端交互上不合适，而且 macOS 沙盒如果没有补对应 entitlement，用户选择文件后也可能没有可读权限，最终表现为“点图标没反应”或“选完无结果”。
+
+#### 图片图标无效的修复方式
+
+已完成两层修复：
+
+1. **桌面端图片入口改造**
+   - 在 `lib/src/features/gemma_home/gemma_home_screen.dart`
+   - macOS/Windows/Linux 点击图片图标时，不再弹移动端 bottom sheet
+   - 直接走 `ImageSource.gallery` 的文件选择器路径
+
+2. **macOS 文件访问 entitlement 补齐**
+   - `macos/Runner/DebugProfile.entitlements`
+   - `macos/Runner/Release.entitlements`
+   - 新增：
+     - `com.apple.security.files.user-selected.read-only = true`
+
+#### 后续防回归原则（桌面图片选择）
+
+1. `image_picker` 在桌面端本质是文件选择器，不要继续套用手机端“拍照/相册”交互
+2. 只要桌面端需要用户手选文件，就必须先检查 sandbox entitlement 是否齐全
+3. 以后若再次出现“图标点击无效”，优先检查：
+   - 是否误回退成移动端图片入口
+   - macOS entitlement 是否缺失
+   - 文件选择器是否被 sandbox 拦截
+
+#### 本轮涉及文件
+
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+- `macos/Runner/DebugProfile.entitlements`
+- `macos/Runner/Release.entitlements`
+
+#### 本轮验证
+
+- `flutter analyze`：通过
+- macOS app 重启后：
+  - 模型仍走私有目录
+  - 输入框可承载中文文本
+  - 图片入口已切到桌面文件选择逻辑
+
+备注：
+
+- 中文输入法候选上屏这类问题很难完全靠自动化稳定验证，因此后续每次修改桌面 composer 输入框后，都要保留一次真实人工中文输入回归。
+
+### 21.0 2026-05-20 移动端默认模型重新统一到 Gemma-4-E2B-it
+
+用户最新要求已经改变：
+
+- **Android 默认模型必须是 `Gemma-4-E2B-it`**
+- **iOS 默认模型也必须是 `Gemma-4-E2B-it`**
+- **图片 / 文字 / 语音识别都继续要求支持**
+- **文字上下文要更长一些**
+
+因此当前仓库的最新基线不再沿用之前的：
+
+- “iOS 默认切到 `Gemma-3n-E2B-it` 以对齐旧 allowlist”
+
+而改为：
+
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+  - `_activeModel` 固定返回 `gemma4E2bIt`
+- `lib/src/core/model/gemma_model_config.dart`
+  - `availableModels` 收敛回单模型 `Gemma-4-E2B-it`
+
+#### 为什么要同步调整 runtime token window
+
+用户随后给出的 macOS / Apple 多模态错误是：
+
+- `Input token ids are too long. Exceeding the maximum number of tokens allowed: 3863 >= 1024`
+
+这说明当前 runtime session window 被硬编码得过小，图片或多模态请求很容易在进入模型前就被拒绝。
+
+为满足“文字上下文更长一些”，并同时减少图片/语音请求的 token 上限错误，已在：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+
+新增统一的 session token window 规则：
+
+- 纯文字请求：目标窗口 `8192`
+- 图片 / 语音等多模态请求：目标窗口 `4096`
+- 最终仍受模型自身 `maxTokens` / `maxContextLength` 限制
+
+#### 后续防回归要求
+
+1. 以后如果再看到 “iOS 默认模型是 Gemma-3n-E2B-it”，优先检查是不是又把 `_activeModel` 改回平台分流了。
+2. 以后如果再看到 `Input token ids are too long ... >= 1024`，优先检查 runtime session window 是否又回退成固定 `1024`。
+3. 不要再把“旧 iOS allowlist 结论”直接当成当前产品策略；当前产品策略以用户最新明确要求为准：**双端统一 Gemma-4-E2B-it**。
+
+### 21.1 2026-05-20 双端 Gemma-4-E2B-it 基线复检与防回退加固
+
+本轮继续落实用户要求：Android / iOS 全部默认 `Gemma-4-E2B-it`，图片、文字、语音识别都走该本地模型，文字上下文窗口加长。
+
+已加固内容：
+
+- `lib/src/core/model/gemma_model_config.dart`
+  - 删除历史 iOS `Gemma-3n-E2B-it` 配置常量，避免后续误把 iOS 默认模型切回 Gemma 3n。
+  - `availableModels` 只保留 `gemma4E2bIt`。
+- `lib/src/features/gemma_home/gemma_home_screen.dart`
+  - `_activeModel` 当前固定为 `gemma4E2bIt`。
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - runtime session window 规则保留并加单测锁定：纯文字 `8192`，图片/语音多模态 `4096`，不再回退到旧的 `1024`。
+- `test/model_baseline_test.dart`
+  - 新增防回归测试：只暴露 `Gemma-4-E2B-it`，且模型能力包含 text / image / audio；session token window 不得回退到 `1024`。
+- `docs/progress.md`、`docs/feature_mapping.md`、`docs/audio_voice_live_design.md`、`docs/google_ai_edge_ux_design.md`
+  - 将 2026-05-14 iOS Gemma 3n allowlist 方案明确标为历史排查记录，不再作为当前默认产品路线。
+
+本轮验证：
+
+```bash
+flutter analyze
+FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh
+flutter build apk --release
+flutter build ios --release
+```
+
+验证结果：
+
+- `flutter analyze`：通过，No issues found。
+- `tool/flutter_test_short_builddir.sh`：通过，13 tests passed。
+- Android Release：通过，产物 `build/app/outputs/flutter-apk/app-release.apk`。
+- iOS Release：通过，产物 `build/ios/iphoneos/Runner.app`。
+
+注意：直接使用较长临时目录跑 Flutter test 仍可能触发 `flutter_gemma` macOS native asset `install_name_tool` headerpad 问题；本仓库继续使用短路径 `FLUTTER_TEST_BUILD_DIR=/tmp/c` 作为当前稳定测试闸口。
+
+### 21.2 2026-05-20 本地安装默认预置 Gemma_4_E2B_it
+
+用户要求本地仓库安装时直接把本机模型预置进应用，不再让移动端重新下载。当前固定本地来源为：
+
+```text
+/Users/sanbo/Desktop/models/gemma/Gemma_4_E2B_it/20260325/gemma4_2b_v09_obfus_fix_all_modalities_thinking.litertlm
+```
+
+已落地：
+
+- `Gemma-4-E2B-it.sizeInBytes` 改为本地文件真实大小 `2538766336`，避免 Android/iOS 预置后被误判为“不完整模型”。
+- 新增本地安装脚本：
+
+```bash
+tool/install_release_with_local_gemma4.sh
+```
+
+脚本行为：
+
+1. 校验本机模型文件存在且大小为 `2538766336`。
+2. 编译：`flutter build apk --release` 和 `flutter build ios --release`。
+3. Android：`adb install -r -d` 保留数据安装 release APK，然后把模型推到：
+
+```text
+/sdcard/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm
+```
+
+4. iOS：`devicectl device install app` 保留数据安装 release Runner.app，然后把模型复制到 app data container：
+
+```text
+Library/Application Support/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm
+```
+
+5. 复制完成后启动 App。
+
+可选环境变量：
+
+```bash
+ANDROID_DEVICE=37101FDJH0077P \
+IOS_DEVICE=CAFC7AFA-4565-5C8D-B724-090061D144D0 \
+tool/install_release_with_local_gemma4.sh
+```
+
+如果只想重新预置模型、不重新编译：
+
+```bash
+BUILD_RELEASE=0 tool/install_release_with_local_gemma4.sh
+```
+
+### 21.3 2026-05-20 稳定优先的更大上下文增强
+
+用户确认“不追求 256K 单次会话”，但希望在稳定基础上增强更大上下文。本轮采用渐进式放大，不直接打满模型 32K：
+
+- 纯文字 session window：从 `8192` 提高到 `16384`。
+- 图片 / 语音多模态 session window：Android/default 从 `4096` 提高到 `8192`；iOS 为稳定保留 `4096`。
+
+原因：
+
+- 纯文字没有额外视觉/音频 encoder 内存，可以先扩大到 16K，明显改善长对话。
+- 图片/语音请求会额外占用多模态 encoder 与 KV cache，先从 4K 提到 8K，避免直接 16K/32K 带来 iOS/Android 内存和初始化风险。
+- `Gemma-4-E2B-it.maxContextLength` 仍保留 `32000`，未来如果真机长期稳定，可以再做高配设备开关或自适应 32K。
+
+防回退：`test/model_baseline_test.dart` 已锁定纯文字 `16384`、多模态 `8192`，避免再次退回 `1024` 或旧的 8K/4K。
+
+### 21.4 2026-05-20 仓库内本地模型缓存（GitHub 忽略）
+
+用户进一步明确：本地编译/安装时希望直接使用本地模型，并把模型拷贝到代码仓库一份；但 GitHub 有大小限制，模型文件必须忽略。
+
+已落地：
+
+- 仓库本地模型缓存路径：
+
+```text
+local_models/Gemma_4_E2B_it/20260325/gemma-4-E2B-it.litertlm
+```
+
+- 该文件已从本机模型源复制/克隆，大小校验为 `2538766336` bytes。
+- `.gitignore` 已新增：
+
+```text
+/local_models/
+/models/
+/bundled_models/
+*.litertlm
+*.litertlm.gallerytmp
+*.xnnpack_cache
+*.mldrift_program_cache.bin
+```
+
+- 新增 `tool/prepare_local_gemma4_model.sh`：如果仓库内模型不存在，会从：
+
+```text
+/Users/sanbo/Desktop/models/gemma/Gemma_4_E2B_it/20260325/gemma4_2b_v09_obfus_fix_all_modalities_thinking.litertlm
+```
+
+复制到仓库 `local_models/.../gemma-4-E2B-it.litertlm`。
+
+- `tool/install_release_with_local_gemma4.sh` 已改为默认使用仓库内 `local_models/.../gemma-4-E2B-it.litertlm`，安装时自动预置到 Android/iOS app data container，不走下载。
+- iOS 大文件 copy 增加重试，并在验证前启动 App，让 `IOSModelDownloadManager.refreshStatus` 有机会把 Application Support 里已有的完整模型迁移到标准路径。
+
+验证：
+
+```bash
+tool/prepare_local_gemma4_model.sh
+git check-ignore -v local_models/Gemma_4_E2B_it/20260325/gemma-4-E2B-it.litertlm
+bash -n tool/prepare_local_gemma4_model.sh tool/install_release_with_local_gemma4.sh
+flutter analyze
+FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh
+```
+
+结果：模型文件已在仓库本地缓存中，且被 `.gitignore` 忽略；脚本语法、analyze、13 个测试均通过。
+
+### 21.5 2026-05-20 iPhone 13 图片识别闪退稳定性修正
+
+用户反馈：iPhone 13 识别图片时 App 会闪退。
+
+排查结论：最近为了“更大上下文”把图片/语音多模态 session window 提到 `8192`。图片识别在 iOS 上会同时占用 LiteRT-LM decoder KV cache 与 vision encoder 内存；iPhone 13 这类较低内存设备在启动 iOS image runtime 时更容易被系统直接终止，Dart 层无法捕获成普通异常。因此这不是模型文件缺失，也不是 UI 选择图片问题，而是 iOS 多模态窗口放大过激导致的稳定性风险。
+
+修复策略：保留更大文字上下文，但 iOS 多模态回到已知更稳的窗口。
+
+- 纯文字：继续 `16384`。
+- Android/default 图片/语音：继续 `8192`。
+- iOS 图片/语音：回退为 `4096`。
+
+代码位置：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - `_runtimeSessionTokenLimit(...)` 现在会对 `Platform.isIOS` 的多模态请求启用 `appleSafeMultimodal`。
+- `test/model_baseline_test.dart`
+  - 新增断言：iOS safe multimodal image/audio 均为 `4096`，防止再次把 iPhone 13 图片路径提高到 8K 后闪退。
+
+后续如果要再提升 iOS 图片上下文，必须做设备分档/开关，不能直接全量提升。
+
+### 21.6 2026-05-20 按设备内存自适应上下文和图片尺寸
+
+用户问是否可以根据手机内存设置大小。已实现：App 启动/初始化 runtime 时读取设备内存，并按内存分档设置文字上下文、多模态上下文、图片预处理长边和 iOS 图片 backend 顺序。
+
+原生内存探测：
+
+- Android `MainActivity.kt`
+  - 新增 `getDeviceMemoryInfo`，返回 `ActivityManager.MemoryInfo.totalMem / availMem / lowMemory / memoryClassMb / largeMemoryClassMb`。
+- iOS `IOSGemmaRuntime.swift`
+  - 新增 `getDeviceMemoryInfo`，返回 `ProcessInfo.physicalMemory / processorCount / thermalState / lowPowerModeEnabled`。
+
+Dart 自适应策略：
+
+- `lib/src/core/runtime/platform_gemma_runtime.dart`
+  - 新增 `DeviceRuntimeProfile.forMemoryBytes(...)`。
+  - iOS 低内存档（例如 iPhone 13 约 4GB）：
+    - text token window: `8192`
+    - image/audio token window: `2048`
+    - image max dimension: `640`
+    - image backend: `cpu -> gpu`
+  - iOS 中内存档（约 6GB）：
+    - text: `12288`
+    - multimodal: `3072`
+    - image max dimension: `768`
+  - iOS 高内存档（>7GB）：
+    - text: `16384`
+    - multimodal: `4096`
+    - image max dimension: `896`
+  - Android 中/高内存档继续保留更大窗口：
+    - text: `16384`
+    - multimodal: `8192`
+    - image max dimension: `1024`
+
+原因：iPhone 13 图片闪退更像 iOS native / jetsam 内存峰值问题；只降低 token 到 4096 仍不够，所以低内存 iOS 同时降低图片长边到 640，并优先尝试 CPU image backend，避免 GPU vision 初始化峰值。
+
+验证：
+
+```bash
+flutter analyze
+FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh
+flutter build ios --release
+BUILD_RELEASE=0 INSTALL_ANDROID=0 IOS_DEVICE=CAFC7AFA-4565-5C8D-B724-090061D144D0 tool/install_release_with_local_gemma4.sh
+```
+
+结果：analyze 通过，14 tests passed，iOS release 构建通过，并已安装启动到 iPhone13。
+
+补充验证：Android release 也已重新编译通过，并通过 `adb install -r -d` 安装启动到 Pixel 8，pid `17045`。

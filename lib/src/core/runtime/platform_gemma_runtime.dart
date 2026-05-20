@@ -14,8 +14,98 @@ import 'package:path_provider/path_provider.dart';
 import '../model/gemma_model_config.dart';
 import 'local_gemma_runtime.dart';
 
+const _macosImportedGemma4E2bBytes = 2538766336;
+const _gib = 1024 * 1024 * 1024;
+
+@visibleForTesting
+class DeviceRuntimeProfile {
+  const DeviceRuntimeProfile({
+    required this.label,
+    required this.textTokenWindow,
+    required this.multimodalTokenWindow,
+    required this.imageMaxDimension,
+    required this.preferCpuForImage,
+    this.totalMemoryBytes,
+  });
+
+  final String label;
+  final int textTokenWindow;
+  final int multimodalTokenWindow;
+  final int imageMaxDimension;
+  final bool preferCpuForImage;
+  final int? totalMemoryBytes;
+
+  static DeviceRuntimeProfile forMemoryBytes(
+    int? totalMemoryBytes, {
+    bool isAppleMobile = false,
+  }) {
+    final memoryBytes = totalMemoryBytes ?? 0;
+    if (isAppleMobile) {
+      if (totalMemoryBytes == null || memoryBytes <= 5 * _gib) {
+        return DeviceRuntimeProfile(
+          label: totalMemoryBytes == null ? 'ios-low-fallback' : 'ios-low',
+          totalMemoryBytes: totalMemoryBytes,
+          textTokenWindow: 8192,
+          multimodalTokenWindow: 2048,
+          imageMaxDimension: 640,
+          preferCpuForImage: true,
+        );
+      }
+      if (memoryBytes <= 7 * _gib) {
+        return DeviceRuntimeProfile(
+          label: 'ios-medium',
+          totalMemoryBytes: totalMemoryBytes,
+          textTokenWindow: 12288,
+          multimodalTokenWindow: 3072,
+          imageMaxDimension: 768,
+          preferCpuForImage: false,
+        );
+      }
+      return DeviceRuntimeProfile(
+        label: 'ios-high',
+        totalMemoryBytes: totalMemoryBytes,
+        textTokenWindow: 16384,
+        multimodalTokenWindow: 4096,
+        imageMaxDimension: 896,
+        preferCpuForImage: false,
+      );
+    }
+
+    if (totalMemoryBytes != null && memoryBytes <= 6 * _gib) {
+      return DeviceRuntimeProfile(
+        label: 'android-low',
+        totalMemoryBytes: totalMemoryBytes,
+        textTokenWindow: 8192,
+        multimodalTokenWindow: 3072,
+        imageMaxDimension: 640,
+        preferCpuForImage: false,
+      );
+    }
+    if (totalMemoryBytes == null || memoryBytes <= 10 * _gib) {
+      return DeviceRuntimeProfile(
+        label: totalMemoryBytes == null
+            ? 'android-medium-fallback'
+            : 'android-medium',
+        totalMemoryBytes: totalMemoryBytes,
+        textTokenWindow: 16384,
+        multimodalTokenWindow: 8192,
+        imageMaxDimension: 1024,
+        preferCpuForImage: false,
+      );
+    }
+    return DeviceRuntimeProfile(
+      label: 'android-high',
+      totalMemoryBytes: totalMemoryBytes,
+      textTokenWindow: 16384,
+      multimodalTokenWindow: 8192,
+      imageMaxDimension: 1024,
+      preferCpuForImage: false,
+    );
+  }
+}
+
 LocalGemmaRuntime createLocalGemmaRuntime() {
-  if (Platform.isAndroid || Platform.isIOS) {
+  if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
     return MethodChannelGemmaRuntime();
   }
   return PlaceholderGemmaRuntime();
@@ -40,17 +130,21 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   fg.InferenceModel? _flutterGemmaModel;
   fg.InferenceChat? _flutterGemmaChat;
   fg_ffi.LiteRtLmFfiClient? _iosRawFfiClient;
+  DeviceRuntimeProfile? _deviceRuntimeProfile;
 
   @override
   Future<void> initialize(GemmaModelConfig config) async {
     final previousConfig = _config;
     _config = config;
-    if (!Platform.isAndroid && !Platform.isIOS) return;
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) return;
 
-    _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
-      _handleRuntimeEvent,
-      onError: (Object error) => _activeGenerationController?.addError(error),
-    );
+    if (Platform.isAndroid || Platform.isIOS) {
+      await _ensureDeviceRuntimeProfile();
+      _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
+        _handleRuntimeEvent,
+        onError: (Object error) => _activeGenerationController?.addError(error),
+      );
+    }
 
     if (Platform.isIOS) {
       if (previousConfig != null &&
@@ -68,8 +162,13 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         'topK': config.topK,
         'topP': config.topP,
         'temperature': config.temperature,
-        'maxTokens': 1024,
+        'maxTokens': _runtimeSessionTokenLimit(config),
       });
+      _initialized = true;
+      return;
+    }
+
+    if (Platform.isMacOS) {
       _initialized = true;
       return;
     }
@@ -101,13 +200,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     List<Map<String, String>> enabledSkillDetails = const [],
     String? acceleratorOverride,
   }) async {
+    await _ensureDeviceRuntimeProfile();
     final modelPath = await _resolveModelPath(config);
     await _methodChannel.invokeMethod<void>('initialize', {
       'modelPath': modelPath,
       'topK': config.topK,
       'topP': config.topP,
       'temperature': config.temperature,
-      'maxTokens': 1024,
+      'maxTokens': _runtimeSessionTokenLimit(
+        config,
+        supportImage: supportImage,
+        supportAudio: supportAudio,
+      ),
       'supportImage': supportImage,
       'supportAudio': supportAudio,
       'supportSkills': supportSkills,
@@ -142,6 +246,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     bool supportImage = false,
     bool supportAudio = false,
   }) async {
+    await _ensureDeviceRuntimeProfile();
     await _validateModelFile(config, modelPath);
 
     try {
@@ -153,7 +258,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       }
 
       _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
-        maxTokens: 1024,
+        maxTokens: _runtimeSessionTokenLimit(
+          config,
+          supportImage: supportImage,
+          supportAudio: supportAudio,
+        ),
         preferredBackend: supportAudio && !supportImage
             ? fg.PreferredBackend.cpu
             : fg.PreferredBackend.gpu,
@@ -167,7 +276,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       await _flutterGemmaModel?.close();
       _flutterGemmaModel = null;
       throw RuntimeUnavailableException(
-        'iOS LiteRT-LM/flutter_gemma 初始化失败：$error',
+        '$_appleRuntimeLabel LiteRT-LM/flutter_gemma 初始化失败：$error',
       );
     }
   }
@@ -182,6 +291,99 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     }
   }
 
+  String get _appleRuntimeLabel => Platform.isMacOS ? 'macOS' : 'iOS';
+
+  DeviceRuntimeProfile get _currentDeviceRuntimeProfile {
+    return _deviceRuntimeProfile ??
+        DeviceRuntimeProfile.forMemoryBytes(
+          null,
+          isAppleMobile: Platform.isIOS,
+        );
+  }
+
+  Future<DeviceRuntimeProfile> _ensureDeviceRuntimeProfile() async {
+    final existing = _deviceRuntimeProfile;
+    if (existing != null) return existing;
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      final profile = DeviceRuntimeProfile.forMemoryBytes(null);
+      _deviceRuntimeProfile = profile;
+      return profile;
+    }
+    try {
+      final info = await _methodChannel.invokeMapMethod<String, Object?>(
+        'getDeviceMemoryInfo',
+      );
+      final totalMemoryBytes = _intFromPlatform(info?['totalMemoryBytes']);
+      final profile = DeviceRuntimeProfile.forMemoryBytes(
+        totalMemoryBytes,
+        isAppleMobile: Platform.isIOS,
+      );
+      _deviceRuntimeProfile = profile;
+      debugPrint(
+        '[GemmaRuntime] device memory profile=${profile.label} '
+        'totalMemoryBytes=${totalMemoryBytes ?? 'unknown'} '
+        'textTokens=${profile.textTokenWindow} '
+        'multimodalTokens=${profile.multimodalTokenWindow} '
+        'imageMaxDimension=${profile.imageMaxDimension} '
+        'preferCpuForImage=${profile.preferCpuForImage}',
+      );
+      return profile;
+    } catch (error) {
+      final profile = DeviceRuntimeProfile.forMemoryBytes(
+        null,
+        isAppleMobile: Platform.isIOS,
+      );
+      _deviceRuntimeProfile = profile;
+      debugPrint(
+        '[GemmaRuntime] device memory profile fallback=${profile.label}: $error',
+      );
+      return profile;
+    }
+  }
+
+  static int? _intFromPlatform(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '');
+  }
+
+  int _runtimeSessionTokenLimit(
+    GemmaModelConfig config, {
+    bool supportImage = false,
+    bool supportAudio = false,
+  }) {
+    return runtimeSessionTokenLimitForTesting(
+      config,
+      supportImage: supportImage,
+      supportAudio: supportAudio,
+      profile: _currentDeviceRuntimeProfile,
+    );
+  }
+
+  @visibleForTesting
+  static int runtimeSessionTokenLimitForTesting(
+    GemmaModelConfig config, {
+    bool supportImage = false,
+    bool supportAudio = false,
+    int? totalMemoryBytes,
+    bool isAppleMobile = false,
+    DeviceRuntimeProfile? profile,
+  }) {
+    profile ??= DeviceRuntimeProfile.forMemoryBytes(
+      totalMemoryBytes,
+      isAppleMobile: isAppleMobile,
+    );
+    // Keep the stable lane split:
+    // - Text-only sessions scale up on higher-memory devices.
+    // - Image/audio sessions carry extra encoder memory, so low-memory phones
+    //   use smaller KV + image windows to avoid iOS jetsam/native termination.
+    final isMultimodal = supportImage || supportAudio;
+    final requested = isMultimodal
+        ? profile.multimodalTokenWindow
+        : profile.textTokenWindow;
+    return math.min(config.maxContextLength, requested);
+  }
+
   Future<void> _validateModelFile(
     GemmaModelConfig config,
     String modelPath,
@@ -189,13 +391,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     final file = File(modelPath);
     if (!await file.exists()) {
       throw RuntimeUnavailableException(
-        'iOS 模型文件不存在：$modelPath。请先在 Models 中完成下载。',
+        '${Platform.operatingSystem} 模型文件不存在：$modelPath。请先准备模型文件。',
       );
     }
     final bytes = await file.length();
     if (bytes < config.sizeInBytes) {
+      if (Platform.isMacOS &&
+          config.normalizedName == gemma4E2bIt.normalizedName &&
+          bytes == _macosImportedGemma4E2bBytes) {
+        return;
+      }
       throw RuntimeUnavailableException(
-        'iOS 模型文件不完整：$bytes / ${config.sizeInBytes} bytes。请删除后重新下载。',
+        '${Platform.operatingSystem} 模型文件不完整：$bytes / ${config.sizeInBytes} bytes。请重新准备完整模型文件。',
       );
     }
   }
@@ -213,13 +420,15 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         fileType: fg.ModelFileType.litertlm,
       ).fromFile(modelPath).install();
     } catch (error) {
-      throw RuntimeUnavailableException('iOS Gemma 模型准备失败：$error');
+      throw RuntimeUnavailableException(
+        '$_appleRuntimeLabel Gemma 模型准备失败：$error',
+      );
     }
   }
 
   @override
   Stream<String> generate(GemmaRequest request) async* {
-    if (!Platform.isAndroid && !Platform.isIOS) {
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) {
       yield* PlaceholderGemmaRuntime(config: _config).generate(request);
       return;
     }
@@ -227,7 +436,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       final config = _config ?? gemma4E2bIt;
       await initialize(config);
     }
-    if (Platform.isIOS) {
+    if (Platform.isIOS || Platform.isMacOS) {
       yield* _generateWithFlutterGemma(request);
       return;
     }
@@ -679,7 +888,11 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           await client.initialize(
             modelPath: modelPath,
             backend: backend,
-            maxTokens: 1024,
+            maxTokens: _runtimeSessionTokenLimit(
+              config,
+              supportImage: isImageRequest,
+              supportAudio: isAudioRequest,
+            ),
             cacheDir: cacheDir,
             enableVision: isImageRequest && config.supportImage,
             maxNumImages: isImageRequest && config.supportImage ? 1 : 0,
@@ -763,7 +976,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         }
       }
       throw RuntimeUnavailableException(
-        'iOS 多模态推理失败，已重置会话，请重试：$lastError。'
+        '$_appleRuntimeLabel 多模态推理失败，已重置会话，请重试：$lastError。'
         '已尝试 backend=${backends.join(' / ')}。',
       );
     } finally {
@@ -782,10 +995,14 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     required bool isImageRequest,
     required bool isAudioRequest,
   }) {
+    final profile = _currentDeviceRuntimeProfile;
     if (isAudioRequest && !isImageRequest) {
       // Audio encoder is CPU-only in LiteRT-LM. Using CPU as the primary
       // backend avoids iOS code 13 failures seen when the main decoder starts
       // on GPU and the audio executor is CPU.
+      return const ['cpu', 'gpu'];
+    }
+    if (isImageRequest && profile.preferCpuForImage) {
       return const ['cpu', 'gpu'];
     }
     if (!isImageRequest && !isAudioRequest) {
@@ -965,10 +1182,14 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     // vision encoder from seeing an oversized / orientation-tagged camera asset
     // that differs from the preview shown to the user.
     if (Platform.isIOS) {
+      final profile = await _ensureDeviceRuntimeProfile();
       try {
         final bytes = await _methodChannel.invokeMethod<Uint8List>(
           'prepareVisionImage',
-          {'imagePath': imageFile.path, 'maxDimension': 1024},
+          {
+            'imagePath': imageFile.path,
+            'maxDimension': profile.imageMaxDimension,
+          },
         );
         if (bytes != null && bytes.isNotEmpty) return bytes;
       } on MissingPluginException {

@@ -129,10 +129,10 @@ lib/src/core/runtime/platform_gemma_runtime.dart
   - `UIDocumentPickerViewController` 选择语音文件。
   - `AVAudioRecorder` 录制 16k / mono / 16-bit PCM WAV 语音。
   - `AVAudioPlayer` 点击播放已发送语音。
-- flutter_gemma API 已存在 `Message.withAudio(...)`、`supportAudio`、`enableAudioModality`、`addAudio(...)` 能力；本项目 iOS 默认对齐 Google AI Edge allowlist 使用 Gemma 3n，并绕过插件高级封装，直接使用 LiteRT-LM raw FFI Conversation JSON。
+- flutter_gemma API 已存在 `Message.withAudio(...)`、`supportAudio`、`enableAudioModality`、`addAudio(...)` 能力；当前产品基线要求 Android / iOS 都只使用 `Gemma-4-E2B-it`，iOS 仍绕过插件高级封装，直接使用 LiteRT-LM raw FFI Conversation JSON。
 - iOS 原生 `audio_input` channel 已接入文件选择/录音/播放，`audio_input_events` 已能输出录音状态和电平事件，文件选择音频会统一转换为 16k mono 16-bit PCM WAV，并做 WAV header/时长校验。
 - 2026-05-14 修复了 iOS 语音识别失败的关键输入格式问题：Dart 侧不再剥离 WAV `data` chunk 后只发送 raw PCM，而是保留完整 WAV 容器；针对 people iPhone 复测出现的 `Failed to start streaming (code: 13)`，当前会进一步把 iOS/macOS 常见的 `FLLR` 等 padding/metadata chunk 规整为最小 44-byte `RIFF/fmt/data` 16k mono 16-bit PCM WAV 后再传给 FFI。剥离 header 会导致 LiteRT-LM 侧拿到无容器的 opaque PCM blob；带额外 chunk 的容器则可能触发 iOS LiteRT-LM streaming code 13。
-- 与图片一致，音频属于多模态请求；每次 iOS media request 会重建 raw FFI client/conversation，避免文字会话模板与多模态 JSON 混用。audio-only 请求优先使用 CPU backend，并在失败时 fallback GPU，错误会带出已尝试 backend。默认走 path-based JSON + 非流式 `sendMessage(...)`，并固定 text -> image -> audio 顺序，让 Gemma3DataProcessor 负责音频预处理。
+- 与图片一致，音频属于多模态请求；每次 iOS media request 会重建 raw FFI client/conversation，避免文字会话模板与多模态 JSON 混用。audio-only 请求优先使用 CPU backend，并在失败时 fallback GPU，错误会带出已尝试 backend。默认走 path-based JSON + 非流式 `sendMessage(...)`，并固定 text -> image -> audio 顺序，让 LiteRT-LM data processor 负责音频预处理。
 
 当前 people iPhone profile smoke 已验证固定 WAV 能被模型处理并返回 `AUDIO_RECEIVED`。后续真机专项仍需覆盖自然录音、选择 WAV、选择 m4a/mp3 后转 WAV，以及 Gemma 实际转写质量。
 
@@ -258,9 +258,9 @@ P2：
 
 - 复测纠偏：直接用手机麦克风录电脑外放时，Gemma 会明显幻听，不能作为语音识别质量结论；将同一个 UI 附件文件替换为清晰 16k mono WAV 后复测，logcat 显示 `audio input ready: wavBytes=246564`，UI 转写为“你好，这是一个非常清晰的语音测试。今天是5月14日，请准确地读出这句。”，说明 App audio 文件链路可用，主要风险在麦克风采集/环境声与模型 ASR 精度。
 
-### Google AI Edge iOS 对齐结论（2026-05-14）
+### Google AI Edge iOS 对齐结论（2026-05-14，历史记录，已被 2026-05-20 产品基线覆盖）
 
-官方 `google-ai-edge/gallery/model_allowlists/ios_1_0_0.json` 的 iOS 可用音频模型是 Gemma 3n E2B/E4B，不是 Gemma 4。Gemma 4 E2B/E4B 的 `llm_ask_audio` 出现在 Android allowlist `1_0_14.json`。因此本项目 iOS audio 不能继续用 `gemma-4-E2B-it.litertlm` 硬测 code 13；当前已把 iOS 活跃模型切换为 `Gemma-3n-E2B-it`，Android 保持 `Gemma-4-E2B-it`。
+当时曾依据官方 `google-ai-edge/gallery/model_allowlists/ios_1_0_0.json` 尝试让 iOS 使用 Gemma 3n E2B/E4B 来验证音频路径。这个结论现在只保留为历史排查记录；2026-05-20 之后的产品基线已经改为：Android 与 iOS 都统一使用 `Gemma-4-E2B-it`，不能再把 iOS 默认切回 Gemma 3n。
 
 限制：`google/gemma-3n-E2B-it-litert-lm` 是 Hugging Face gated repo；没有授权 token 或本地预下载文件时，iOS 下载会被 401 拒绝。
 
@@ -270,7 +270,7 @@ P2：
 
 1. Gemma 4 + blob/base64 audio JSON：people 手测仍报 `Failed to start streaming (code: 13)`，不再作为稳定路线。
 2. PhoneClaw 对齐方案：audio-only 改成临时 WAV 文件路径 JSON，并优先非流式 `sendMessage`；该实现已落地，并已在 people iPhone profile smoke 中返回真实模型输出 `AUDIO_RECEIVED`。
-3. 官方 iOS allowlist 方案：iOS 活跃模型恢复为 `Gemma-3n-E2B-it`；people iPhone app container 中已存在完整 `gemma-3n-E2B-it-int4.litertlm`，并完成 profile smoke 验证。
+3. 官方 iOS allowlist 方案：曾验证 iOS `Gemma-3n-E2B-it` 路线；当前已废弃为默认产品路线，只能作为历史对照，不能覆盖 Android / iOS 统一 `Gemma-4-E2B-it` 的最新要求。
 4. iOS 26 启动稳定性：当前连接的 iPhone13 上 `FlutterGemmaPlugin.register(with:)` 会在启动时 SIGSEGV，因此 iOS 暂时不注册 flutter_gemma 插件，运行时改为 raw FFI；iOS Skills/function calling 暂停，避免用不可验证路径冒充成功。
 
 ### 2026-05-14 继续测试：iOS native direct session 方案
@@ -281,7 +281,7 @@ P2：
 - Dart FFI `LiteRtLmFfiClient` Conversation JSON；
 - `conversation_send_message_stream` 的 streaming code 13 路径。
 
-结论：native direct session 不作为默认 iOS audio 路径，因为真机错误显示底层 `session_generate_content` 不会自动跑 LiteRT-LM `AudioPreprocessor`，会报 `Audio must be preprocessed before being used in SessionAdvanced.`；它只保留为显式实验开关 `GEMMA_IOS_USE_NATIVE_DIRECT=1`。默认稳定路径是 Dart raw FFI Conversation API：`content` 顺序固定为 text -> image -> audio，audio-only 使用 path-based JSON + 非流式 `sendMessage`，让 Gemma3DataProcessor 负责音频预处理。
+结论：native direct session 不作为默认 iOS audio 路径，因为真机错误显示底层 `session_generate_content` 不会自动跑 LiteRT-LM `AudioPreprocessor`，会报 `Audio must be preprocessed before being used in SessionAdvanced.`；它只保留为显式实验开关 `GEMMA_IOS_USE_NATIVE_DIRECT=1`。默认稳定路径是 Dart raw FFI Conversation API：`content` 顺序固定为 text -> image -> audio，audio-only 使用 path-based JSON + 非流式 `sendMessage`，让 LiteRT-LM data processor 负责音频预处理。
 
 
 ### 2026-05-14 people iPhone 复测结论：为什么会提示“请提供音频”
@@ -289,7 +289,7 @@ P2：
 本次用户手测“已经发了音频，但模型提示请提供音频”后，排查结论如下：
 
 - 不是录音为空：从 people iPhone container 拉取 `tmp/voice_1778748629479.wav`，文件为 16kHz / mono / int16 WAV，约 6.53 秒、208KB，存在有效峰值与 RMS。
-- 旧 iOS JSON 组包顺序是 audio -> image -> text；LiteRT-LM/Gemma3n 官方 data processor 测试覆盖的是 text -> audio，真机表现证明 audio 放在 text 前面时，模型可能完成 prefill 但回答像“没有音频”。
+- 旧 iOS JSON 组包顺序是 audio -> image -> text；LiteRT-LM 官方 data processor 测试覆盖的是 text -> audio，真机表现证明 audio 放在 text 前面时，模型可能完成 prefill 但回答像“没有音频”。
 - 已修复 `buildIosPathMessageJsonForTesting(...)`：默认顺序改为 text -> image -> audio，并用单元测试锁住，避免再次回退。
 - 已新增 iOS profile smoke 结果文件 `Library/Application Support/gemma_ios_audio_smoke_result.json`，用于 devicectl 拉取真实模型结果，而不是只依赖 Flutter debugPrint。
 - people iPhone profile smoke 验证通过：安装 `build/ios/iphoneos/Runner.app` 后启动，拉取结果为 `status=success`、`response=AUDIO_RECEIVED`，证明当前默认 path JSON + Conversation API 路径能让 LiteRT-LM 收到并处理音频。

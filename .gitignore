@@ -33,6 +33,16 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Local Gemma model cache used by local build/install scripts.
+# The .litertlm file is several GB and must never be pushed to GitHub.
+/local_models/
+/models/
+/bundled_models/
+*.litertlm
+*.litertlm.gallerytmp
+*.xnnpack_cache
+*.mldrift_program_cache.bin
+
 # Symbolication related
 app.*.symbols
 

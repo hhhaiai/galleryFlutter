@@ -113,6 +113,8 @@ final class IOSGemmaRuntime: NSObject {
       switch call.method {
       case "prepareVisionImage":
         self.prepareVisionImage(call: call, result: result)
+      case "getDeviceMemoryInfo":
+        self.getDeviceMemoryInfo(result: result)
       case "initialize":
         self.initialize(call: call, result: result)
       case "generate":
@@ -343,6 +345,17 @@ final class IOSGemmaRuntime: NSObject {
       return
     }
     result(FlutterStandardTypedData(bytes: pngData))
+  }
+
+  private func getDeviceMemoryInfo(result: FlutterResult) {
+    let processInfo = ProcessInfo.processInfo
+    result([
+      "totalMemoryBytes": NSNumber(value: processInfo.physicalMemory),
+      "processorCount": NSNumber(value: processInfo.processorCount),
+      "activeProcessorCount": NSNumber(value: processInfo.activeProcessorCount),
+      "thermalState": NSNumber(value: processInfo.thermalState.rawValue),
+      "lowPowerModeEnabled": NSNumber(value: processInfo.isLowPowerModeEnabled),
+    ])
   }
 
   private func emit(_ map: [String: Any]) {

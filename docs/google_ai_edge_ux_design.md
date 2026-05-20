@@ -31,7 +31,7 @@ google-ai-edge/mediapipe-samples-web   Web 端 MediaPipe samples，非当前 iOS
    - README 明确同时提供 Google Play 与 App Store 下载入口，说明 Google AI Edge Gallery 已面向 iOS 分发。
    - Android 源码包含 `DownloadRepository.kt`、`DownloadWorker.kt`，使用 WorkManager 承担模型后台下载、进度与通知。
    - `skills/README.md`、`skill.proto`、`customtasks/agentchat/*` 展示 Agent Skills 的产品形态：内置 skills、featured skills、本地导入、URL 导入、启用/禁用、校验与免责声明。
-   - `model_allowlists/ios_1_0_0.json` 明确存在 iOS allowlist，其中 Gemma 3n E2B/E4B 在 iOS 上支持 text、vision、audio input，并要求 iOS 17+。
+   - `model_allowlists/ios_1_0_0.json` 明确存在 iOS allowlist，其中 Gemma 3n E2B/E4B 在 iOS 上支持 text、vision、audio input，并要求 iOS 17+；该条只作为 Gallery 参考背景，当前本项目产品基线仍要求 Android / iOS 统一使用 `Gemma-4-E2B-it`。
 2. `google-ai-edge/LiteRT-LM`
    - README 描述 LiteRT-LM 是跨平台边缘 LLM runtime，目标覆盖 Android、iOS、Web、Desktop、IoT。
    - 仓库存在 `prebuilt/ios_arm64`、`prebuilt/ios_sim_arm64`、`prebuilt/macos_arm64` 等预编译组件，说明不能再把 iOS 简单标记为“暂不支持”。
@@ -194,4 +194,3 @@ P4：图片、语音、Skills Hub
 3. Android：不破坏已验证文字对话与系统通知下载。
 4. iOS：不出现“暂不支持”死胡同；至少具备可下载、可管理、可启动的真实路径。
 5. 用户体验：任何不可用能力都必须有明确原因、下一步动作和降级方案。
-

@@ -40,8 +40,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   StreamSubscription<ModelDownloadStatus>? _downloadSubscription;
   StreamSubscription<AudioInputEvent>? _audioEventSubscription;
 
-  GemmaModelConfig get _activeModel =>
-      Platform.isIOS ? gemma3nE2bItIos : gemma4E2bIt;
+  GemmaModelConfig get _activeModel => gemma4E2bIt;
 
   ModelDownloadStatus _downloadStatus = const ModelDownloadStatus(
     type: ModelDownloadStatusType.notDownloaded,
@@ -468,6 +467,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   Future<void> _showImageSourceSheet() async {
     if (_running) return;
+    if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+      await _pickImage(ImageSource.gallery);
+      return;
+    }
     final source = await showModalBottomSheet<ImageSource>(
       context: context,
       showDragHandle: true,
@@ -492,6 +495,10 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       ),
     );
     if (source == null) return;
+    await _pickImage(source);
+  }
+
+  Future<void> _pickImage(ImageSource source) async {
     try {
       final image = await _imagePicker.pickImage(
         source: source,
@@ -1199,7 +1206,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             onCancel: () => _downloadController.cancel(_activeModel),
             onDelete: () => _downloadController.delete(_activeModel),
             onRefresh: () => _downloadController.refreshStatus(_activeModel),
-            tag: Platform.isIOS ? 'iOS 音频模型' : '主力模型',
+            tag: '主力模型',
           ),
         ],
       ),
@@ -1908,12 +1915,6 @@ class _Composer extends StatelessWidget {
                   textInputAction: TextInputAction.newline,
                   enableSuggestions: true,
                   autocorrect: true,
-                  onTap: () {
-                    focusNode.requestFocus();
-                    SystemChannels.textInput.invokeMethod<void>(
-                      'TextInput.show',
-                    );
-                  },
                   decoration: const InputDecoration(
                     hintText: '发送消息，或添加图片/语音/Skills/Prompt Lab…',
                     border: InputBorder.none,

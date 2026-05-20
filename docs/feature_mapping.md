@@ -98,7 +98,9 @@
 - iOS/Flutter 侧已把 Skills 模式下的 `loadSkill` / `runJs` / `runIntent` 作为 `flutter_gemma` tools 注册；`loadSkill` 可从 Dart enabledSkillDetails 返回 instructions 并回传模型继续生成，`runJs` / `runIntent` 仍返回诚实 `pending_bridge`，避免伪装已执行。
 
 
-## 平台模型映射更新（2026-05-14）
+## 平台模型映射更新（2026-05-20）
 
-- Android：继续以 `Gemma-4-E2B-it` 为活跃模型，对齐 Google AI Edge Android allowlist 的 Gemma 4 多模态/audio 条目。
-- iOS：活跃模型改为 `Gemma-3n-E2B-it`，对齐 Google AI Edge `ios_1_0_0.json` 中 `llmSupportAudio=true` / `llm_ask_audio` 的 iOS allowlist 条目。此前用 Gemma 4 在 iOS audio 上遇到的 `Failed to start streaming (code: 13)` 不再作为主要实现路线。
+- Android：以 `Gemma-4-E2B-it` 为唯一活跃模型。
+- iOS：以 `Gemma-4-E2B-it` 为唯一活跃模型。
+- 图片 / 文字 / 语音识别都必须继续走这一个本地模型。2026-05-14 曾尝试的 iOS `Gemma-3n-E2B-it` allowlist 路线只保留为历史排查记录，不再作为默认产品路线。
+- 为避免 Apple 多模态请求再次落回 `1024` token window，runtime 初始化统一使用更长 session window：纯文字目标 `16384`，Android 图片/语音目标 `8192`，iOS 图片/语音目标 `4096`。

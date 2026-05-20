@@ -84,15 +84,20 @@ class AudioInputService {
 
   Future<bool> get isSupported async => Platform.isAndroid || Platform.isIOS;
 
-  Stream<AudioInputEvent> get events => _eventChannel
-      .receiveBroadcastStream()
-      .map((event) {
-        if (event is Map<dynamic, dynamic>) {
-          return AudioInputEvent.fromMap(event);
-        }
-        return const AudioInputEvent(type: '');
-      })
-      .where((event) => event.type.isNotEmpty);
+  Stream<AudioInputEvent> get events {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return const Stream<AudioInputEvent>.empty();
+    }
+    return _eventChannel
+        .receiveBroadcastStream()
+        .map((event) {
+          if (event is Map<dynamic, dynamic>) {
+            return AudioInputEvent.fromMap(event);
+          }
+          return const AudioInputEvent(type: '');
+        })
+        .where((event) => event.type.isNotEmpty);
+  }
 
   Future<AudioAttachment?> pickAudioFile() async {
     final result = await _channel.invokeMapMethod<String, dynamic>(

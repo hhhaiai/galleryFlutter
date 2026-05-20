@@ -48,7 +48,7 @@
 - [x] Android audio 发送前稳健性补强：`readAudioForGemma(...)` 现在对所有 WAV 输入都解析 data chunk，并在发送给 `Content.AudioBytes` 前统一重建 16k mono 16-bit PCM WAV；Gallery 实际路线是 raw PCM + WAV header，不再剥离 RIFF header 后裸发
 - [x] iOS 音频 runtime 风险收口：`Info.plist` 和原生 audio input 保留，Dart raw FFI Conversation 路径改为校验后发送完整 WAV/path JSON；people iPhone 固定 WAV profile smoke 已返回 `AUDIO_RECEIVED`
 - [x] iOS 历史真机 blocker 记录：旧路径曾在实时录音时触发 `Failed to start streaming (code: 13)`；2026-05-14 已改完整 WAV FFI 输入，仍需设备在线后重新判定
-- [x] iOS audio input 基础补强：`IOSAudioInput.swift` 增加 `audio_input_events`，录音电平事件，文件选择音频统一转 16k mono 16-bit PCM WAV，并对 WAV header/时长做校验；iOS audio runtime 已通过 Gemma 3n raw FFI 路径开启验证
+- [x] iOS audio input 基础补强：`IOSAudioInput.swift` 增加 `audio_input_events`，录音电平事件，文件选择音频统一转 16k mono 16-bit PCM WAV，并对 WAV header/时长做校验；历史上曾通过 Gemma 3n raw FFI 路径开启验证，当前默认已恢复为 `Gemma-4-E2B-it` raw FFI 路径
 - [x] iOS 固定 WAV 输入修正：iOS 录音/文件入口生成 16k mono PCM WAV，Dart runtime 校验后保留 WAV 容器，并在送 LiteRT-LM FFI 前重建为最小 44-byte `RIFF/fmt/data` WAV；audio-only 推理 CPU backend/path JSON/sendMessage 已在 people iPhone profile smoke 验证
 - [x] Live 语音通话方案已整理：`docs/audio_voice_live_design.md` 记录分段伪实时、PCM streaming + VAD、TTS 双向语音三个阶段，以及方案对比和架构
 - [x] 文字/Skills prompt 质量补强：Android `generate` 不再丢失 `systemPrompt` / `enabledSkillNames`；Dart runtime 会把 system instructions、enabled skills 与用户请求组合成 contextual prompt 后送入本地 Gemma，iOS 文字路径也复用同一逻辑
@@ -106,11 +106,11 @@ cd .. && flutter build ios --no-codesign
 # 直接 flutter test --no-pub 仍会撞长 install_name/headerpad 问题；使用上面的短 build-dir wrapper
 ```
 
-- [x] 对齐 Google AI Edge iOS allowlist：iOS 当前改用 `Gemma-3n-E2B-it` (`google/gemma-3n-E2B-it-litert-lm`, `gemma-3n-E2B-it-int4.litertlm`) 作为平台活跃模型，Android 继续使用 `Gemma-4-E2B-it`；原因是官方 iOS allowlist 标注 Gemma 3n 支持 audio，而 Gemma 4 只在 Android allowlist 标注 audio。Gemma 3n 仓库为 gated repo，仍需 HF 授权/本地预下载文件后才能真机验证。
+- [x] 历史记录（2026-05-14，已废弃为默认路线）：曾对齐 Google AI Edge iOS allowlist，把 iOS 临时切到 `Gemma-3n-E2B-it` 以验证 audio 路径。2026-05-20 后产品基线已经改为 Android / iOS 都统一使用 `Gemma-4-E2B-it`，不能再把这条历史结论当作当前默认模型策略。
 
 ### 2026-05-14 iOS audio fallback verification update
 
-- 已切换下一轮 iOS 方案：优先使用 Google AI Edge iOS allowlist 的 `Gemma-3n-E2B-it`；people iPhone app container 已有完整 `gemma-3n-E2B-it-int4.litertlm`，profile app 已安装并完成固定 WAV smoke。
+- 历史方案：曾优先使用 Google AI Edge iOS allowlist 的 `Gemma-3n-E2B-it` 并完成固定 WAV smoke；当前只作为历史对照保留，最新默认模型策略已恢复为 iOS `Gemma-4-E2B-it`。
 - 为避开 iOS 26 上 `FlutterGemmaPlugin.register(with:)` 启动崩溃，`SafePluginRegistrant` 暂时不注册 `FlutterGemmaPlugin`；iOS 普通文字/图片/语音先统一走 LiteRT-LM raw FFI 路径，Skills/function calling 在 iOS 暂停并返回明确错误，不做假成功。
 - 新增的 PhoneClaw 对齐点保留：iOS audio-only 使用 path-based JSON + non-streaming `sendMessage`，不再走 `{type: audio, blob: base64}` 的 streaming-first 路径。
 
@@ -125,6 +125,68 @@ cd .. && flutter build ios --no-codesign
 ### 2026-05-14 iOS audio text-first path verification
 
 - 根因纠偏：用户遇到“发了音频但提示请提供音频”时，已确认录音文件不是空音频；拉取的 WAV 为 16k mono int16、约 6.53 秒、208KB。
-- 修复：iOS LiteRT-LM path JSON `content` 顺序从 audio -> image -> text 改为 text -> image -> audio；官方 Gemma3n DataProcessor 覆盖 text/audio 顺序，真机表现也证明 audio-first 会让模型像没收到音频。
+- 修复：iOS LiteRT-LM path JSON `content` 顺序从 audio -> image -> text 改为 text -> image -> audio；LiteRT-LM data processor 覆盖 text/audio 顺序，真机表现也证明 audio-first 会让模型像没收到音频。
 - 验证：`flutter analyze` 通过；`FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh` 11 tests passed；`flutter build ios --profile --dart-define=GEMMA_IOS_AUDIO_SMOKE_PATH=gemma_smoke.wav` 通过；已安装到 people iPhone 并拉取 smoke JSON：`response=AUDIO_RECEIVED`。
 - 仍需：用用户实际语音 UI 再发一次，验证转写质量和不再出现“请提供音频”。
+
+### 2026-05-20 移动端统一基线调整
+
+- 最新产品要求已改为：**Android 与 iOS 都统一使用 `Gemma-4-E2B-it`**，并要求继续支持图片 / 文字 / 语音识别。
+- `lib/src/features/gemma_home/gemma_home_screen.dart` 中 `_activeModel` 已改为固定 `gemma4E2bIt`，不再让 iOS 默认切到 `Gemma-3n-E2B-it`。
+- `lib/src/core/model/gemma_model_config.dart` 中 `availableModels` 已收敛回单模型 `Gemma-4-E2B-it`。
+- 为满足“文字上下文更长一些”，`lib/src/core/runtime/platform_gemma_runtime.dart` 的 runtime session token window 不再固定 `1024`：
+  - 纯文字请求目标窗口：`16384`
+  - 图片/语音等多模态请求目标窗口：Android/default `8192`，iOS `4096`
+  - 最终仍受模型配置 `maxTokens` / `maxContextLength` 共同约束
+- 这次调整的直接目的，是避免图片/多模态请求继续出现 `Input token ids are too long ... >= 1024` 这一类会话窗口过小错误。
+
+### 2026-05-20 双端 Gemma-4-E2B-it 防回退复检
+
+- 已删除代码中的历史 iOS `Gemma-3n-E2B-it` 配置常量，避免后续误把 iOS 默认模型切回 Gemma 3n。
+- 新增 `test/model_baseline_test.dart`：锁定 `availableModels == [gemma4E2bIt]`、模型支持文字/图片/语音任务、runtime session window 纯文字 `16384` / Android 多模态 `8192` / iOS 多模态 `4096`。
+- 已同步文档：`docs/feature_mapping.md`、`docs/audio_voice_live_design.md`、`docs/google_ai_edge_ux_design.md` 中的 Gemma 3n 说明现在均标记为历史参考，不是当前默认路线。
+- 验证通过：`flutter analyze`、`FLUTTER_TEST_BUILD_DIR=/tmp/c tool/flutter_test_short_builddir.sh`、`flutter build apk --release`、`flutter build ios --release`。
+
+### 2026-05-20 本地安装预置模型流程
+
+- 新增 `tool/install_release_with_local_gemma4.sh`，本地安装默认从 `/Users/sanbo/Desktop/models/gemma/Gemma_4_E2B_it/20260325/gemma4_2b_v09_obfus_fix_all_modalities_thinking.litertlm` 预置模型。
+- Android 预置路径：`/sdcard/Android/data/com.example.gemma_local_app/files/gemma-4-e2b-it.litertlm`。
+- iOS 预置路径：`Library/Application Support/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm`。
+- `Gemma-4-E2B-it.sizeInBytes` 已调整为本地文件真实大小 `2538766336`，避免预置模型被状态检查误判为未下载/不完整。
+
+### 2026-05-20 稳定优先上下文增强
+
+- 纯文字 runtime session window 从 `8192` 提高到 `16384`。
+- 图片/语音多模态 runtime session window：Android/default 从 `4096` 提高到 `8192`；iOS 为稳定保留 `4096`。
+- 不直接启用 32K/256K：当前先保稳定，后续如真机长期稳定再考虑高配设备开关或自适应窗口。
+
+### 2026-05-20 仓库本地模型缓存
+
+- 已把本机 `Gemma_4_E2B_it/20260325` 模型复制到仓库本地缓存：`local_models/Gemma_4_E2B_it/20260325/gemma-4-E2B-it.litertlm`。
+- 已新增 `.gitignore` 规则忽略 `local_models/`、`models/`、`bundled_models/`、`*.litertlm` 等大模型/缓存文件，避免 GitHub 大文件限制。
+- 新增 `tool/prepare_local_gemma4_model.sh`：从 `/Users/sanbo/Desktop/models/gemma/Gemma_4_E2B_it/20260325` 准备仓库本地模型。
+- `tool/install_release_with_local_gemma4.sh` 现在默认使用仓库本地模型缓存安装并预置到 Android/iOS，避免下载后再测试。
+- 验证：仓库模型文件大小 `2538766336`；`git check-ignore` 确认被忽略；`flutter analyze` 和短路径 Flutter test 通过。
+
+### 2026-05-20 iPhone 13 图片识别闪退修正
+
+- 用户反馈 iPhone 13 图片识别会闪退。
+- 根因方向：iOS 图片识别同时占用 decoder KV cache 与 vision encoder 内存；此前把多模态窗口提到 `8192` 后，对 iPhone 13 稳定性过激。
+- 修复：纯文字继续 `16384`；Android/default 图片/语音保留 `8192`；iOS 图片/语音回退到稳定窗口 `4096`。
+- 已用 `test/model_baseline_test.dart` 锁定 iOS safe multimodal 为 `4096`。
+
+### 2026-05-20 设备内存自适应 runtime profile
+
+- Android/iOS runtime channel 新增 `getDeviceMemoryInfo`。
+- Dart 新增 `DeviceRuntimeProfile.forMemoryBytes(...)`，按设备内存自动设置 text token window、multimodal token window、iOS 图片预处理长边和图片 backend 顺序。
+- iPhone 13 这类 iOS 低内存档使用：text `8192`、图片/语音 `2048`、图片长边 `640`、图片 backend `cpu -> gpu`。
+- Android 中/高内存档保持 text `16384`、图片/语音 `8192`、图片长边 `1024`。
+- 验证：`flutter analyze` 通过，短路径 Flutter test `14 tests passed`，`flutter build ios --release` 通过，并已安装启动到 iPhone13。
+- 补充验证：`flutter build apk --release` 通过，并已 `adb install -r -d` 安装启动到 Pixel 8。
+
+### 2026-05-20 iPhone 14 Pro Max release 安装
+
+- 目标设备：people / iPhone 14 Pro Max，devicectl id `BAD258BF-4E4A-5C40-9701-AEF8CCF43E6D`。
+- 执行：`flutter build ios --release` 通过，随后 `BUILD_RELEASE=0 INSTALL_ANDROID=0 IOS_DEVICE=BAD258BF-4E4A-5C40-9701-AEF8CCF43E6D tool/install_release_with_local_gemma4.sh` 安装。
+- 结果：`com.example.gemmaLocalApp` 安装成功并启动，Runner pid `76241`。
+- 模型预置验证：`Library/Application Support/Gemma_4_E2B_it/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm` 存在，大小显示 `2.36 GB`。

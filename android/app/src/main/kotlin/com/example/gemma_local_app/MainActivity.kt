@@ -2,6 +2,7 @@ package com.example.gemma_local_app
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -156,6 +157,7 @@ class MainActivity : FlutterActivity() {
         "stop" -> runtime.stop(result)
         "dispose" -> runtime.dispose(result)
         "getExternalFilesDir" -> result.success(applicationContext.getExternalFilesDir(null)?.absolutePath)
+        "getDeviceMemoryInfo" -> result.success(deviceMemoryInfo())
         else -> result.notImplemented()
       }
     }
@@ -255,6 +257,19 @@ class MainActivity : FlutterActivity() {
       )
     }
     return granted
+  }
+
+  private fun deviceMemoryInfo(): Map<String, Any> {
+    val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val memoryInfo = ActivityManager.MemoryInfo()
+    activityManager.getMemoryInfo(memoryInfo)
+    return mapOf(
+      "totalMemoryBytes" to memoryInfo.totalMem,
+      "availableMemoryBytes" to memoryInfo.availMem,
+      "lowMemory" to memoryInfo.lowMemory,
+      "memoryClassMb" to activityManager.memoryClass,
+      "largeMemoryClassMb" to activityManager.largeMemoryClass,
+    )
   }
 
   companion object {
