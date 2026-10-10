@@ -1476,6 +1476,7 @@ private data class RuntimeInitArgs(
   val supportImage: Boolean,
   val supportAudio: Boolean,
   val supportSkills: Boolean,
+  val imageMaxDimension: Int,
   val topK: Int,
   val topP: Double,
   val temperature: Double,
@@ -1491,6 +1492,14 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
   @Volatile private var conversation: Conversation? = null
   private var eventSink: EventChannel.EventSink? = null
   @Volatile private var initArgs: RuntimeInitArgs? = null
+  @Volatile private var lastTextInitArgs: RuntimeInitArgs? = null
+  @Volatile private var textIdleReleaseGeneration = 0L
+  private var generationCounter = 0L
+  @Volatile private var activeGenerationId = 0L
+  @Volatile private var cancelledGenerationId = -1L
+  @Volatile private var activeGenerationIsPlainText = false
+  @Volatile private var textRuntimeInvalidated = false
+  private val textHistory = mutableListOf<Message>()
 
   fun initialize(call: MethodCall, result: MethodChannel.Result) {
     val args = RuntimeInitArgs(
@@ -1502,6 +1511,7 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
       supportImage = call.argument<Boolean>("supportImage") ?: false,
       supportAudio = call.argument<Boolean>("supportAudio") ?: false,
       supportSkills = call.argument<Boolean>("supportSkills") ?: false,
+      imageMaxDimension = (call.argument<Int>("imageMaxDimension") ?: 768).coerceIn(320, 1024),
       topK = call.argument<Int>("topK") ?: 64,
       topP = call.argument<Double>("topP") ?: 0.95,
       temperature = call.argument<Double>("temperature") ?: 1.0,
@@ -1538,11 +1548,22 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
 
   @OptIn(ExperimentalApi::class)
   private fun initializeBlocking(args: RuntimeInitArgs) {
+    val isPlainTextRuntime = args.isPlainTextRuntime()
+    val previousTextArgs = lastTextInitArgs
+    if (
+      isPlainTextRuntime &&
+        previousTextArgs != null &&
+        previousTextArgs.modelPath != args.modelPath
+    ) {
+      synchronized(textHistory) { textHistory.clear() }
+    }
+    if (isPlainTextRuntime) lastTextInitArgs = args
+    cancelScheduledTextRuntimeRelease()
     closeCurrentRuntime()
     val backend = createBackend(args.accelerator, args.supportImage, args.supportAudio)
     Log.d(
       TAG,
-      "initializing runtime: backend=$backend, supportImage=${args.supportImage}, supportAudio=${args.supportAudio}, supportSkills=${args.supportSkills}",
+      "initializing runtime: backend=$backend, supportImage=${args.supportImage}, supportAudio=${args.supportAudio}, supportSkills=${args.supportSkills}, maxTokens=${args.maxTokens}, imageMaxDimension=${args.imageMaxDimension}",
     )
     val engineConfig = EngineConfig(
       modelPath = args.modelPath,
@@ -1555,44 +1576,75 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     )
 
     val newEngine = Engine(engineConfig)
-    newEngine.initialize()
-
-    ExperimentalFlags.enableConversationConstrainedDecoding = args.supportSkills
-    val newConversation = newEngine.createConversation(
-      ConversationConfig(
-        samplerConfig = if (backend is Backend.NPU) {
-          null
-        } else {
-          SamplerConfig(
-            topK = args.topK,
-            topP = args.topP,
-            temperature = args.temperature,
-          )
-        },
-        systemInstruction = args.systemPrompt?.let {
-          Contents.of(Content.Text(it))
-        },
-        tools = if (args.supportSkills) {
-          listOf(
-            tool(
-              GemmaSkillToolSet(
-                context = activity,
-                enabledSkillNames = args.enabledSkillNames,
-                enabledSkillDetails = args.enabledSkills,
-                onToolResult = { toolResult ->
-                  runOnMainThread {
-                    eventSink?.success(mapOf("type" to "tool_result") + toolResult)
-                  }
-                },
+    val newConversation = try {
+      newEngine.initialize()
+      val conversationConfig =
+        ConversationConfig(
+          samplerConfig = if (backend is Backend.NPU) {
+            null
+          } else {
+            SamplerConfig(
+              topK = args.topK,
+              topP = args.topP,
+              temperature = args.temperature,
+            )
+          },
+          systemInstruction = args.systemPrompt?.let {
+            Contents.of(Content.Text(it))
+          },
+          initialMessages = if (isPlainTextRuntime) {
+            synchronized(textHistory) { textHistory.toList() }
+          } else {
+            emptyList()
+          },
+          tools = if (args.supportSkills) {
+            listOf(
+              tool(
+                GemmaSkillToolSet(
+                  context = activity,
+                  enabledSkillNames = args.enabledSkillNames,
+                  enabledSkillDetails = args.enabledSkills,
+                  onToolResult = { toolResult ->
+                    runOnMainThread {
+                      eventSink?.success(mapOf("type" to "tool_result") + toolResult)
+                    }
+                  },
+                )
               )
             )
-          )
-        } else {
-          listOf()
-        },
-      )
-    )
-    ExperimentalFlags.enableConversationConstrainedDecoding = false
+          } else {
+            listOf()
+          },
+        )
+
+      ExperimentalFlags.enableConversationConstrainedDecoding = args.supportSkills
+      try {
+        newEngine.createConversation(conversationConfig)
+      } catch (throwable: Throwable) {
+        val constraintProviderFailed = generateSequence(throwable) { it.cause }
+          .mapNotNull { it.message }
+          .any { it.contains("GemmaModelConstraintProvider", ignoreCase = true) }
+        if (!args.supportSkills || !constraintProviderFailed) {
+          throw throwable
+        }
+        // LiteRT-LM 0.10.0 can execute ToolProviders without the optional
+        // constrained decoder. Retry only this known provider failure with the
+        // exact same tools rather than disabling Skills or leaking the engine.
+        Log.w(TAG, "Constrained Skills provider unavailable; retrying unconstrained conversation", throwable)
+        ExperimentalFlags.enableConversationConstrainedDecoding = false
+        newEngine.createConversation(conversationConfig)
+      } finally {
+        ExperimentalFlags.enableConversationConstrainedDecoding = false
+      }
+    } catch (throwable: Throwable) {
+      // Engine ownership is not transferred to the runtime until both engine
+      // and conversation creation succeed. Close the local engine on any
+      // failure (notably constraint-provider creation) to avoid retaining
+      // multiple gigabytes of native model memory after a recoverable error.
+      ExperimentalFlags.enableConversationConstrainedDecoding = false
+      runCatching { newEngine.close() }
+      throw throwable
+    }
 
     engine = newEngine
     conversation = newConversation
@@ -1603,13 +1655,62 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     val prompt = call.argument<String>("prompt") ?: ""
     val imagePaths = call.argument<List<String>>("imagePaths") ?: emptyList()
     val audioPaths = call.argument<List<String>>("audioPaths") ?: emptyList()
+    val enabledSkillNames = call.argument<List<String>>("enabledSkillNames") ?: emptyList()
+    val systemPrompt = call.argument<String>("systemPrompt")
     if (prompt.isBlank() && imagePaths.isEmpty() && audioPaths.isEmpty()) {
       result.error("EMPTY_PROMPT", "prompt is empty.", null)
       return
     }
 
+    val generationId = ++generationCounter
+    activeGenerationId = generationId
+    activeGenerationIsPlainText =
+      imagePaths.isEmpty() &&
+        audioPaths.isEmpty() &&
+        enabledSkillNames.isEmpty() &&
+        systemPrompt.isNullOrBlank()
+
     executor.execute {
-      val currentConversation = conversation
+      cancelScheduledTextRuntimeRelease()
+      if (textRuntimeInvalidated) {
+        if (initArgs?.isPlainTextRuntime() == true) {
+          closeCurrentRuntime()
+          Log.d(TAG, "discarded cancelled text runtime before generation $generationId")
+        }
+        textRuntimeInvalidated = false
+      }
+      var currentConversation = conversation
+      if (
+        currentConversation == null &&
+          imagePaths.isEmpty() &&
+          audioPaths.isEmpty()
+      ) {
+        val textArgs = lastTextInitArgs
+        if (textArgs != null) {
+          try {
+            Log.d(TAG, "rehydrating idle text runtime with ${textHistory.size} history messages")
+            initializeBlocking(textArgs)
+            currentConversation = conversation
+          } catch (throwable: Throwable) {
+            Log.e(TAG, "idle text runtime rehydrate failed", throwable)
+            runOnMainThread {
+              result.error("NOT_INITIALIZED", throwable.message ?: "Text runtime rehydrate failed.", null)
+            }
+            return@execute
+          }
+        }
+      }
+      if (cancelledGenerationId == generationId) {
+        if (activeGenerationIsPlainText) {
+          textRuntimeInvalidated = true
+          scheduleTextRuntimeRelease()
+        }
+        runOnMainThread {
+          eventSink?.success(mapOf("type" to "done"))
+          result.success(null)
+        }
+        return@execute
+      }
       if (currentConversation == null) {
         runOnMainThread { result.error("NOT_INITIALIZED", "LiteRT-LM runtime is not initialized.", null) }
         return@execute
@@ -1618,9 +1719,18 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
       try {
         val contents = mutableListOf<Content>()
         for (imagePath in imagePaths.take(1)) {
-          val bitmap = decodeGalleryStyleBitmap(imagePath)
-          val imageBytes = bitmap.toPngByteArray()
-          Log.d(TAG, "image input ready: ${bitmap.width}x${bitmap.height}, pngBytes=${imageBytes.size}")
+          val bitmap = decodeGalleryStyleBitmap(
+            imagePath,
+            initArgs?.imageMaxDimension ?: 768,
+          )
+          val imageWidth = bitmap.width
+          val imageHeight = bitmap.height
+          val imageBytes = try {
+            bitmap.toPngByteArray()
+          } finally {
+            bitmap.recycle()
+          }
+          Log.d(TAG, "image input ready: ${imageWidth}x${imageHeight}, pngBytes=${imageBytes.size}")
           contents.add(Content.ImageBytes(imageBytes))
         }
         for (audioPath in audioPaths.take(1)) {
@@ -1632,15 +1742,22 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
           contents.add(Content.Text(prompt))
         }
 
+        val shouldRecordTextHistory =
+          imagePaths.isEmpty() &&
+            audioPaths.isEmpty() &&
+            initArgs?.isPlainTextRuntime() == true
+        val responseText = StringBuilder()
         currentConversation.sendMessageAsync(
           Contents.of(contents),
           object : MessageCallback {
             override fun onMessage(message: Message) {
+              val tokenText = message.toString()
+              if (shouldRecordTextHistory) responseText.append(tokenText)
               runOnMainThread {
                 eventSink?.success(
                   mapOf(
                     "type" to "token",
-                    "text" to message.toString(),
+                    "text" to tokenText,
                     "thought" to message.channels["thought"],
                   )
                 )
@@ -1648,6 +1765,19 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
             }
 
             override fun onDone() {
+              if (
+                shouldRecordTextHistory &&
+                  cancelledGenerationId != generationId &&
+                  prompt.isNotBlank() &&
+                  responseText.isNotBlank()
+              ) {
+                synchronized(textHistory) {
+                  textHistory.add(Message.user(prompt))
+                  textHistory.add(Message.model(responseText.toString()))
+                  trimTextHistoryLocked()
+                }
+              }
+              if (shouldRecordTextHistory) scheduleTextRuntimeRelease()
               runOnMainThread { eventSink?.success(mapOf("type" to "done")) }
             }
 
@@ -1679,6 +1809,11 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
 
   fun stop(result: MethodChannel.Result) {
     try {
+      cancelledGenerationId = activeGenerationId
+      if (activeGenerationIsPlainText) {
+        textRuntimeInvalidated = true
+        scheduleTextRuntimeRelease()
+      }
       conversation?.cancelProcess()
       result.success(null)
     } catch (throwable: Throwable) {
@@ -1687,11 +1822,13 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
   }
 
   fun dispose(result: MethodChannel.Result) {
-    try {
-      closeCurrentRuntime()
-      result.success(null)
-    } catch (throwable: Throwable) {
-      result.error("DISPOSE_FAILED", throwable.message, null)
+    executor.execute {
+      try {
+        closeCurrentRuntime()
+        runOnMainThread { result.success(null) }
+      } catch (throwable: Throwable) {
+        runOnMainThread { result.error("DISPOSE_FAILED", throwable.message, null) }
+      }
     }
   }
 
@@ -1717,7 +1854,7 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     Handler(Looper.getMainLooper()).post(block)
   }
 
-  private fun decodeGalleryStyleBitmap(imagePath: String): Bitmap {
+  private fun decodeGalleryStyleBitmap(imagePath: String, maxDimension: Int): Bitmap {
     val imageFile = File(imagePath)
     if (!imageFile.exists()) {
       throw IllegalArgumentException("Image file not found: $imagePath")
@@ -1735,9 +1872,22 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
       ExifInterface.ORIENTATION_NORMAL
     }
 
-    val decoded = decodeSampledBitmapFromUri(uri, 1024, 1024)
+    val decoded = decodeSampledBitmapFromUri(uri, maxDimension, maxDimension)
       ?: throw IllegalArgumentException("Unable to decode image: $imagePath")
-    return rotateBitmap(decoded, orientation)
+    val rotated = rotateBitmap(decoded, orientation)
+    if (rotated !== decoded) decoded.recycle()
+    val largestDimension = max(rotated.width, rotated.height)
+    if (largestDimension <= maxDimension) return rotated
+
+    val scale = maxDimension.toDouble() / largestDimension.toDouble()
+    val scaled = Bitmap.createScaledBitmap(
+      rotated,
+      max(1, (rotated.width * scale).roundToInt()),
+      max(1, (rotated.height * scale).roundToInt()),
+      true,
+    )
+    if (scaled !== rotated) rotated.recycle()
+    return scaled
   }
 
   private fun decodeSampledBitmapFromUri(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
@@ -1952,11 +2102,55 @@ private class GemmaLiteRtRuntime(private val activity: Activity) : EventChannel.
     initArgs = null
   }
 
+  private fun RuntimeInitArgs.isPlainTextRuntime(): Boolean =
+    !supportImage && !supportAudio && !supportSkills
+
+  private fun cancelScheduledTextRuntimeRelease() {
+    textIdleReleaseGeneration += 1
+  }
+
+  private fun scheduleTextRuntimeRelease() {
+    val releaseGeneration = ++textIdleReleaseGeneration
+    Handler(Looper.getMainLooper()).postDelayed(
+      {
+        executor.execute {
+          if (
+            releaseGeneration == textIdleReleaseGeneration &&
+              initArgs?.isPlainTextRuntime() == true
+          ) {
+            closeCurrentRuntime()
+            Log.d(
+              TAG,
+              "released idle text runtime; retained ${textHistory.size} history messages",
+            )
+          }
+        }
+      },
+      TEXT_RUNTIME_IDLE_RELEASE_MS,
+    )
+  }
+
+  private fun trimTextHistoryLocked() {
+    while (textHistory.size > MAX_TEXT_HISTORY_MESSAGES) {
+      textHistory.removeAt(0)
+    }
+    while (
+      textHistory.size > 2 &&
+        textHistory.sumOf { it.toString().length } > MAX_TEXT_HISTORY_CHARS
+    ) {
+      textHistory.removeAt(0)
+      if (textHistory.isNotEmpty()) textHistory.removeAt(0)
+    }
+  }
+
   companion object {
     const val METHOD_CHANNEL = "com.example.gemma_local_app/runtime"
     const val EVENT_CHANNEL = "com.example.gemma_local_app/runtime_events"
     private const val TAG = "GemmaLiteRtRuntime"
     private const val SAMPLE_RATE = 16000
     private const val MAX_AUDIO_SECONDS = 30
+    private const val TEXT_RUNTIME_IDLE_RELEASE_MS = 8_000L
+    private const val MAX_TEXT_HISTORY_MESSAGES = 12
+    private const val MAX_TEXT_HISTORY_CHARS = 12_000
   }
 }

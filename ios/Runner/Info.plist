@@ -4,6 +4,8 @@
 <dict>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app uses local on-device model runtime resources.</string>
 	<key>NSCameraUsageDescription</key>

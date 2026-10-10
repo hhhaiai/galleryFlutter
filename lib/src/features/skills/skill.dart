@@ -39,7 +39,7 @@ For every new request:
 1. Find the most relevant skill from the enabled skill list below.
 2. Follow that skill's instructions exactly.
 3. Current bridge status: Android supports native ToolProvider for `loadSkill`, bundled `run_js` scripts, and platform `run_intent` actions such as send_email, get_current_date_and_time, create_calendar_event, read_calendar_events, and schedule_notification. If a tool result says `failed`, `pending`, or display output is pending, report that honestly and do not pretend execution or UI rendering succeeded.
-4. iOS/Dart tool-result dispatch is still in progress; if a FunctionCall/tool bridge is unavailable, output the intended tool call payload and clearly say it is waiting for the native Skills bridge.
+4. iOS/Dart executes the bundled `calculate-hash` run_js skill locally and returns its real SHA-1 result. Other run_js and run_intent skills still report `pending_bridge`; never pretend those actions completed.
 5. Pure text skills can be completed directly by the local Gemma model.
 ''';
 

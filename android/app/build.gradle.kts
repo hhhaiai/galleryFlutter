@@ -46,6 +46,11 @@ flutter {
 }
 
 dependencies {
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+    // Validate the latest standalone LiteRT-LM release as one isolated
+    // variable against the already verified 7fa1... model revision. The
+    // preceding 0.11.0 candidate crashed in Pixel 8 GPU vision initialization;
+    // this version is retained only if text, image, audio, and Skills all pass
+    // the same device probes.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

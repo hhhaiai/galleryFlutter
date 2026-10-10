@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show File, Platform;
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data' show ByteData, Endian, Uint8List;
 import 'dart:ui' as ui;
 
+import 'package:crypto/crypto.dart' show sha1;
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/core/ffi/litert_lm_client.dart' as fg_ffi;
@@ -84,8 +86,8 @@ class DeviceRuntimeProfile {
       return const DeviceRuntimeProfile(
         label: 'android-medium-fallback',
         textTokenWindow: 16384,
-        multimodalTokenWindow: 8192,
-        imageMaxDimension: 1024,
+        multimodalTokenWindow: 4096,
+        imageMaxDimension: 768,
         preferCpuForImage: false,
       );
     }
@@ -104,8 +106,8 @@ class DeviceRuntimeProfile {
         label: 'android-medium',
         totalMemoryBytes: totalMemoryBytes,
         textTokenWindow: 24576,
-        multimodalTokenWindow: 8192,
-        imageMaxDimension: 1024,
+        multimodalTokenWindow: 4096,
+        imageMaxDimension: 768,
         preferCpuForImage: false,
       );
     }
@@ -138,6 +140,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   StreamSubscription<dynamic>? _eventSubscription;
   GemmaModelConfig? _config;
   bool _initialized = false;
+  bool _androidRuntimeReady = false;
   bool _androidSupportImage = false;
   bool _androidSupportAudio = false;
   bool _androidSupportSkills = false;
@@ -146,6 +149,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   fg.InferenceModel? _flutterGemmaModel;
   fg.InferenceChat? _flutterGemmaChat;
   fg_ffi.LiteRtLmFfiClient? _iosRawFfiClient;
+  Future<String>? _iosRawAudioTask;
   DeviceRuntimeProfile? _deviceRuntimeProfile;
 
   @override
@@ -189,20 +193,12 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       return;
     }
 
-    if (_initialized &&
-        previousConfig?.modelId == config.modelId &&
-        previousConfig?.commitHash == config.commitHash) {
-      return;
-    }
-
-    // Keep Android initial runtime text-only. Google Gallery enables image/audio
-    // per task/session; enabling multimodal backends globally made Android stay
-    // in "思考中" even for normal chat.
-    await _initializeAndroidRuntime(
-      config,
-      supportImage: false,
-      supportAudio: false,
-    );
+    // Android runtime creation is request-driven. Eagerly loading a large CPU
+    // text engine here means an image/audio request immediately closes it and
+    // loads a GPU multimodal engine, temporarily doubling native pressure.
+    // Keeping initialize() lightweight also lets the system photo/file picker
+    // open after a completed model request without competing with a 2+ GiB
+    // native engine that is not needed while the picker is visible.
     _initialized = true;
   }
 
@@ -218,6 +214,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
   }) async {
     await _ensureDeviceRuntimeProfile();
     final modelPath = await _resolveModelPath(config);
+    _androidRuntimeReady = false;
     await _methodChannel.invokeMethod<void>('initialize', {
       'modelPath': modelPath,
       'topK': config.topK,
@@ -231,6 +228,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       'supportImage': supportImage,
       'supportAudio': supportAudio,
       'supportSkills': supportSkills,
+      'imageMaxDimension': _currentDeviceRuntimeProfile.imageMaxDimension,
       'systemPrompt': systemPrompt,
       'enabledSkillNames': enabledSkillNames,
       'enabledSkills': enabledSkillDetails,
@@ -253,48 +251,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           supportImage: supportImage,
           supportAudio: supportAudio,
         );
-  }
-
-  Future<void> _initializeFlutterGemma(
-    GemmaModelConfig config,
-    String modelPath, {
-    bool forceReload = false,
-    bool supportImage = false,
-    bool supportAudio = false,
-  }) async {
-    await _ensureDeviceRuntimeProfile();
-    await _validateModelFile(config, modelPath);
-
-    try {
-      if (forceReload) {
-        await _flutterGemmaChat?.session.close();
-        _flutterGemmaChat = null;
-        await _flutterGemmaModel?.close();
-        _flutterGemmaModel = null;
-      }
-
-      _flutterGemmaModel ??= await fg.FlutterGemma.getActiveModel(
-        maxTokens: _runtimeSessionTokenLimit(
-          config,
-          supportImage: supportImage,
-          supportAudio: supportAudio,
-        ),
-        preferredBackend: supportAudio && !supportImage
-            ? fg.PreferredBackend.cpu
-            : fg.PreferredBackend.gpu,
-        supportImage: supportImage && config.supportImage,
-        supportAudio: supportAudio && config.supportAudio,
-        maxNumImages: supportImage && config.supportImage ? 1 : null,
-      );
-      _flutterGemmaChat = null;
-    } catch (error) {
-      _flutterGemmaChat = null;
-      await _flutterGemmaModel?.close();
-      _flutterGemmaModel = null;
-      throw RuntimeUnavailableException(
-        '$_appleRuntimeLabel LiteRT-LM/flutter_gemma 初始化失败：$error',
-      );
-    }
+    _androidRuntimeReady = true;
   }
 
   fg.ModelType _flutterGemmaModelType(GemmaModelConfig config) {
@@ -389,15 +346,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       totalMemoryBytes,
       isAppleMobile: isAppleMobile,
     );
-    // Keep the stable lane split:
-    // - Text-only sessions scale up on higher-memory devices.
-    // - Image/audio sessions carry extra encoder memory, so low-memory phones
-    //   use smaller KV + image windows to avoid iOS jetsam/native termination.
+    // Keep the stable lane split, but never exceed the model's configured
+    // generation/session token budget. Google AI Edge Gallery passes the
+    // allowlist `maxTokens` value (4000 for Gemma-4-E2B-it) to
+    // EngineConfig.maxNumTokens; treating the advertised 32K context length as
+    // a 24K/32K preallocated mobile KV window adds gigabytes of memory and makes
+    // cold initialization much slower. Low-memory multimodal profiles may still
+    // choose a smaller budget to avoid iOS jetsam/native termination.
     final isMultimodal = supportImage || supportAudio;
     final requested = isMultimodal
         ? profile.multimodalTokenWindow
         : profile.textTokenWindow;
-    return math.min(config.maxContextLength, requested);
+    return math.min(config.maxTokens, requested);
   }
 
   Future<void> _validateModelFile(
@@ -506,7 +466,12 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
           );
         }
       } on PlatformException catch (error) {
-        if (!needsImageRuntime && !needsAudioRuntime) rethrow;
+        if (!needsImageRuntime && !needsAudioRuntime) {
+          if (needsSkillsRuntime) {
+            await _releaseAndroidRuntimeEngine();
+          }
+          rethrow;
+        }
         if (!isLastAttempt) continue;
         await _restoreAndroidTextRuntime(config);
         throw RuntimeUnavailableException(
@@ -517,10 +482,16 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       }
 
       try {
-        yield* _invokeAndroidGenerate(
-          request,
-          includeSystemContext: !needsSkillsRuntime,
-        );
+        try {
+          yield* _invokeAndroidGenerate(
+            request,
+            includeSystemContext: !needsSkillsRuntime,
+          );
+        } finally {
+          if (needsImageRuntime || needsAudioRuntime || needsSkillsRuntime) {
+            await _releaseAndroidRuntimeEngine();
+          }
+        }
         return;
       } on RuntimeUnavailableException catch (error) {
         lastRuntimeError = error;
@@ -530,7 +501,9 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
             !isLastAttempt &&
             _isCompiledModelInvocationError(error.message);
         if (!shouldRetryAudio) {
-          await _restoreAndroidTextRuntime(config);
+          if (!needsSkillsRuntime) {
+            await _restoreAndroidTextRuntime(config);
+          }
           rethrow;
         }
         continue;
@@ -547,6 +520,10 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     required bool includeSystemContext,
   }) async* {
     final generationController = StreamController<String>();
+    final isSkillsRequest =
+        request.systemPrompt?.trim().isNotEmpty == true ||
+        request.enabledSkillNames.isNotEmpty;
+    final idleTimeout = Duration(seconds: isSkillsRequest ? 180 : 90);
     final prompt = _androidPromptForRequest(
       request,
       includeSystemContext: includeSystemContext,
@@ -572,11 +549,18 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       }
 
       await for (final token in generationController.stream.timeout(
-        const Duration(seconds: 90),
+        idleTimeout,
         onTimeout: (sink) {
+          // Tool calls do not emit user-visible tokens while LiteRT-LM is
+          // executing them. Give Skills a larger idle window, but always
+          // cancel the native generation before the specialized runtime is
+          // disposed so a timeout cannot leave a multi-gigabyte engine alive.
+          unawaited(stop().catchError((Object _) {}));
           sink.addError(
-            const RuntimeUnavailableException(
-              '模型 90 秒内没有返回内容，已自动停止。请重试，或切换为纯文字/较短输入。',
+            RuntimeUnavailableException(
+              isSkillsRequest
+                  ? '模型/工具 180 秒内没有返回内容，已自动停止。请重试，或减少启用的 Skills。'
+                  : '模型 90 秒内没有返回内容，已自动停止。请重试，或切换为纯文字/较短输入。',
             ),
           );
           sink.close();
@@ -648,21 +632,24 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     final isImageRequest = request.imagePaths.isNotEmpty;
     final isAudioRequest = request.audioPaths.isNotEmpty;
     final config = _config ?? gemma4E2bIt;
+    final pendingAudioTask = _iosRawAudioTask;
+    if (pendingAudioTask != null) {
+      try {
+        await pendingAudioTask;
+      } catch (_) {
+        // The original audio request reports its own failure. The important
+        // invariant here is that its native engine has exited before another
+        // large engine is created on a low-memory Apple device.
+      }
+    }
     var modelPath = await _resolveModelPath(config);
 
-    final tools = _iosSkillToolsFor(request);
+    final tools = iosSkillToolsForTesting(request);
     const useDartFfiDefine = String.fromEnvironment('GEMMA_IOS_USE_DART_FFI');
-    const allowPluginPathDefine = String.fromEnvironment(
-      'GEMMA_IOS_ALLOW_PLUGIN_PATH',
-    );
     final useDartFfi =
         useDartFfiDefine == '1' ||
         useDartFfiDefine.toLowerCase() == 'true' ||
         Platform.environment['GEMMA_IOS_USE_DART_FFI'] == '1';
-    final allowPluginPath =
-        allowPluginPathDefine == '1' ||
-        allowPluginPathDefine.toLowerCase() == 'true' ||
-        Platform.environment['GEMMA_IOS_ALLOW_PLUGIN_PATH'] == '1';
     const useNativeDirectDefine = String.fromEnvironment(
       'GEMMA_IOS_USE_NATIVE_DIRECT',
     );
@@ -688,130 +675,212 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       );
       return;
     }
-    if (!allowPluginPath) {
-      throw const RuntimeUnavailableException(
-        'iOS Skills/function calling 当前已暂时关闭：为避开 flutter_gemma iOS 插件注册崩溃，iOS 现在统一使用 LiteRT-LM raw FFI 路径。请先用文字/图片/语音验证本地模型。',
-      );
-    }
-    // 这里处理的是：纯文字、图片、或图片+Skills 的 flutter_gemma 高级 API 路径。
-    final effectiveConfig = config;
-    if (isImageRequest || isAudioRequest) {
-      await _initializeFlutterGemma(
-        effectiveConfig,
-        modelPath,
-        forceReload: true,
-        supportImage: isImageRequest,
-        supportAudio: isAudioRequest,
-      );
-    } else if (_flutterGemmaModel == null) {
-      await _initializeFlutterGemma(
-        effectiveConfig,
-        modelPath,
-        supportImage: false,
-        supportAudio: false,
-      );
-    } else {
-      await _flutterGemmaChat?.session.close();
-      _flutterGemmaChat = null;
-    }
-    final currentModel = _flutterGemmaModel;
-    if (currentModel == null) {
-      throw const RuntimeUnavailableException(
-        'iOS flutter_gemma model 重新初始化失败。',
-      );
-    }
-    final chat = await currentModel.createChat(
-      // Vision answers should be factual and stable. Keep text/skills creative
-      // defaults, but reduce sampling for image grounding so counts and visible
-      // entities are less likely to drift.
-      temperature: isImageRequest
-          ? 0.2
-          : (_config?.temperature ?? gemma4E2bIt.temperature),
-      topK: isImageRequest ? 1 : (_config?.topK ?? gemma4E2bIt.topK),
-      topP: _config?.topP ?? gemma4E2bIt.topP,
-      supportImage: isImageRequest,
-      supportAudio: isAudioRequest,
-      modelType: _flutterGemmaModelType(effectiveConfig),
-      isThinking: false,
+    yield* _generateIosSkillsWithRawLiteRtLm(
+      request: request,
+      prompt: prompt,
+      config: config,
+      modelPath: modelPath,
       tools: tools,
-      supportsFunctionCalls: tools.isNotEmpty,
-      toolChoice: tools.isEmpty ? fg.ToolChoice.none : fg.ToolChoice.auto,
     );
-    _flutterGemmaChat = chat;
+  }
 
-    try {
-      if (isImageRequest || isAudioRequest) {
-        Uint8List? imageBytes;
-        Uint8List? audioBytes;
-        if (isImageRequest) {
-          final firstImage = File(request.imagePaths.first);
-          if (!await firstImage.exists()) {
-            throw RuntimeUnavailableException(
-              '图片文件不存在：${request.imagePaths.first}',
-            );
+  Stream<String> _generateIosSkillsWithRawLiteRtLm({
+    required GemmaRequest request,
+    required String prompt,
+    required GemmaModelConfig config,
+    required String modelPath,
+    required List<fg.Tool> tools,
+  }) async* {
+    if (request.imagePaths.isNotEmpty || request.audioPaths.isNotEmpty) {
+      throw const RuntimeUnavailableException(
+        'iOS Skills 当前只支持纯文字请求。请先移除图片/语音附件，再运行 Skill。',
+      );
+    }
+
+    await _prepareFlutterGemmaModel(config, modelPath);
+    await _flutterGemmaChat?.session.close();
+    _flutterGemmaChat = null;
+    await _flutterGemmaModel?.close();
+    _flutterGemmaModel = null;
+
+    final cacheDir = (await getApplicationSupportDirectory()).path;
+    const backends = ['gpu', 'cpu'];
+    Object? lastError;
+
+    for (final backend in backends) {
+      final client = fg_ffi.LiteRtLmFfiClient();
+      _iosRawFfiClient = client;
+      try {
+        debugPrint(
+          '[GemmaIOS] raw Skills inference backend=$backend '
+          'tools=${tools.map((tool) => tool.name).join(',')}',
+        );
+        await client.initialize(
+          modelPath: modelPath,
+          backend: backend,
+          maxTokens: _runtimeSessionTokenLimit(config),
+          cacheDir: cacheDir,
+          enableVision: false,
+          maxNumImages: 0,
+          enableAudio: false,
+        );
+        client.createConversation(
+          temperature: 0.1,
+          topK: 1,
+          topP: 0.95,
+          seed: 1,
+        );
+
+        final selectionPrompt = iosTextToolProtocolForTesting(prompt, tools);
+        final callText = StringBuffer();
+        fg.FunctionCallResponse? call;
+        await for (final rawChunk in client.chatRaw(selectionPrompt)) {
+          callText.write(
+            fg_ffi.LiteRtLmFfiClient.extractTextFromResponse(rawChunk),
+          );
+          call = parseIosTextToolCallForTesting(callText.toString());
+          if (call != null) {
+            client.cancelGeneration();
+            break;
           }
-          imageBytes = await _readGalleryStyleVisionImageBytes(firstImage);
         }
-        if (isAudioRequest) {
-          audioBytes = await _readGemmaWavBytes(request.audioPaths.first);
+        call ??= parseIosTextToolCallForTesting(callText.toString());
+        if (call == null) {
+          throw RuntimeUnavailableException(
+            'Gemma 未返回可执行的 JSON 工具调用：${callText.toString().trim()}',
+          );
         }
-        final mediaPrompt = isImageRequest && isAudioRequest
-            ? _imageAndAudioPrompt(prompt)
-            : isImageRequest
-            ? _visionPrompt(prompt)
-            : _audioPrompt(prompt);
-        await chat.addQueryChunk(
-          fg.Message(
-            text: mediaPrompt,
-            imageBytes: imageBytes,
-            audioBytes: audioBytes,
-            isUser: true,
+        final selectedCall = call;
+        final allowedTool = tools.any(
+          (tool) =>
+              tool.name.replaceAll('_', '').toLowerCase() ==
+              selectedCall.name.replaceAll('_', '').toLowerCase(),
+        );
+        if (!allowedTool) {
+          throw RuntimeUnavailableException(
+            'Gemma 请求了未启用的工具：${selectedCall.name}',
+          );
+        }
+
+        final toolResult = executeDartSkillToolForTesting(
+          selectedCall,
+          request,
+        );
+        yield '\n[tool:${selectedCall.name}] ${toolResult['status'] ?? 'done'}\n';
+        final resultText = toolResult['result']?.toString().trim() ?? '';
+        yield resultText.isNotEmpty
+            ? '$resultText\n'
+            : '${jsonEncode(toolResult)}\n';
+        return;
+      } catch (error) {
+        lastError = error;
+        debugPrint(
+          '[GemmaIOS] raw Skills inference failed on $backend: $error',
+        );
+      } finally {
+        if (identical(_iosRawFfiClient, client)) {
+          _iosRawFfiClient = null;
+        }
+        client.shutdown();
+      }
+    }
+
+    throw RuntimeUnavailableException(
+      '$_appleRuntimeLabel Skills 推理失败，已重置会话，请重试：$lastError。'
+      '已尝试 backend=${backends.join(' / ')}。',
+    );
+  }
+
+  @visibleForTesting
+  static String iosTextToolProtocolForTesting(
+    String prompt,
+    List<fg.Tool> tools,
+  ) {
+    final toolSchemas = [
+      for (final tool in tools)
+        {
+          'name': tool.name,
+          'description': tool.description,
+          'parameters': tool.parameters,
+        },
+    ];
+    return '''
+You must select and call exactly one enabled local tool for this request.
+Do not calculate or answer the request yourself before the tool executes.
+Available tools JSON:
+${jsonEncode(toolSchemas)}
+
+Output only one valid compact JSON object with this exact outer shape:
+{"name":"toolName","arguments":{}}
+Do not use Markdown fences and do not add explanations.
+
+Original task and enabled-skill context:
+$prompt
+'''
+        .trim();
+  }
+
+  @visibleForTesting
+  static fg.FunctionCallResponse? parseIosTextToolCallForTesting(String text) {
+    for (final fragment in _jsonObjectFragments(text)) {
+      try {
+        final decoded = jsonDecode(fragment);
+        if (decoded is! Map) continue;
+        final function = decoded['function'];
+        final callMap = function is Map ? function : decoded;
+        final name = (callMap['name'] ?? callMap['tool'])?.toString().trim();
+        if (name == null || name.isEmpty) continue;
+        Object? rawArguments =
+            callMap['arguments'] ?? callMap['args'] ?? callMap['parameters'];
+        if (rawArguments is String) {
+          rawArguments = jsonDecode(rawArguments);
+        }
+        if (rawArguments is! Map) continue;
+        return fg.FunctionCallResponse(
+          name: name,
+          args: rawArguments.map(
+            (key, value) => MapEntry(key.toString(), value),
           ),
         );
-      } else {
-        await chat.addQueryChunk(fg.Message.text(text: prompt, isUser: true));
+      } catch (_) {
+        // Try the next balanced JSON object.
       }
-    } catch (error) {
-      await chat.session.close();
-      if (identical(_flutterGemmaChat, chat)) _flutterGemmaChat = null;
-      throw RuntimeUnavailableException('iOS 多模态/文本输入失败，已重置会话，请重试：$error');
     }
+    return null;
+  }
 
-    var toolRounds = 0;
-    var shouldContinueAfterTool = false;
-    do {
-      shouldContinueAfterTool = false;
-      await for (final response in chat.generateChatResponseAsync()) {
-        if (response is fg.TextResponse) {
-          yield response.token;
-        } else if (response is fg.ThinkingResponse) {
-          yield response.content;
-        } else if (response is fg.FunctionCallResponse) {
-          final toolResult = _executeDartSkillTool(response, request);
-          yield '\n[tool:${response.name}] ${toolResult['status'] ?? 'done'}\n';
-          await chat.addQueryChunk(
-            fg.Message.toolResponse(
-              toolName: response.name,
-              response: toolResult,
-            ),
-          );
-          shouldContinueAfterTool = true;
-        } else if (response is fg.ParallelFunctionCallResponse) {
-          for (final call in response.calls) {
-            final toolResult = _executeDartSkillTool(call, request);
-            yield '\n[tool:${call.name}] ${toolResult['status'] ?? 'done'}\n';
-            await chat.addQueryChunk(
-              fg.Message.toolResponse(
-                toolName: call.name,
-                response: toolResult,
-              ),
-            );
-          }
-          shouldContinueAfterTool = response.calls.isNotEmpty;
+  static Iterable<String> _jsonObjectFragments(String text) sync* {
+    var depth = 0;
+    var start = -1;
+    var inString = false;
+    var escaped = false;
+    for (var index = 0; index < text.length; index += 1) {
+      final char = text[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char == r'\') {
+        escaped = true;
+        continue;
+      }
+      if (char == '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (char == '{') {
+        if (depth == 0) start = index;
+        depth += 1;
+      } else if (char == '}') {
+        if (depth == 0) continue;
+        depth -= 1;
+        if (depth == 0 && start >= 0) {
+          yield text.substring(start, index + 1);
+          start = -1;
         }
       }
-      toolRounds += 1;
-    } while (shouldContinueAfterTool && toolRounds < 3);
+    }
   }
 
   Stream<String> _generateIosMediaWithRawLiteRtLm({
@@ -891,6 +960,39 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       );
       Object? lastError;
       for (final backend in backends) {
+        if (isAudioRequest && !isImageRequest) {
+          try {
+            debugPrint(
+              '[GemmaIOS] raw audio inference in background isolate '
+              'backend=$backend audioBytes=${audioBytes?.length ?? 0} '
+              'audioPath=${audioPathForJson != null}',
+            );
+            final rawResponse = await _sendIosRawAudioMessageOffMainIsolate(
+              modelPath: modelPath,
+              backend: backend,
+              maxTokens: _runtimeSessionTokenLimit(
+                config,
+                supportImage: false,
+                supportAudio: true,
+              ),
+              cacheDir: cacheDir,
+              messageJson: buildIosPathMessageJsonForTesting(
+                text: mediaPrompt,
+                audioPath: audioPathForJson,
+              ),
+            );
+            yield _extractIosRawResponseText(rawResponse);
+            return;
+          } catch (error) {
+            lastError = error;
+            debugPrint(
+              '[GemmaIOS] isolated raw audio inference failed on '
+              '$backend: $error',
+            );
+            continue;
+          }
+        }
+
         final client = fg_ffi.LiteRtLmFfiClient();
         _iosRawFfiClient = client;
         try {
@@ -927,14 +1029,6 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
               audioPath: audioPathForJson,
               imagePath: imagePathForJson,
             );
-            if (!isImageRequest) {
-              // PhoneClaw's working iOS Gemma 4 route uses file-path JSON and
-              // non-streaming Conversation API for audio-only. This avoids the
-              // iOS streaming startup path that repeatedly returned code 13.
-              final rawResponse = await client.sendMessage(messageJson);
-              yield _extractIosRawResponseText(rawResponse);
-              return;
-            }
             try {
               await for (final rawChunk in client.sendMessageStreamRaw(
                 messageJson,
@@ -1005,6 +1099,53 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
         }
       }
     }
+  }
+
+  Future<String> _sendIosRawAudioMessageOffMainIsolate({
+    required String modelPath,
+    required String backend,
+    required int maxTokens,
+    required String cacheDir,
+    required String messageJson,
+  }) {
+    // LiteRtLmFfiClient.sendMessage() wraps LiteRT-LM's synchronous C API.
+    // Marking that method async does not move the native call off the caller's
+    // isolate, so an audio response can otherwise freeze Flutter semantics and
+    // input dispatch for several minutes on low-memory iPads. Construct and
+    // own the complete native engine inside a worker isolate instead. Strings
+    // and integers are copied safely; no native pointer crosses isolates.
+    final existingTask = _iosRawAudioTask;
+    if (existingTask != null) return existingTask;
+    late final Future<String> task;
+    task = Isolate.run(() async {
+      final client = fg_ffi.LiteRtLmFfiClient();
+      try {
+        await client.initialize(
+          modelPath: modelPath,
+          backend: backend,
+          maxTokens: maxTokens,
+          cacheDir: cacheDir,
+          enableVision: false,
+          maxNumImages: 0,
+          enableAudio: true,
+        );
+        client.createConversation(
+          temperature: 0.1,
+          topK: 1,
+          topP: 0.95,
+          seed: 1,
+        );
+        return await client.sendMessage(messageJson);
+      } finally {
+        client.shutdown();
+      }
+    }, debugName: 'gemma-ios-audio');
+    _iosRawAudioTask = task;
+    return task.whenComplete(() {
+      if (identical(_iosRawAudioTask, task)) {
+        _iosRawAudioTask = null;
+      }
+    });
   }
 
   List<String> _iosRawMediaBackends({
@@ -1282,46 +1423,71 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     return String.fromCharCodes(bytes.sublist(offset, offset + count));
   }
 
-  List<fg.Tool> _iosSkillToolsFor(GemmaRequest request) {
-    if (request.enabledSkillNames.isEmpty &&
-        request.enabledSkillDetails.isEmpty) {
+  @visibleForTesting
+  List<fg.Tool> iosSkillToolsForTesting(GemmaRequest request) {
+    final enabledNames = <String>{
+      ...request.enabledSkillNames,
+      ...request.enabledSkillDetails
+          .map((skill) => skill['name'] ?? '')
+          .where((name) => name.isNotEmpty),
+    };
+    if (enabledNames.isEmpty) {
       return const [];
     }
-    return const [
-      fg.Tool(
-        name: 'loadSkill',
-        description:
-            'Loads an enabled skill by name and returns its full instructions.',
-        parameters: {
-          'skillName': {
-            'type': 'string',
-            'description': 'The name of the enabled skill to load.',
+    const pureTextSkillNames = {'kitchen-adventure'};
+    const intentSkillNames = {
+      'send-email',
+      'schedule-notification',
+      'create-calendar-event',
+      'read-calendar-events',
+    };
+    final needsIntent = enabledNames.any(intentSkillNames.contains);
+    final needsRunJs = enabledNames.any(
+      (name) =>
+          !pureTextSkillNames.contains(name) &&
+          !intentSkillNames.contains(name),
+    );
+    return [
+      if (needsRunJs)
+        fg.Tool(
+          name: 'runJs',
+          description:
+              'Runs an enabled bundled JS-style skill. calculate-hash executes locally; unsupported skills return an honest pending result.',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'skillName': {'type': 'string'},
+              'scriptName': {'type': 'string'},
+              'data': {
+                'type': 'string',
+                'description': 'A JSON object encoded as a string.',
+              },
+            },
+            'required': ['skillName', 'scriptName', 'data'],
           },
-        },
-      ),
-      fg.Tool(
-        name: 'runJs',
-        description:
-            'Attempts to run a JS skill. iOS/Dart execution is not connected yet and returns an honest pending result.',
-        parameters: {
-          'skillName': {'type': 'string'},
-          'scriptName': {'type': 'string'},
-          'data': {'type': 'string'},
-        },
-      ),
-      fg.Tool(
-        name: 'runIntent',
-        description:
-            'Attempts to run a platform intent. iOS/Dart execution is not connected yet and returns an honest pending result.',
-        parameters: {
-          'intent': {'type': 'string'},
-          'parameters': {'type': 'string'},
-        },
-      ),
+        ),
+      if (needsIntent)
+        fg.Tool(
+          name: 'runIntent',
+          description:
+              'Attempts to run a platform intent. iOS/Dart execution is not connected yet and returns an honest pending result.',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'intent': {'type': 'string'},
+              'parameters': {
+                'type': 'string',
+                'description': 'A JSON object encoded as a string.',
+              },
+            },
+            'required': ['intent', 'parameters'],
+          },
+        ),
     ];
   }
 
-  Map<String, dynamic> _executeDartSkillTool(
+  @visibleForTesting
+  Map<String, dynamic> executeDartSkillToolForTesting(
     fg.FunctionCallResponse call,
     GemmaRequest request,
   ) {
@@ -1350,11 +1516,46 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
               '---\nname: ${skill['name'] ?? requestedName}\ndescription: ${skill['description'] ?? ''}\n---\n\n${skill['instructions'] ?? ''}',
         };
       case 'runjs':
+        final skillName =
+            (call.args['skillName'] ?? call.args['skill_name'] ?? '')
+                .toString()
+                .trim();
+        if (skillName == 'calculate-hash') {
+          try {
+            final rawData = call.args['data'];
+            final Object? decodedData = rawData is String
+                ? jsonDecode(rawData)
+                : rawData;
+            if (decodedData is! Map) {
+              throw const FormatException('data must be a JSON object');
+            }
+            final text = decodedData['text']?.toString() ?? '';
+            if (text.isEmpty) {
+              throw const FormatException('data.text is required');
+            }
+            final digest = sha1.convert(utf8.encode(text)).toString();
+            return {
+              'status': 'succeeded',
+              'skill_name': skillName,
+              'script_name':
+                  (call.args['scriptName'] ??
+                          call.args['script_name'] ??
+                          'index.html')
+                      .toString(),
+              'algorithm': 'SHA-1',
+              'result': digest,
+            };
+          } catch (error) {
+            return {
+              'status': 'failed',
+              'skill_name': skillName,
+              'error': 'Invalid calculate-hash input: $error',
+            };
+          }
+        }
         return {
           'status': 'pending_bridge',
-          'skill_name':
-              (call.args['skillName'] ?? call.args['skill_name'] ?? '')
-                  .toString(),
+          'skill_name': skillName,
           'script_name':
               (call.args['scriptName'] ??
                       call.args['script_name'] ??
@@ -1497,6 +1698,24 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     } catch (_) {}
   }
 
+  Future<void> _releaseAndroidRuntimeEngine() async {
+    try {
+      await _methodChannel.invokeMethod<void>('dispose');
+    } on PlatformException catch (error) {
+      debugPrint(
+        '[GemmaRuntime] Android specialized runtime release failed: '
+        '${error.message ?? error.code}',
+      );
+    } finally {
+      _androidRuntimeReady = false;
+      _androidSupportImage = false;
+      _androidSupportAudio = false;
+      _androidSupportSkills = false;
+      _androidEnabledSkillNames = const [];
+      _androidAccelerator = GemmaAccelerator.cpu.id;
+    }
+  }
+
   bool _androidRuntimeMatches({
     required bool supportImage,
     required bool supportAudio,
@@ -1505,6 +1724,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
     required String accelerator,
   }) {
     return _initialized &&
+        _androidRuntimeReady &&
         _androidSupportImage == supportImage &&
         _androidSupportAudio == supportAudio &&
         _androidSupportSkills == supportSkills &&
@@ -1584,6 +1804,7 @@ class MethodChannelGemmaRuntime implements LocalGemmaRuntime {
       _flutterGemmaModel = null;
     } else if (Platform.isAndroid) {
       await _methodChannel.invokeMethod<void>('dispose');
+      _androidRuntimeReady = false;
       _androidSupportImage = false;
       _androidSupportAudio = false;
       _androidSupportSkills = false;

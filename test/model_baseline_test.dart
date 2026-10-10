@@ -15,74 +15,28 @@ void main() {
     expect(gemma4E2bIt.taskIds, contains(GemmaTaskId.askAudio));
   });
 
-  test('runtime session windows do not regress to the old 1024 limit', () {
-    expect(
-      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(gemma4E2bIt),
-      16384,
-    );
-    expect(
-      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-        gemma4E2bIt,
-        supportImage: true,
-      ),
-      8192,
-    );
-    expect(
-      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-        gemma4E2bIt,
-        supportAudio: true,
-      ),
-      8192,
-    );
-    expect(
-      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-        gemma4E2bIt,
-        supportImage: true,
-        isAppleMobile: true,
-        totalMemoryBytes: 4 * 1024 * 1024 * 1024,
-      ),
-      2048,
-    );
-    expect(
-      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-        gemma4E2bIt,
-        supportAudio: true,
-        isAppleMobile: true,
-        totalMemoryBytes: 6 * 1024 * 1024 * 1024,
-      ),
-      3072,
-    );
-  });
-
-  test('runtime profile scales image input by device memory', () {
-    final iphone13 = DeviceRuntimeProfile.forMemoryBytes(
-      4 * 1024 * 1024 * 1024,
-      isAppleMobile: true,
-    );
-    expect(iphone13.label, 'ios-low');
-    expect(iphone13.textTokenWindow, 12288);
-    expect(iphone13.multimodalTokenWindow, 2048);
-    expect(iphone13.imageMaxDimension, 640);
-    expect(iphone13.preferCpuForImage, isTrue);
-
-    final highMemoryAndroid = DeviceRuntimeProfile.forMemoryBytes(
-      8 * 1024 * 1024 * 1024,
-    );
-    expect(highMemoryAndroid.textTokenWindow, 24576);
-    expect(highMemoryAndroid.multimodalTokenWindow, 8192);
-    expect(highMemoryAndroid.imageMaxDimension, 1024);
-  });
-
   test(
-    'text-only windows scale higher without enlarging multimodal windows',
+    'runtime session windows honor the official 4000-token model budget',
     () {
       expect(
         MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
           gemma4E2bIt,
-          isAppleMobile: true,
-          totalMemoryBytes: 4 * 1024 * 1024 * 1024,
         ),
-        12288,
+        4000,
+      );
+      expect(
+        MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+          gemma4E2bIt,
+          supportImage: true,
+        ),
+        4000,
+      );
+      expect(
+        MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+          gemma4E2bIt,
+          supportAudio: true,
+        ),
+        4000,
       );
       expect(
         MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
@@ -96,25 +50,81 @@ void main() {
       expect(
         MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
           gemma4E2bIt,
+          supportAudio: true,
           isAppleMobile: true,
           totalMemoryBytes: 6 * 1024 * 1024 * 1024,
         ),
-        16384,
-      );
-      expect(
-        MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-          gemma4E2bIt,
-          totalMemoryBytes: 8 * 1024 * 1024 * 1024,
-        ),
-        24576,
-      );
-      expect(
-        MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
-          gemma4E2bIt,
-          totalMemoryBytes: 12 * 1024 * 1024 * 1024,
-        ),
-        32000,
+        3072,
       );
     },
   );
+
+  test('runtime profile scales image input by device memory', () {
+    final iphone13 = DeviceRuntimeProfile.forMemoryBytes(
+      4 * 1024 * 1024 * 1024,
+      isAppleMobile: true,
+    );
+    expect(iphone13.label, 'ios-low');
+    expect(iphone13.textTokenWindow, 12288);
+    expect(iphone13.multimodalTokenWindow, 2048);
+    expect(iphone13.imageMaxDimension, 640);
+    expect(iphone13.preferCpuForImage, isTrue);
+
+    final pixel8ClassAndroid = DeviceRuntimeProfile.forMemoryBytes(
+      8 * 1024 * 1024 * 1024,
+    );
+    expect(pixel8ClassAndroid.label, 'android-medium');
+    expect(pixel8ClassAndroid.textTokenWindow, 24576);
+    expect(pixel8ClassAndroid.multimodalTokenWindow, 4096);
+    expect(pixel8ClassAndroid.imageMaxDimension, 768);
+
+    final highMemoryAndroid = DeviceRuntimeProfile.forMemoryBytes(
+      12 * 1024 * 1024 * 1024,
+    );
+    expect(highMemoryAndroid.label, 'android-high');
+    expect(highMemoryAndroid.multimodalTokenWindow, 8192);
+    expect(highMemoryAndroid.imageMaxDimension, 1024);
+  });
+
+  test('runtime profiles cannot exceed the model token budget', () {
+    expect(
+      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+        gemma4E2bIt,
+        isAppleMobile: true,
+        totalMemoryBytes: 4 * 1024 * 1024 * 1024,
+      ),
+      4000,
+    );
+    expect(
+      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+        gemma4E2bIt,
+        supportImage: true,
+        isAppleMobile: true,
+        totalMemoryBytes: 4 * 1024 * 1024 * 1024,
+      ),
+      2048,
+    );
+    expect(
+      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+        gemma4E2bIt,
+        isAppleMobile: true,
+        totalMemoryBytes: 6 * 1024 * 1024 * 1024,
+      ),
+      4000,
+    );
+    expect(
+      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+        gemma4E2bIt,
+        totalMemoryBytes: 8 * 1024 * 1024 * 1024,
+      ),
+      4000,
+    );
+    expect(
+      MethodChannelGemmaRuntime.runtimeSessionTokenLimitForTesting(
+        gemma4E2bIt,
+        totalMemoryBytes: 12 * 1024 * 1024 * 1024,
+      ),
+      4000,
+    );
+  });
 }

@@ -63,6 +63,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   static const _liveSilenceHold = Duration(milliseconds: 850);
   static const _liveSpeechThreshold = 0.16;
   static const _liveUiTick = Duration(seconds: 1);
+  static const _liveMaxPendingSegments = 1;
   bool _recording = false;
   bool _autoStoppingRecording = false;
   bool _running = false;
@@ -191,8 +192,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   @override
   void dispose() {
-    _liveStopSignal?.complete();
-    _liveSegmentCutSignal?.complete();
+    _completePendingSignal(_liveStopSignal);
+    _completePendingSignal(_liveSegmentCutSignal);
     _liveUiTimer?.cancel();
     _downloadSubscription?.cancel();
     _audioEventSubscription?.cancel();
@@ -344,9 +345,17 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       }
       _finishAssistantMessage(stopped: _stopRequested);
     } on RuntimeUnavailableException catch (error) {
-      _appendAssistantText(error.message, done: true);
+      if (_stopRequested) {
+        _finishAssistantMessage(stopped: true);
+      } else {
+        _appendAssistantText(error.message, done: true);
+      }
     } catch (error) {
-      _appendAssistantText('生成失败：$error', done: true);
+      if (_stopRequested) {
+        _finishAssistantMessage(stopped: true);
+      } else {
+        _appendAssistantText('生成失败：$error', done: true);
+      }
     }
   }
 
@@ -391,8 +400,8 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     if (!mounted) return;
     setState(() {
       final last = _messages.removeLast();
-      final text = stopped && last.text.trim().isNotEmpty
-          ? '${last.text}\n\n_已停止生成。_'
+      final text = stopped
+          ? _withStoppedGenerationMarker(last.text)
           : last.text;
       _messages.add(last.copyWith(text: text, streaming: false));
       _running = false;
@@ -500,6 +509,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
 
   Future<void> _pickImage(ImageSource source) async {
     try {
+      await _releaseAndroidRuntimeForExternalPicker();
       final image = await _imagePicker.pickImage(
         source: source,
         imageQuality: 92,
@@ -619,6 +629,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       return;
     }
     try {
+      await _releaseAndroidRuntimeForExternalPicker();
       final audio = await _audioInput.pickAudioFile();
       if (audio == null || !mounted) return;
       setState(() {
@@ -630,6 +641,16 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     } on PlatformException catch (error) {
       _showSnackBar('语音文件选择失败：${error.message ?? error.code}');
     }
+  }
+
+  Future<void> _releaseAndroidRuntimeForExternalPicker() async {
+    if (!Platform.isAndroid) return;
+    // Photo/file pickers run in a separate system process. Releasing the
+    // 2+ GiB LiteRT-LM engine before launching that process prevents the
+    // picker from being killed or the activity from being relaunched under
+    // memory pressure. The next request lazily initializes the exact backend
+    // it needs, so an image/audio request does not reload CPU first.
+    await _runtime.dispose();
   }
 
   Future<void> _toggleRecording() async {
@@ -673,9 +694,9 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       _showSnackBar('当前平台暂不支持 Live 语音通话。');
       return;
     }
-    _liveStopSignal?.complete();
+    _completePendingSignal(_liveStopSignal);
     _liveStopSignal = Completer<void>();
-    _liveSegmentCutSignal?.complete();
+    _completePendingSignal(_liveSegmentCutSignal);
     _liveSegmentCutSignal = null;
     _liveUiTimer?.cancel();
     setState(() {
@@ -691,14 +712,14 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       _enabledModes.add(_ComposerMode.voice);
       _attachedAudios.clear();
     });
-    _livePendingSegments.clear();
+    _discardPendingLiveSegments();
     _liveUiTimer = Timer.periodic(_liveUiTick, (_) {
       if (!mounted || !_liveCallActive) return;
       setState(() {
         _liveElapsed += _liveUiTick;
       });
     });
-    _showSnackBar('Live 语音通话已开启：每 4 秒切一段，先语音理解，再返回文字。');
+    _showSnackBar('Live 语音通话已开启：静音时自动分段，单段最长 7 秒，先语音理解，再返回文字。');
     unawaited(_runLiveVoiceLoop());
   }
 
@@ -735,10 +756,16 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     );
   }
 
+  void _completePendingSignal(Completer<void>? signal) {
+    if (signal != null && !signal.isCompleted) {
+      signal.complete();
+    }
+  }
+
   void _resetLiveSegmentationTracking() {
     _liveSpeechDetectedInSegment = false;
     _liveLastSpeechElapsedMs = 0;
-    _liveSegmentCutSignal?.complete();
+    _completePendingSignal(_liveSegmentCutSignal);
     _liveSegmentCutSignal = Completer<void>();
   }
 
@@ -784,11 +811,19 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
           });
           continue;
         }
-        if (_isLikelySilent(audio)) {
+        // A peak crossing the live VAD threshold is stronger evidence than
+        // the whole-segment average, which is naturally diluted by the
+        // leading/trailing silence kept around speech. Only apply the coarse
+        // average fallback when VAD never detected speech.
+        if (!_liveSpeechDetectedInSegment && _isLikelySilent(audio)) {
+          unawaited(_deleteLiveSegmentFile(audio));
           setState(() {
             _liveStatusText = '这次主要是环境声，继续聆听…';
           });
           continue;
+        }
+        while (_livePendingSegments.length >= _liveMaxPendingSegments) {
+          unawaited(_deleteLiveSegmentFile(_livePendingSegments.removeFirst()));
         }
         _livePendingSegments.add(audio);
         unawaited(_runLiveProcessorLoop());
@@ -812,7 +847,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
           _liveElapsed = Duration.zero;
         });
       }
-      _livePendingSegments.clear();
+      _discardPendingLiveSegments();
       _liveUiTimer?.cancel();
       _liveUiTimer = null;
       _liveStopSignal = null;
@@ -835,7 +870,12 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
             _liveStatusText = _recording ? '我在持续听，同时整理回复…' : '正在理解你刚才的话…';
           });
         }
-        final delta = await _runLiveSegmentSafely(audio);
+        late final String delta;
+        try {
+          delta = await _runLiveSegmentSafely(audio);
+        } finally {
+          await _deleteLiveSegmentFile(audio);
+        }
         if (!mounted) return;
         if (!_liveCallActive) break;
         setState(() {
@@ -859,16 +899,28 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   Future<void> _stopLiveVoiceCall({bool showToast = false}) async {
     if (!_liveCallActive && !_recording && !_liveSegmentProcessing) return;
     _liveCallActive = false;
-    _liveStopSignal?.complete();
-    _livePendingSegments.clear();
+    _completePendingSignal(_liveStopSignal);
+    _discardPendingLiveSegments();
     if (_recording) {
       try {
         await _audioInput.cancelRecording();
       } catch (_) {}
     }
     if (_running) {
-      _stopCurrentGeneration();
+      _stopRequested = true;
+      try {
+        await _runtime.stop();
+      } catch (_) {}
     }
+    // iOS audio inference owns its engine in a worker isolate and cannot be
+    // cancelled through a pointer on the main isolate. The runtime serializes
+    // any next request behind that task, so dispose here prevents all other
+    // resident engines without creating a post-hang-up double-engine spike.
+    try {
+      await _runtime.dispose();
+    } catch (_) {}
+    _running = false;
+    _stopRequested = false;
     if (mounted) {
       setState(() {
         _recording = false;
@@ -889,25 +941,25 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
   }
 
   Future<String> _runLiveSegment(AudioAttachment audio) async {
-    if (!_downloadStatus.isDownloaded) {
+    if (!_downloadStatus.isDownloaded || !_liveCallActive) {
       return '';
     }
     final previousPreview = _liveAssistantPreview;
-    final heard = await _collectRuntimeResponse(
+    final reply = await _collectRuntimeResponse(
       GemmaRequest(
-        prompt: _buildLiveUnderstandingPrompt(),
+        prompt: _buildLiveAudioReplyPrompt(),
         audioPaths: [audio.path],
       ),
       onToken: (partial) {
         if (!mounted) return;
         setState(() {
-          _liveStatusText = '正在听懂你刚才说的话…';
-          _liveDraftPreview = partial;
+          _liveStatusText = '正在听懂并回应你刚才的话…';
+          _liveDraftPreview = _composeLivePreview(previousPreview, partial);
         });
       },
     );
-    final cleanedHeard = _sanitizeLiveDelta(heard);
-    if (cleanedHeard.isEmpty) {
+    final delta = _sanitizeLiveDelta(reply);
+    if (delta.isEmpty || !_liveCallActive) {
       if (mounted) {
         setState(() {
           _liveDraftPreview = '';
@@ -916,27 +968,13 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
       return '';
     }
 
-    _liveHeardContext = _appendLiveContext(
-      _liveHeardContext,
-      cleanedHeard,
-      900,
-    );
-    final reply = await _collectRuntimeResponse(
-      GemmaRequest(prompt: _buildLiveReplyPrompt(cleanedHeard)),
-      onToken: (partial) {
-        if (!mounted) return;
-        setState(() {
-          _liveStatusText = '我在根据你刚才的话持续回应…';
-          _liveDraftPreview = _composeLivePreview(previousPreview, partial);
-        });
-      },
-    );
-    final delta = _sanitizeLiveDelta(reply);
+    _liveHeardContext = _appendLiveContext(_liveHeardContext, delta, 900);
     if (mounted) {
       setState(() {
-        _liveAssistantPreview = delta.isEmpty
-            ? previousPreview
-            : _mergeLiveAssistantPreview(previousPreview, delta);
+        _liveAssistantPreview = _mergeLiveAssistantPreview(
+          previousPreview,
+          delta,
+        );
         _liveDraftPreview = '';
       });
     }
@@ -985,6 +1023,7 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     GemmaRequest request, {
     void Function(String partial)? onToken,
   }) async {
+    if (!_liveCallActive) return '';
     _running = true;
     _stopRequested = false;
     final buffer = StringBuffer();
@@ -1002,39 +1041,20 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     return buffer.toString();
   }
 
-  String _buildLiveUnderstandingPrompt() {
-    return 'Extract only the useful information from this audio clip.\n'
-        'Requirements:\n'
-        '1. Recover the user facts, questions, requests, goals, times, places, numbers, and key terms as accurately as possible.\n'
-        '2. If part of the audio is unclear, explicitly say which part is uncertain.\n'
-        '3. Do not comfort, do not answer, do not give suggestions, and do not say that you are listening. Only perform understanding.\n'
-        '4. Output 1 to 3 concise sentences in $_preferredReplyLanguageName.';
-  }
-
-  String _buildLiveReplyPrompt(String heard) {
-    final custom = _inputController.text.trim();
-    final base = custom.isEmpty
-        ? 'You are in a continuous live voice conversation with the user. Reply naturally based on what the user just said.'
-        : custom;
+  String _buildLiveAudioReplyPrompt() {
     final previousReply = _liveAssistantPreview.trim();
     final previousContext = previousReply.isEmpty
-        ? '（暂无）'
+        ? 'none'
         : _tailText(previousReply, 220);
-    final heardContext = _liveHeardContext.trim().isEmpty
-        ? heard
-        : _tailText(_liveHeardContext, 400);
-    return '$base\n\n'
-        'This is a continuous phone-style conversation.\n'
-        'Confirmed user context so far: $heardContext\n'
-        'Newest understood content: $heard\n'
-        'Your previous reply content: $previousContext\n\n'
+    return 'This is one segment of a continuous live voice conversation. '
+        'Listen to the attached audio and reply directly to the newest user speech.\n'
+        'Previous assistant reply: $previousContext\n'
         'Requirements:\n'
-        '1. Respond to the newest understood content, not with generic emotional validation.\n'
-        '2. If the user asked a question, answer it directly. If the user described a situation, provide a concrete judgment, summary, or next action.\n'
-        '3. If part of the content is unclear, say what you understood, what remains unclear, and ask one concrete clarification question.\n'
-        '4. Output only the new reply you want to say now. Do not repeat your previous reply.\n'
-        '5. Keep the response short, direct, specific, and in $_preferredReplyLanguageName.\n'
-        '6. If there is no new valid content, return an empty string.';
+        '1. Preserve important names, numbers, dates, places, questions, and requests.\n'
+        '2. If the user asks a question, answer it directly. Otherwise give one relevant, concrete response.\n'
+        '3. If speech is unclear, state what is uncertain and ask one short clarification.\n'
+        '4. Do not repeat the previous reply.\n'
+        '5. Output only 1 to 3 concise sentences in $_preferredReplyLanguageName.';
   }
 
   bool _isLikelySilent(AudioAttachment audio) {
@@ -1044,13 +1064,50 @@ class _GemmaHomeScreenState extends State<GemmaHomeScreen> {
     return average < 0.12;
   }
 
+  Future<void> _deleteLiveSegmentFile(AudioAttachment audio) async {
+    try {
+      final file = File(audio.path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (error) {
+      debugPrint('[LiveAudio] failed to delete ${audio.path}: $error');
+    }
+  }
+
+  void _discardPendingLiveSegments() {
+    while (_livePendingSegments.isNotEmpty) {
+      unawaited(_deleteLiveSegmentFile(_livePendingSegments.removeFirst()));
+    }
+  }
+
   void _stopCurrentGeneration() {
     if (!_running || _stopRequested) return;
     _stopRequested = true;
     _runtime.stop();
     if (!_liveCallActive) {
-      _finishAssistantMessage(stopped: true);
+      _markAssistantMessageStopped();
     }
+  }
+
+  void _markAssistantMessageStopped() {
+    if (!mounted || _messages.isEmpty) return;
+    setState(() {
+      final last = _messages.removeLast();
+      _messages.add(
+        last.copyWith(
+          text: _withStoppedGenerationMarker(last.text),
+          streaming: false,
+        ),
+      );
+    });
+    _scrollToBottom();
+  }
+
+  String _withStoppedGenerationMarker(String text) {
+    const marker = '_已停止生成。_';
+    if (text.trimRight().endsWith(marker)) return text;
+    return text.trim().isEmpty ? marker : '$text\n\n$marker';
   }
 
   String _sanitizeLiveDelta(String text) {
@@ -1360,66 +1417,73 @@ class _ChatTranscript extends StatelessWidget {
       controller: controller,
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
       itemCount: messages.length,
-      itemBuilder: (context, index) => _MessageBubble(message: messages[index]),
+      itemBuilder: (context, index) =>
+          _MessageBubble(index: index, message: messages[index]),
     );
   }
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message});
+  const _MessageBubble({required this.index, required this.message});
 
+  final int index;
   final _ChatMessage message;
 
   @override
   Widget build(BuildContext context) {
     final isUser = message.role == _ChatRole.user;
     final colorScheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.sizeOf(context).width * 0.82,
-        ),
-        child: Card(
-          elevation: 0,
-          color: isUser
-              ? colorScheme.primaryContainer
-              : colorScheme.surfaceContainerHighest,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
+    final roleName = isUser ? 'user' : 'assistant';
+    final semanticText = message.text.isEmpty && message.streaming
+        ? '思考中…'
+        : message.text;
+    return Semantics(
+      identifier: 'chat-message-$roleName-$index',
+      container: true,
+      explicitChildNodes: true,
+      label: semanticText,
+      child: Align(
+        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(context).width * 0.82,
           ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (message.imagePaths.isNotEmpty) ...[
-                  _SentImagePreviewGrid(imagePaths: message.imagePaths),
-                  if (message.audioAttachments.isNotEmpty ||
-                      message.text.trim().isNotEmpty)
-                    const SizedBox(height: 10),
+          child: Card(
+            elevation: 0,
+            color: isUser
+                ? colorScheme.primaryContainer
+                : colorScheme.surfaceContainerHighest,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (message.imagePaths.isNotEmpty) ...[
+                    _SentImagePreviewGrid(imagePaths: message.imagePaths),
+                    if (message.audioAttachments.isNotEmpty ||
+                        message.text.trim().isNotEmpty)
+                      const SizedBox(height: 10),
+                  ],
+                  if (message.audioAttachments.isNotEmpty) ...[
+                    _VoiceMessageGrid(audios: message.audioAttachments),
+                    if (message.text.trim().isNotEmpty)
+                      const SizedBox(height: 10),
+                  ],
+                  if (message.text.trim().isNotEmpty || message.streaming)
+                    _MarkdownMessageText(text: semanticText, isUser: isUser),
+                  if (message.streaming) ...[
+                    const SizedBox(height: 8),
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ],
                 ],
-                if (message.audioAttachments.isNotEmpty) ...[
-                  _VoiceMessageGrid(audios: message.audioAttachments),
-                  if (message.text.trim().isNotEmpty)
-                    const SizedBox(height: 10),
-                ],
-                if (message.text.trim().isNotEmpty || message.streaming)
-                  _MarkdownMessageText(
-                    text: message.text.isEmpty && message.streaming
-                        ? '思考中…'
-                        : message.text,
-                    isUser: isUser,
-                  ),
-                if (message.streaming) ...[
-                  const SizedBox(height: 8),
-                  const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ],
-              ],
+              ),
             ),
           ),
         ),

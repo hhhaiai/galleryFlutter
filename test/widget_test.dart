@@ -4,6 +4,8 @@ import 'package:gemma_local_app/src/app/gemma_local_app.dart';
 
 void main() {
   testWidgets('galleryFlutter smoke test', (WidgetTester tester) async {
+    final semantics = tester.ensureSemantics();
+
     await tester.pumpWidget(const GemmaLocalApp());
     await tester.pump();
 
@@ -15,5 +17,10 @@ void main() {
     expect(find.text('图片'), findsWidgets);
     expect(find.text('语音'), findsWidgets);
     expect(find.textContaining('你好，我是 galleryFlutter'), findsOneWidget);
+    expect(
+      find.bySemanticsIdentifier('chat-message-assistant-0'),
+      findsOneWidget,
+    );
+    semantics.dispose();
   });
 }

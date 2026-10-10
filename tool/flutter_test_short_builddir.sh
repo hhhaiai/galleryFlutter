@@ -23,4 +23,7 @@ cat > "$settings_file" <<JSON
 {"build-dir":"$relative_build_dir"}
 JSON
 
-exec env XDG_CONFIG_HOME="$config_dir" "$flutter_bin" test --no-pub "$@"
+# Use the system env explicitly. Some developer machines have a user-local
+# `env` shim on PATH that only mutates PATH and silently ignores the command,
+# which made this test gate return success without executing any tests.
+exec /usr/bin/env XDG_CONFIG_HOME="$config_dir" "$flutter_bin" test --no-pub "$@"

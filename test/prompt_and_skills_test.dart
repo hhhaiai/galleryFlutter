@@ -1,4 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_gemma/flutter_gemma.dart' as fg;
+import 'package:gemma_local_app/src/core/runtime/local_gemma_runtime.dart';
+import 'package:gemma_local_app/src/core/runtime/platform_gemma_runtime.dart';
 import 'package:gemma_local_app/src/features/prompt_lab/prompt_templates.dart';
 import 'package:gemma_local_app/src/features/skills/skill.dart';
 
@@ -17,10 +20,7 @@ void main() {
     final prompt = buildAgentSkillsSystemPrompt(builtInSkills);
 
     expect(prompt, contains('Android supports native ToolProvider'));
-    expect(
-      prompt,
-      contains('iOS/Dart tool-result dispatch is still in progress'),
-    );
+    expect(prompt, contains('iOS/Dart executes the bundled `calculate-hash`'));
     expect(prompt, contains('calculate-hash'));
     expect(prompt, contains('run_js'));
     expect(prompt, contains('send_email'));
@@ -45,4 +45,54 @@ void main() {
       expect(enabled, isNot(contains('send-email')));
     },
   );
+
+  test('iOS/Dart calculate-hash executes the enabled SHA-1 skill', () {
+    final result = MethodChannelGemmaRuntime().executeDartSkillToolForTesting(
+      const fg.FunctionCallResponse(
+        name: 'runJs',
+        args: {
+          'skillName': 'calculate-hash',
+          'scriptName': 'index.html',
+          'data': '{"text":"abc"}',
+        },
+      ),
+      const GemmaRequest(
+        prompt: 'Hash abc',
+        enabledSkillNames: ['calculate-hash'],
+      ),
+    );
+
+    expect(result['status'], 'succeeded');
+    expect(result['algorithm'], 'SHA-1');
+    expect(result['result'], 'a9993e364706816aba3e25717850c26c9cd0d89d');
+  });
+
+  test('iOS raw Skills tools use complete JSON Schema parameters', () {
+    final tools = MethodChannelGemmaRuntime().iosSkillToolsForTesting(
+      const GemmaRequest(
+        prompt: 'Hash abc',
+        enabledSkillNames: ['calculate-hash'],
+      ),
+    );
+
+    expect(tools, isNotEmpty);
+    for (final tool in tools) {
+      expect(tool.parameters['type'], 'object', reason: tool.name);
+      expect(tool.parameters['properties'], isA<Map>(), reason: tool.name);
+      expect(tool.parameters['required'], isA<List>(), reason: tool.name);
+    }
+  });
+
+  test('iOS text tool protocol parses a Gemma JSON tool selection', () {
+    final call = MethodChannelGemmaRuntime.parseIosTextToolCallForTesting('''
+```json
+{"name":"runJs","arguments":{"skillName":"calculate-hash","scriptName":"index.html","data":"{\\"text\\":\\"abc\\"}"}}
+```
+''');
+
+    expect(call, isNotNull);
+    expect(call!.name, 'runJs');
+    expect(call.args['skillName'], 'calculate-hash');
+    expect(call.args['data'], '{"text":"abc"}');
+  });
 }
